@@ -1,0 +1,92 @@
+[project]
+name = "shopping-erp"
+version = "0.1.0"
+description = "쇼핑몰 통합 ERP (주문·광고·매출·경영관리)"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+# === 코드 품질 도구 공통 설정 ===
+# frontend/(별도 npm 생태계), venv/, migrations/versions/(자동 생성 리비전)는
+# 전 도구에서 공통으로 제외한다.
+
+[tool.black]
+line-length = 120
+target-version = ["py311"]
+# 기존 코드에 습관적으로 붙인 트레일링 콤마 때문에 magic-trailing-comma가
+# 짧은 리스트/튜플까지 전부 한 줄에 하나씩 펼쳐버려 가독성을 해쳐서 끈다.
+skip-magic-trailing-comma = true
+extend-exclude = '''
+(
+    venv
+    | frontend
+    | migrations/versions
+)
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 120
+skip = ["venv", "frontend", "migrations/versions"]
+known_first_party = [
+    "api", "config", "core", "integrations", "models",
+    "repositories", "scheduler", "services",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+exclude = ["venv", "frontend", "migrations/versions"]
+
+[tool.ruff.lint]
+# E501(line-too-long)은 black이 담당하므로 제외.
+# I(import순서)는 isort가 담당하므로 제외한다 - ruff와 isort를 동시에 켜면
+# 서로 다른 import 정렬 결과를 두고 다투므로 한쪽(isort)에만 맡긴다.
+# UP(pyupgrade)는 대부분 껐다 - Optional[X]/List[X]/timezone.utc 등 기존
+# 코드 전반에 일관되게 쓰인 여전히 유효한 문법을 X | None/list[X]/
+# datetime.UTC로 바꾸라는 순수 스타일 제안이 158건 넘게 나와서, 전면
+# 재작성 없이(설계 변경 최소화 원칙) 실질적 버그 탐지에 집중하기 위해 뺐다.
+select = ["E", "F", "W", "B", "SIM", "C4"]
+ignore = [
+    "E501",  # line-too-long (black이 담당)
+    "B008",  # function-call-in-default-argument - FastAPI의 Depends(...)는 의도된 관용구
+]
+
+[tool.ruff.lint.per-file-ignores]
+# scripts/*, alembic env.py는 sys.path.insert 이후 지역 import가 필요해
+# E402(모듈 상단이 아닌 import)를 이 파일들에서만 허용한다.
+"scripts/*.py" = ["E402"]
+"migrations/env.py" = ["E402"]
+"scheduler/scheduler.py" = ["E402"]
+# SQLAlchemy 2.0 relationship()의 Mapped["ClassName"] 전방참조 문자열을
+# ruff가 실제 이름 참조로 오인해 F821(undefined-name)을 오탐하므로 제외한다
+# (다른 파일에 정의된 모델을 가리키며, import하면 순환참조 위험이 생긴다).
+"models/*.py" = ["F821"]
+
+[tool.mypy]
+# 설치된 numpy(3.14용 wheel, pandas의 의존성)의 .pyi 스텁이 PEP 695
+# `type` 문(3.12+ 전용 문법)을 쓰고 있어 python_version="3.11"로는 numpy
+# 스텁 자체를 파싱하지 못해 mypy가 즉시 실패한다. 우리 코드는 3.11 문법만
+# 쓰므로 검사 대상 문법 범위를 넓히는 것뿐이며 하위 호환성엔 영향 없다.
+python_version = "3.12"
+plugins = ["sqlalchemy.ext.mypy.plugin"]
+exclude = ["venv/", "frontend/", "migrations/"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+# tests/conftest.py와 tests/integration/conftest.py처럼 tests/ 하위에
+# __init__.py 없이 동명 파일이 여러 개 있으면(pytest에서는 정상 구조)
+# mypy가 기본 모드에서 "Duplicate module named conftest"로 실패한다.
+# __init__.py를 추가하면 pytest의 테스트 수집 방식이 바뀔 수 있어(설계 변경
+# 최소화 원칙), 대신 mypy가 디렉터리 구조 기준으로 모듈명을 매기도록 한다.
+explicit_package_bases = true
+mypy_path = "."
+# 기존 코드 대부분이 부분적으로만 타입힌트를 갖추고 있어(services/repositories는
+# 시그니처에 힌트가 있지만 스크립트류는 없음), 전면 재작성 없이 점진 도입할 수
+# 있도록 미표기 함수 강제(disallow_untyped_defs)는 켜지 않는다. 대신 이미 있는
+# 타입힌트끼리의 모순(check_untyped_defs)은 잡아낸다.
+check_untyped_defs = true
+disallow_untyped_defs = false
+no_implicit_optional = true

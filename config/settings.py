@@ -1,0 +1,59 @@
+"""
+config/settings.py
+--------------------
+.env 파일을 로드하여 애플리케이션 전역 설정을 노출한다.
+pydantic-settings를 사용하여 타입 검증과 기본값을 함께 관리한다.
+
+사용 예:
+    from config.settings import settings
+    print(settings.database_url)
+"""
+
+from functools import lru_cache
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+class Settings(BaseSettings):
+    # 애플리케이션 기본 정보
+    app_name: str = "쇼핑몰 통합 ERP"
+    app_version: str = "0.1.0"
+    debug: bool = False
+
+    # DB - 초기엔 SQLite, 추후 PostgreSQL 전환 시 이 값만 교체
+    # 예: postgresql+psycopg://user:pw@localhost:5432/erp
+    database_url: str = f"sqlite:///{BASE_DIR / 'erp.db'}"
+
+    # 인증
+    jwt_secret_key: str = "CHANGE_ME_IN_PRODUCTION"
+    jwt_algorithm: str = "HS256"
+    jwt_expire_minutes: int = 60 * 8  # 8시간
+
+    # API Key 암호화 마스터 키 (Fernet 등 대칭키 암호화에 사용)
+    credential_encryption_key: str = "CHANGE_ME_IN_PRODUCTION"
+
+    # 디렉터리 경로
+    reports_dir: Path = BASE_DIR / "reports"
+    logs_dir: Path = BASE_DIR / "logs"
+    backup_dir: Path = BASE_DIR / "backup"
+
+    # 백업 정책
+    backup_retention_days: int = 30
+    backup_max_count: int = 60
+
+    # 휴면 고객 판정 기준(일) - v1.2 고객분석
+    dormant_customer_days: int = 90
+
+    model_config = SettingsConfigDict(env_file=str(BASE_DIR / ".env"), env_file_encoding="utf-8", extra="ignore")
+
+
+@lru_cache
+def get_settings() -> Settings:
+    """설정 객체를 프로세스당 1회만 생성하도록 캐싱한다."""
+    return Settings()
+
+
+settings = get_settings()

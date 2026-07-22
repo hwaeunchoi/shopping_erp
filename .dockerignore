@@ -1,0 +1,34 @@
+# .dockerignore
+# 이미지에 넣지 않을 것들 - venv/frontend/캐시류는 용량이 크고, .env/erp.db는
+# 로컬 개발용 민감정보/데이터라 이미지에 구울 대상이 아니다(컨테이너는
+# docker-compose.yml의 environment로 값을 주입받는다).
+
+venv/
+.venv/
+frontend/
+
+.git/
+.gitignore
+.dockerignore
+
+__pycache__/
+*.pyc
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+.env
+*.db
+*.sqlite3
+
+logs/
+backup/
+reports/generated/
+
+tests/
+
+.pre-commit-config.yaml
+
+SRS_*.md
+UI와이어프레임*.md

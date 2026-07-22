@@ -1,0 +1,201 @@
+"""
+models/order.py
+-----------------
+ERD 2.5 주문/배송/교환/반품/취소 그룹:
+orders, order_items, order_status_history, shipments, exchanges,
+returns, cancellations
+
+핵심 제약: orders.(platform_id, platform_order_no) UNIQUE - 중복 수집 방지
+(SRS FR-MALL-04). order_date/payment_date/delivery_completed_date 3종을
+모두 보유하여 손익 계산 기준 4종(주문일/결제일/배송완료일/정산일) 중
+3종의 기반을 제공한다 (정산일은 settlements 테이블에서 관리).
+"""
+
+from datetime import datetime
+from typing import Optional
+
+from sqlalchemy import DateTime, ForeignKey, Index, Numeric, String, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from models.base import Base, SoftDeleteMixin, TimestampMixin
+
+
+class Order(Base, TimestampMixin, SoftDeleteMixin):
+    """주문."""
+
+    __tablename__ = "orders"
+    __table_args__ = (
+        UniqueConstraint("platform_id", "platform_order_no", name="uq_order_platform_no"),
+        Index("idx_orders_date", "order_date"),
+        Index("idx_orders_status", "status"),
+        Index("idx_orders_platform_date", "platform_id", "order_date"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    platform_id: Mapped[int] = mapped_column(ForeignKey("platforms.id"), nullable=False)
+    platform_order_no: Mapped[str] = mapped_column(String(100), nullable=False)
+    customer_id: Mapped[Optional[int]] = mapped_column(ForeignKey("customers.id"), nullable=True)
+    # NEW/PREPARING/SHIPPING/DELIVERED/CANCELED/EXCHANGED/RETURNED/REFUNDED
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    order_date: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    payment_date: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    delivery_completed_date: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    total_amount: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False)
+    discount_amount: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)
+    # 주문 워크벤치(허브) 재설계: 담당자 배정 + 운영 태그(쉼표 구분).
+    assignee_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    tags: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+
+    # --- 업무 설계 확정 반영 -------------------------------------------------
+    # 통화: 지금은 KRW 고정이지만 컬럼을 미리 둔다. 나중에 넣으면 금액을 다루는
+    # 모든 테이블과 계산 로직을 전면 수정해야 한다(구조적 위험 대비).
+    currency: Mapped[str] = mapped_column(String(3), default="KRW", nullable=False)
+    # 주문 출처: CHANNEL(쇼핑몰 수집) / MANUAL(수기) / B2B.
+    # 채널 없는 주문을 나중에 허용하려면 조회·집계 쿼리를 전부 재검토해야 하므로 미리 둔다.
+    order_source: Mapped[str] = mapped_column(String(20), default="CHANNEL", nullable=False)
+
+    # 주문확인 단계 - 이 시점에 재고를 선점한다(재고 중복판매 방지).
+    confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    confirmed_by: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+
+    # 수취인 - 구매자와 다를 수 있다(선물 주문). 합포장 판정의 기준이기도 하다.
+    receiver_name: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    receiver_phone: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    receiver_zipcode: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    receiver_address: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+
+    items: Mapped[list["OrderItem"]] = relationship(back_populates="order", cascade="all, delete-orphan")
+    status_history: Mapped[list["OrderStatusHistory"]] = relationship(
+        back_populates="order", cascade="all, delete-orphan"
+    )
+    # 배송은 shipment_items를 통해 N:M으로 연결된다(합포장/분할배송). 직접 관계를 두지 않고
+    # ShipmentRepository.list_by_order()로 조회한다.
+
+
+class OrderItem(Base):
+    """주문상품. cost_price_snapshot은 매출 확정 시점에 원가를 스냅샷으로 고정한 값."""
+
+    __tablename__ = "order_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False)
+    product_option_id: Mapped[int] = mapped_column(ForeignKey("product_options.id"), nullable=False)
+    quantity: Mapped[int] = mapped_column(nullable=False)
+    unit_price: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False)
+    cost_price_snapshot: Mapped[Optional[float]] = mapped_column(Numeric(14, 2), nullable=True)
+    line_amount: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False)
+
+    # --- 세트상품 분해 추적 --------------------------------------------------
+    # 이 품목이 어느 채널상품에서 분해되어 나왔는가. 세트 "3종세트 2개"는
+    # 구성 SKU 3행으로 저장되며, 세 행 모두 같은 channel_product_id를 갖는다.
+    channel_product_id: Mapped[Optional[int]] = mapped_column(ForeignKey("channel_products.id"), nullable=True)
+    # 채널에서 주문된 세트 개수(구성수량 × set_quantity = quantity)
+    set_quantity: Mapped[Optional[int]] = mapped_column(nullable=True)
+    currency: Mapped[str] = mapped_column(String(3), default="KRW", nullable=False)
+
+    order: Mapped["Order"] = relationship(back_populates="items")
+
+
+class OrderStatusHistory(Base):
+    """주문 상태 변경 이력."""
+
+    __tablename__ = "order_status_history"
+    __table_args__ = (Index("idx_order_status_history", "order_id", "changed_at"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False)
+    from_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    to_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    changed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+    order: Mapped["Order"] = relationship(back_populates="status_history")
+
+
+class Shipment(Base):
+    """배송(택배 1건 = 송장 1장).
+
+    이지어드민 수준의 합포장/분할배송을 지원하기 위해 주문과 1:1이 아니라
+    shipment_items를 통해 N:M으로 연결한다.
+
+    - 합포장: 같은 수취인의 주문 여러 건 → shipment 1건(송장 1장)
+      (shipment_items에 order_id가 여러 개 붙는다)
+    - 분할배송: 주문 1건을 나눠 발송 → shipment 여러 건
+      (같은 order_id가 여러 shipment의 shipment_items에 붙는다)
+
+    과거에는 shipments.order_id에 UNIQUE 제약이 있어 둘 다 구조적으로 불가능했다.
+    """
+
+    __tablename__ = "shipments"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    carrier: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    tracking_no: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    shipped_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)  # READY/SHIPPING/DELIVERED
+
+    items: Mapped[list["ShipmentItem"]] = relationship(back_populates="shipment", cascade="all, delete-orphan")
+
+
+class ShipmentItem(Base):
+    """배송↔주문 연결(N:M 해소). order_item_id가 NULL이면 '주문 전체'를 의미한다.
+
+    분할배송에서 특정 품목만 먼저 보낼 때 order_item_id/quantity를 채운다.
+    """
+
+    __tablename__ = "shipment_items"
+    __table_args__ = (
+        Index("idx_shipment_items_shipment", "shipment_id"),
+        Index("idx_shipment_items_order", "order_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    shipment_id: Mapped[int] = mapped_column(ForeignKey("shipments.id"), nullable=False)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False)
+    order_item_id: Mapped[Optional[int]] = mapped_column(ForeignKey("order_items.id"), nullable=True)
+    quantity: Mapped[Optional[int]] = mapped_column(nullable=True)
+
+    shipment: Mapped["Shipment"] = relationship(back_populates="items")
+
+
+class Exchange(Base):
+    """교환."""
+
+    __tablename__ = "exchanges"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False)
+    order_item_id: Mapped[Optional[int]] = mapped_column(ForeignKey("order_items.id"), nullable=True)
+    reason: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)  # REQUESTED/APPROVED/SHIPPED/COMPLETED/REJECTED
+    requested_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class Return(Base):
+    """반품."""
+
+    __tablename__ = "returns"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False)
+    order_item_id: Mapped[Optional[int]] = mapped_column(ForeignKey("order_items.id"), nullable=True)
+    reason: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    refund_amount: Mapped[Optional[float]] = mapped_column(Numeric(14, 2), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)  # REQUESTED/APPROVED/RECEIVED/REFUNDED/REJECTED
+    requested_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class Cancellation(Base):
+    """취소."""
+
+    __tablename__ = "cancellations"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    refund_amount: Mapped[Optional[float]] = mapped_column(Numeric(14, 2), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)  # REQUESTED/COMPLETED
+    requested_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

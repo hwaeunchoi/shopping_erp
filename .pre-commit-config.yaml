@@ -1,0 +1,85 @@
+# .pre-commit-config.yaml
+# --------------------------
+# 설치: pip install -r requirements.txt (pre-commit 포함) 후 `pre-commit install`
+# 수동 전체 실행: `pre-commit run --all-files`
+#
+# ruff/black/isort/mypy/pytest는 격리된 환경을 새로 만드는 대신 venv에 이미
+# 설치된 버전을 그대로 사용한다(language: system). 이 저장소에서 직접 겪은
+# Windows 관련 함정 두 가지 때문에 entry 경로가 다음과 같은 형태다:
+#   1) pre-commit이 훅을 실행하는 프로세스는 "활성화된" 셸 PATH를 물려받지
+#      않아 bare `python`이 venv가 아닌 엉뚱한 실행 파일로 풀릴 수 있다
+#      (Microsoft Store python 스텁으로 연결되어 exit code 9009 발생).
+#      그래서 venv의 python.exe를 상대경로로 직접 지정한다.
+#   2) 그 상대경로를 슬래시(venv/Scripts/python.exe)로 쓰면 셸을 거치지 않는
+#      직접 실행(win32 CreateProcess)이 FileNotFoundError를 낸다. 백슬래시로
+#      바꿔도 pre-commit이 entry 문자열을 shlex로 파싱하면서 단일 백슬래시를
+#      이스케이프 문자로 소비해버려(venv\Scripts\python.exe ->
+#      venvScriptspython.exe) 여전히 깨진다. 그래서 백슬래시를 두 번(\\) 써서
+#      shlex가 한 번 풀어낸 뒤 올바른 단일 백슬래시 경로가 되도록 한다.
+# 프로젝트 루트에서 `pre-commit run`을 실행한다고 가정한다.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        exclude: ^frontend/
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=2000"]
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+
+  - repo: local
+    hooks:
+      - id: isort
+        name: isort (import 정렬)
+        entry: venv\\Scripts\\python.exe -m isort
+        language: system
+        types: [python]
+        exclude: ^(venv/|frontend/|migrations/versions/)
+
+      - id: black
+        name: black (포맷팅)
+        entry: venv\\Scripts\\python.exe -m black
+        language: system
+        types: [python]
+        exclude: ^(venv/|frontend/|migrations/versions/)
+
+      - id: ruff
+        name: ruff (린트)
+        entry: venv\\Scripts\\python.exe -m ruff check --fix
+        language: system
+        types: [python]
+        exclude: ^(venv/|frontend/|migrations/versions/)
+
+      - id: mypy
+        name: mypy (타입 검사)
+        entry: venv\\Scripts\\python.exe -m mypy
+        language: system
+        types: [python]
+        pass_filenames: false
+        exclude: ^(venv/|frontend/|migrations/)
+        args:
+          [
+            "models",
+            "config",
+            "core",
+            "repositories",
+            "services",
+            "api",
+            "integrations",
+            "scheduler",
+            "scripts",
+            "tests",
+          ]
+
+      - id: pytest
+        name: pytest (테스트)
+        entry: venv\\Scripts\\python.exe -m pytest -q
+        language: system
+        pass_filenames: false
+        always_run: true

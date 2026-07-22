@@ -1,0 +1,181 @@
+"""
+integrations/malls/base_mall_connector.py
+---------------------------------------------
+쇼핑몰 플랫폼 커넥터 공통 인터페이스.
+
+Scheduler/Service 계층은 구체 커넥터 클래스가 아니라 이 인터페이스에만
+의존한다. Platform.connector_class 값(예: "CoupangConnector")으로 실제
+구현체를 동적으로 로딩할 때는 integrations.malls.get_mall_connector()를 사용한다.
+
+반환 형식(정규화된 표준 딕셔너리)은 플랫폼마다 다른 원본 API 응답 형식을
+흡수하여 이 표준 형태로 맞추는 것이 커넥터의 핵심 책임이다:
+
+fetch_orders()/fetch_order_detail() 반환 항목:
+    {
+        "platform_order_no": str,
+        "order_date": datetime,
+        "status": str,  # NEW/PREPARING/SHIPPING/DELIVERED/CANCELED (models.order.Order.status와 동일 값)
+        "customer_key": str,             # Customer.platform_customer_key에 대응
+        "customer_name": Optional[str],
+        "customer_phone": Optional[str],
+        "total_amount": float,
+        "discount_amount": float,
+        "items": [
+            {"platform_option_id": str, "quantity": int, "unit_price": float},
+            ...
+        ],
+    }
+
+fetch_settlements() 반환 항목:
+    {
+        "settlement_cycle": str, "scheduled_date": date, "settled_date": Optional[date],
+        "expected_amount": float, "settled_amount": float, "status": str,
+    }
+
+실제 API 키가 없으면(또는 session/platform_id가 주어지지 않으면) 각
+구현체는 위 형식에 맞는 더미(가짜) 데이터를 생성한다. session과 platform_id를
+함께 넘기면(운영 환경 등) settings.api_credentials에 등록된 실제 키가 있는지
+확인해 있으면 실제 HTTP 연동을, 없으면 더미 폴백을 시도한다(NaverSmartstoreConnector
+참고 - 나머지 플랫폼은 아직 더미 전용이며, 동일한 패턴으로 확장 가능).
+"""
+
+import random
+from abc import ABC, abstractmethod
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Optional
+
+ORDER_STATUSES = ["NEW", "PREPARING", "SHIPPING", "DELIVERED", "CANCELED"]
+DUMMY_CUSTOMER_NAMES = ["김민준", "이서연", "박도윤", "최지우", "정하은", "강시우", "조수아"]
+DUMMY_PRODUCT_PRICES = [12900.0, 15900.0, 19900.0, 24900.0, 29900.0, 39900.0, 59900.0]
+
+
+class BaseMallConnector(ABC):
+    """모든 쇼핑몰 커넥터가 구현해야 하는 공통 인터페이스."""
+
+    platform_code: str  # models.platform.Platform.code와 일치해야 한다.
+
+    def __init__(self, session: Any = None, platform_id: Optional[int] = None) -> None:
+        """session/platform_id는 실제 API 연동을 지원하는 커넥터(예: 네이버)만 사용한다.
+
+        둘 다 주어지지 않으면(기본값) 기존과 동일하게 더미 데이터만 생성하므로
+        이 파라미터를 모르는 기존 호출부/테스트는 전혀 영향받지 않는다.
+        """
+        self.session = session
+        self.platform_id = platform_id
+
+    @abstractmethod
+    def fetch_orders(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+        """기간 내 신규/변경 주문 목록을 정규화된 형식으로 조회한다."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def fetch_order_detail(self, platform_order_no: str) -> dict[str, Any]:
+        """단일 주문 상세(주문상품 포함)를 정규화된 형식으로 조회한다."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def update_shipment(self, platform_order_no: str, carrier: str, tracking_no: str) -> bool:
+        """송장 등록/배송 상태를 플랫폼에 반영한다. 성공 여부를 반환한다."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def fetch_settlements(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+        """기간 내 정산 내역을 정규화된 형식으로 조회한다."""
+        raise NotImplementedError
+
+    def fetch_products(self) -> list[dict[str, Any]]:
+        """상품 목록을 정규화된 형식으로 조회한다(services.product_sync_service.
+        ProductSyncService.sync_products_from_naver 참고). 상품은 이 메서드를 통해서만
+        생성/갱신되어야 하며, 주문 API(fetch_orders)에서는 더 이상 상품을 만들지 않는다.
+
+        상품 API 연동을 아직 지원하지 않는 플랫폼(더미 커넥터 등)은 기본값인 이
+        구현을 그대로 상속해 예외를 던진다 - abstractmethod로 강제하면 아직
+        상품 API가 없는 플랫폼(쿠팡/카카오/11번가/ESM)의 더미 커넥터도 전부 구현체를
+        추가해야 해서, 실제 지원하는 커넥터(네이버)만 오버라이드하는 편이 낫다.
+
+        반환 형식: [{"product_name", "category", "brand", "manufacturer",
+        "images": {"representative_url", "optional_urls": [...]},
+        "items": [{"platform_option_id"(옵션번호), "platform_product_id"(상품번호),
+                   "option_name", "seller_product_code", "sale_price", "is_selling",
+                   "option_image_url"}, ...]}, ...]
+        """
+        raise NotImplementedError(f"{self.platform_code} 플랫폼은 아직 상품 API 연동을 지원하지 않습니다.")
+
+    def _dummy_seed_orders(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+        """개발/테스트용 더미 주문 시드를 생성한다 (플랫폼 공통 내부 유틸).
+
+        실제 fetch_orders()는 이 시드를 각 플랫폼 고유의 원본 응답 형식으로
+        감싼 뒤(raw), 다시 표준 형식으로 정규화(normalize)하는 두 단계를 거친다.
+        실제 API 연동 시에는 이 메서드 호출부만 실제 HTTP 요청으로 교체하면 된다.
+        """
+        rng = random.Random(f"{self.platform_code}:{start_date.isoformat()}:{end_date.isoformat()}")
+        days = max((end_date - start_date).days, 1)
+        seeds = []
+        for i in range(rng.randint(0, 3) * days):
+            offset_days = rng.randint(0, max(days - 1, 0))
+            order_date = datetime.combine(
+                start_date + timedelta(days=offset_days), datetime.min.time(), tzinfo=timezone.utc
+            ) + timedelta(hours=rng.uniform(0, 23), minutes=rng.uniform(0, 59))
+            seeds.append(
+                {
+                    "seq": i,
+                    "order_date": order_date,
+                    "status": rng.choice(ORDER_STATUSES),
+                    "customer_key": f"{self.platform_code.upper()}-{rng.randint(10000, 99999)}",
+                    "customer_name": rng.choice(DUMMY_CUSTOMER_NAMES),
+                    "customer_phone": f"010-{rng.randint(1000, 9999)}-{rng.randint(1000, 9999)}",
+                    "product_code": f"{self.platform_code.upper()}-{rng.randint(100000, 999999)}",
+                    "quantity": rng.randint(1, 3),
+                    "unit_price": rng.choice(DUMMY_PRODUCT_PRICES),
+                }
+            )
+        return seeds
+
+    def _dummy_single_order(self, platform_order_no: str) -> dict[str, Any]:
+        """platform_order_no로부터 결정적(deterministic)인 더미 주문 1건을 만든다.
+
+        같은 주문번호로 다시 조회해도 항상 같은 결과가 나오도록 시드를 고정한다.
+        """
+        rng = random.Random(f"{self.platform_code}:{platform_order_no}")
+        order_date = datetime.now(timezone.utc) - timedelta(days=rng.uniform(0, 30))
+        n_items = rng.randint(1, 3)
+        items: list[dict[str, Any]] = [
+            {
+                "platform_option_id": f"{self.platform_code.upper()}-{rng.randint(100000, 999999)}",
+                "quantity": rng.randint(1, 3),
+                "unit_price": rng.choice(DUMMY_PRODUCT_PRICES),
+            }
+            for _ in range(n_items)
+        ]
+        total_amount = round(sum(it["quantity"] * it["unit_price"] for it in items), 2)
+        return {
+            "platform_order_no": platform_order_no,
+            "order_date": order_date,
+            "status": rng.choice(ORDER_STATUSES),
+            "customer_key": f"{self.platform_code.upper()}-{rng.randint(10000, 99999)}",
+            "customer_name": rng.choice(DUMMY_CUSTOMER_NAMES),
+            "customer_phone": f"010-{rng.randint(1000, 9999)}-{rng.randint(1000, 9999)}",
+            "total_amount": total_amount,
+            "discount_amount": 0.0,
+            "items": items,
+        }
+
+    def _dummy_settlements(self, start_date: date, end_date: date, cycle_days: int) -> list[dict[str, Any]]:
+        rng = random.Random(f"{self.platform_code}:settlement:{start_date.isoformat()}:{end_date.isoformat()}")
+        settlements = []
+        cursor = start_date
+        while cursor < end_date:
+            cycle_end = min(cursor + timedelta(days=cycle_days), end_date)
+            amount = round(rng.uniform(500000, 5000000), 2)
+            settlements.append(
+                {
+                    "settlement_cycle": f"{cursor.isoformat()}~{cycle_end.isoformat()}",
+                    "scheduled_date": cycle_end + timedelta(days=3),
+                    "settled_date": cycle_end + timedelta(days=3) if cycle_end < end_date else None,
+                    "expected_amount": amount,
+                    "settled_amount": amount if cycle_end < end_date else 0.0,
+                    "status": "COMPLETED" if cycle_end < end_date else "SCHEDULED",
+                }
+            )
+            cursor = cycle_end
+        return settlements

@@ -1,0 +1,401 @@
+import { useState, type FormEvent } from 'react'
+import { api, ApiError } from '../api/client'
+import { useApiData } from '../api/useApiData'
+import type {
+  ApiCredentialMasked,
+  ApiCredentialUpsert,
+  Platform,
+  RolePermissions,
+  SettingsPermission,
+  SettingsRole,
+  SettingsUser,
+  SettingsUserCreate,
+  SystemSetting,
+} from '../api/types'
+
+// 설정 화면: 사용자관리/역할관리/권한관리/API Credential관리/시스템설정 5개 탭.
+// 전체가 백엔드 SETTINGS_MANAGE 권한으로 보호되며, 이 화면 자체도 그 권한이 있는
+// 사용자에게만 사이드바 메뉴로 노출된다(Layout.tsx의 role 기반 메뉴 숨김 참고).
+
+function UsersTab() {
+  const { data, error, isLoading, reload } = useApiData<SettingsUser[]>(() => api.get('/api/settings/users'), [])
+  const { data: roles } = useApiData<SettingsRole[]>(() => api.get('/api/settings/roles'), [])
+  const [form, setForm] = useState<SettingsUserCreate>({ username: '', password: '', name: '', role_id: 0 })
+  const [createError, setCreateError] = useState<string | null>(null)
+
+  const handleCreate = async (e: FormEvent) => {
+    e.preventDefault()
+    if (!form.username || !form.password || !form.name || !form.role_id) {
+      setCreateError('아이디/비밀번호/이름/역할을 모두 입력하세요.')
+      return
+    }
+    setCreateError(null)
+    try {
+      await api.post('/api/settings/users', form)
+      setForm({ username: '', password: '', name: '', role_id: 0 })
+      reload()
+    } catch (err) {
+      setCreateError(err instanceof ApiError ? err.message : '사용자 등록 중 오류가 발생했습니다.')
+    }
+  }
+
+  async function toggleActive(user: SettingsUser) {
+    await api.patch(`/api/settings/users/${user.id}`, { is_active: !user.is_active })
+    reload()
+  }
+
+  async function changeRole(user: SettingsUser, roleId: number) {
+    await api.patch(`/api/settings/users/${user.id}`, { role_id: roleId })
+    reload()
+  }
+
+  return (
+    <div>
+      <form className="inline-form" onSubmit={handleCreate}>
+        <input value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} placeholder="아이디" />
+        <input
+          type="password"
+          value={form.password}
+          onChange={(e) => setForm({ ...form, password: e.target.value })}
+          placeholder="비밀번호"
+        />
+        <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="이름" />
+        <select value={form.role_id} onChange={(e) => setForm({ ...form, role_id: Number(e.target.value) })}>
+          <option value={0}>역할 선택</option>
+          {roles?.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
+        </select>
+        <button type="submit">사용자 등록</button>
+      </form>
+      {createError && <p className="form-error">{createError}</p>}
+
+      {isLoading && <p>불러오는 중...</p>}
+      {error && <p className="form-error">{error}</p>}
+      {data && (
+        <table className="data-table">
+          <thead>
+            <tr><th>ID</th><th>아이디</th><th>이름</th><th>역할</th><th>상태</th><th></th></tr>
+          </thead>
+          <tbody>
+            {data.map((u) => (
+              <tr key={u.id}>
+                <td>{u.id}</td>
+                <td>{u.username}</td>
+                <td>{u.name}</td>
+                <td>
+                  <select value={u.role_id} onChange={(e) => changeRole(u, Number(e.target.value))}>
+                    {roles?.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
+                  </select>
+                </td>
+                <td>{u.is_active ? '활성' : '비활성'}</td>
+                <td>
+                  <button type="button" onClick={() => toggleActive(u)}>{u.is_active ? '비활성화' : '활성화'}</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  )
+}
+
+function RolesTab() {
+  const { data, error, isLoading, reload } = useApiData<SettingsRole[]>(() => api.get('/api/settings/roles'), [])
+  const [form, setForm] = useState({ name: '', description: '' })
+  const [createError, setCreateError] = useState<string | null>(null)
+
+  const handleCreate = async (e: FormEvent) => {
+    e.preventDefault()
+    if (!form.name) {
+      setCreateError('역할 이름을 입력하세요.')
+      return
+    }
+    setCreateError(null)
+    try {
+      await api.post('/api/settings/roles', form)
+      setForm({ name: '', description: '' })
+      reload()
+    } catch (err) {
+      setCreateError(err instanceof ApiError ? err.message : '역할 등록 중 오류가 발생했습니다.')
+    }
+  }
+
+  return (
+    <div>
+      <form className="inline-form" onSubmit={handleCreate}>
+        <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="역할 이름" />
+        <input
+          value={form.description}
+          onChange={(e) => setForm({ ...form, description: e.target.value })}
+          placeholder="설명"
+        />
+        <button type="submit">역할 등록</button>
+      </form>
+      {createError && <p className="form-error">{createError}</p>}
+
+      {isLoading && <p>불러오는 중...</p>}
+      {error && <p className="form-error">{error}</p>}
+      {data && (
+        <table className="data-table">
+          <thead><tr><th>ID</th><th>이름</th><th>설명</th></tr></thead>
+          <tbody>
+            {data.map((r) => (
+              <tr key={r.id}><td>{r.id}</td><td>{r.name}</td><td>{r.description ?? '-'}</td></tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  )
+}
+
+function PermissionsTab() {
+  const { data: roles } = useApiData<SettingsRole[]>(() => api.get('/api/settings/roles'), [])
+  const { data: permissions } = useApiData<SettingsPermission[]>(() => api.get('/api/settings/permissions'), [])
+  const [roleId, setRoleId] = useState<number>(0)
+  const { data: rolePerms, reload } = useApiData<RolePermissions | null>(
+    () => (roleId ? api.get(`/api/settings/roles/${roleId}/permissions`) : Promise.resolve(null)),
+    [roleId],
+  )
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const [checked, setChecked] = useState<Set<string>>(new Set())
+
+  // 서버에서 새로 받아온 매핑으로 체크박스 상태를 동기화한다.
+  const currentCodes = rolePerms?.permission_codes.join(',') ?? ''
+  const [syncedFor, setSyncedFor] = useState('')
+  if (currentCodes !== syncedFor) {
+    setSyncedFor(currentCodes)
+    setChecked(new Set(rolePerms?.permission_codes ?? []))
+  }
+
+  function toggle(code: string) {
+    setChecked((prev) => {
+      const next = new Set(prev)
+      if (next.has(code)) next.delete(code)
+      else next.add(code)
+      return next
+    })
+  }
+
+  async function handleSave() {
+    setSaveError(null)
+    try {
+      await api.patch(`/api/settings/roles/${roleId}/permissions`, { permission_codes: [...checked] })
+      reload()
+    } catch (err) {
+      setSaveError(err instanceof ApiError ? err.message : '권한 저장 중 오류가 발생했습니다.')
+    }
+  }
+
+  return (
+    <div>
+      <div className="filter-bar">
+        <select value={roleId} onChange={(e) => setRoleId(Number(e.target.value))}>
+          <option value={0}>역할을 선택하세요</option>
+          {roles?.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
+        </select>
+        {roleId > 0 && <button type="button" onClick={handleSave}>권한 저장</button>}
+      </div>
+      {saveError && <p className="form-error">{saveError}</p>}
+      {roleId > 0 && permissions && (
+        <table className="data-table">
+          <thead><tr><th>메뉴</th><th>권한 코드</th><th>이름</th><th>부여</th></tr></thead>
+          <tbody>
+            {permissions.map((p) => (
+              <tr key={p.id}>
+                <td>{p.menu_group ?? '-'}</td>
+                <td>{p.code}</td>
+                <td>{p.name}</td>
+                <td>
+                  <input type="checkbox" checked={checked.has(p.code)} onChange={() => toggle(p.code)} />
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  )
+}
+
+// 커넥터(integrations/malls/naver_smartstore_connector.py _get_credentials())가 실제로
+// 조회하는 key_name과 정확히 일치해야 한다 - 자유 입력을 허용하면 오탈자/임의 명칭으로
+// 등록해도 저장 자체는 성공해버려서, 실제로는 계속 더미 데이터로 폴백되는데도 사용자가
+// 이를 알아챌 방법이 없다(실제로 이 문제가 발생했었음). 그래서 드롭다운으로 못박는다.
+const CREDENTIAL_KEY_NAMES = ['client_id', 'client_secret'] as const
+
+function CredentialsTab() {
+  const { data: platforms } = useApiData<Platform[]>(() => api.get('/api/platforms'), [])
+  const [ownerId, setOwnerId] = useState<number>(0)
+  const { data, error, isLoading, reload } = useApiData<ApiCredentialMasked[]>(
+    () => (ownerId ? api.get(`/api/settings/api-credentials?owner_type=PLATFORM&owner_id=${ownerId}`) : Promise.resolve([])),
+    [ownerId],
+  )
+  const [form, setForm] = useState({ key_name: CREDENTIAL_KEY_NAMES[0] as string, plain_value: '' })
+  const [formError, setFormError] = useState<string | null>(null)
+
+  const handleSave = async (e: FormEvent) => {
+    e.preventDefault()
+    if (!ownerId || !form.key_name || !form.plain_value) {
+      setFormError('플랫폼/키 이름/값을 모두 입력하세요.')
+      return
+    }
+    setFormError(null)
+    try {
+      const payload: ApiCredentialUpsert = { owner_type: 'PLATFORM', owner_id: ownerId, key_name: form.key_name, plain_value: form.plain_value }
+      await api.post('/api/settings/api-credentials', payload)
+      setForm({ key_name: CREDENTIAL_KEY_NAMES[0], plain_value: '' })
+      reload()
+    } catch (err) {
+      setFormError(err instanceof ApiError ? err.message : 'API Credential 저장 중 오류가 발생했습니다.')
+    }
+  }
+
+  async function handleDelete(id: number) {
+    await api.del(`/api/settings/api-credentials/${id}`)
+    reload()
+  }
+
+  const registeredKeyNames = new Set(data?.map((c) => c.key_name) ?? [])
+  const missingKeys = CREDENTIAL_KEY_NAMES.filter((k) => !registeredKeyNames.has(k))
+
+  return (
+    <div>
+      <p className="hint-text">
+        API 키/시크릿은 서버에 암호화(Fernet)되어 저장되며, 조회 시 마지막 4자리만 표시됩니다. 현재 네이버
+        스마트스토어(NaverSmartstoreConnector)만 실제 API 연동을 지원하며, client_id/client_secret 두 개가 모두
+        등록돼야 실제 호출을 시도합니다(하나라도 없으면 더미 데이터로 동작합니다).
+      </p>
+      <form className="inline-form" onSubmit={handleSave}>
+        <select value={ownerId} onChange={(e) => setOwnerId(Number(e.target.value))}>
+          <option value={0}>플랫폼 선택</option>
+          {platforms?.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+        </select>
+        <select value={form.key_name} onChange={(e) => setForm({ ...form, key_name: e.target.value })}>
+          {CREDENTIAL_KEY_NAMES.map((k) => <option key={k} value={k}>{k}</option>)}
+        </select>
+        <input
+          type="password"
+          value={form.plain_value}
+          onChange={(e) => setForm({ ...form, plain_value: e.target.value })}
+          placeholder="값"
+        />
+        <button type="submit">저장</button>
+      </form>
+      {formError && <p className="form-error">{formError}</p>}
+      {ownerId > 0 && missingKeys.length > 0 && (
+        <p className="form-error">
+          아직 등록되지 않은 키: {missingKeys.join(', ')} - 이 상태에서는 실제 API를 호출하지 않고 더미 데이터로 동작합니다.
+        </p>
+      )}
+
+      {isLoading && <p>불러오는 중...</p>}
+      {error && <p className="form-error">{error}</p>}
+      {ownerId > 0 && data && (
+        <table className="data-table">
+          <thead><tr><th>키 이름</th><th>값(마스킹)</th><th>수정일시</th><th></th></tr></thead>
+          <tbody>
+            {data.map((c) => (
+              <tr key={c.id}>
+                <td>{c.key_name}</td>
+                <td>{c.masked_value}</td>
+                <td>{new Date(c.updated_at).toLocaleString()}</td>
+                <td><button type="button" onClick={() => handleDelete(c.id)}>삭제</button></td>
+              </tr>
+            ))}
+            {data.length === 0 && <tr><td colSpan={4}>등록된 API Credential이 없습니다.</td></tr>}
+          </tbody>
+        </table>
+      )}
+    </div>
+  )
+}
+
+function SystemSettingsTab() {
+  const { data, error, isLoading, reload } = useApiData<SystemSetting[]>(() => api.get('/api/settings/system'), [])
+  const [form, setForm] = useState({ category: 'BACKUP', key: '', value: '' })
+  const [formError, setFormError] = useState<string | null>(null)
+
+  const handleSave = async (e: FormEvent) => {
+    e.preventDefault()
+    if (!form.key) {
+      setFormError('키를 입력하세요.')
+      return
+    }
+    setFormError(null)
+    try {
+      await api.patch('/api/settings/system', form)
+      setForm({ ...form, key: '', value: '' })
+      reload()
+    } catch (err) {
+      setFormError(err instanceof ApiError ? err.message : '시스템 설정 저장 중 오류가 발생했습니다.')
+    }
+  }
+
+  return (
+    <div>
+      <form className="inline-form" onSubmit={handleSave}>
+        <select value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })}>
+          <option value="BACKUP">BACKUP</option>
+          <option value="REPORT">REPORT</option>
+          <option value="SYSTEM">SYSTEM</option>
+        </select>
+        <input value={form.key} onChange={(e) => setForm({ ...form, key: e.target.value })} placeholder="키" />
+        <input value={form.value} onChange={(e) => setForm({ ...form, value: e.target.value })} placeholder="값" />
+        <button type="submit">저장</button>
+      </form>
+      {formError && <p className="form-error">{formError}</p>}
+
+      {isLoading && <p>불러오는 중...</p>}
+      {error && <p className="form-error">{error}</p>}
+      {data && (
+        <table className="data-table">
+          <thead><tr><th>카테고리</th><th>키</th><th>값</th><th>수정일시</th></tr></thead>
+          <tbody>
+            {data.map((s) => (
+              <tr key={s.id}><td>{s.category}</td><td>{s.key}</td><td>{s.value ?? '-'}</td><td>{new Date(s.updated_at).toLocaleString()}</td></tr>
+            ))}
+            {data.length === 0 && <tr><td colSpan={4}>등록된 설정이 없습니다.</td></tr>}
+          </tbody>
+        </table>
+      )}
+    </div>
+  )
+}
+
+type SettingsTab = 'users' | 'roles' | 'permissions' | 'credentials' | 'system'
+
+export function SettingsPage() {
+  const [tab, setTab] = useState<SettingsTab>('users')
+
+  const TABS: Array<{ key: SettingsTab; label: string }> = [
+    { key: 'users', label: '사용자 관리' },
+    { key: 'roles', label: '역할 관리' },
+    { key: 'permissions', label: '권한 관리' },
+    { key: 'credentials', label: 'API Credential 관리' },
+    { key: 'system', label: '시스템 설정' },
+  ]
+
+  return (
+    <div>
+      <h2>설정</h2>
+      <div className="tabs">
+        {TABS.map((t) => (
+          <button
+            key={t.key}
+            type="button"
+            className={'tab-button' + (tab === t.key ? ' active' : '')}
+            onClick={() => setTab(t.key)}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+      {tab === 'users' && <UsersTab />}
+      {tab === 'roles' && <RolesTab />}
+      {tab === 'permissions' && <PermissionsTab />}
+      {tab === 'credentials' && <CredentialsTab />}
+      {tab === 'system' && <SystemSettingsTab />}
+    </div>
+  )
+}

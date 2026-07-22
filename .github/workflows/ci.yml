@@ -1,0 +1,48 @@
+# .github/workflows/ci.yml
+# --------------------------
+# Push/PR마다 4순위(개발 품질 향상)에서 구성한 도구들을 그대로 실행한다.
+# .pre-commit-config.yaml의 로컬 훅과 동일한 명령/대상 디렉터리를 쓰므로,
+# 로컬에서 pre-commit이 통과하면 CI도 통과하는 것이 원칙이다.
+#
+# Python 버전은 requires-python(pyproject.toml, ">=3.11")이 아니라 이
+# 프로젝트가 실제로 개발/검증해 온 3.14를 사용한다 - requirements.txt의
+# 여러 패키지 버전(SQLAlchemy 2.0.51, pydantic 2.13.4, pandas 2.3.3 등)이
+# 전부 "Python 3.14용 wheel이 없어서/충돌해서" 상향된 것들이라, 3.11에서
+# 그대로 통과한다는 보장이 없다. 3.11 지원 여부를 검증하려면 별도로
+# 매트릭스를 추가해야 한다.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Ruff (lint)
+        run: ruff check .
+
+      - name: Black (format check)
+        run: black --check .
+
+      - name: MyPy (type check)
+        run: mypy models config core repositories services api integrations scheduler scripts tests
+
+      - name: Pytest
+        run: pytest -q

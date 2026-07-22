@@ -1,0 +1,119 @@
+# docker-compose.yml
+# --------------------
+# 운영 준비 구성: PostgreSQL(db) + Redis(redis) + FastAPI(api) +
+# 스케줄러(scheduler) + React+Nginx(web).
+#
+# 실행:
+#   docker compose up --build
+#
+# api 컨테이너는 시작할 때
+#   1) alembic upgrade head        (2순위에서 검증한 초기 마이그레이션 적용)
+#   2) python scripts/init_db.py   (역할/권한/기본 admin 계정/플랫폼/창고 시딩,
+#                                    이미 존재하면 각 단계가 알아서 건너뜀)
+#   3) uvicorn 기동
+# 순서로 동작하므로, 최초 실행만으로 로그인 가능한 상태(admin / ChangeMe!123 -
+# 로그인 후 반드시 변경)까지 준비된다. scheduler 컨테이너는 동일 이미지로
+# scheduler/scheduler.py(APScheduler)만 별도 프로세스로 띄운다 - api가 요청을
+# 처리하는 동안 배치 작업이 API 응답 지연에 영향을 주지 않도록 분리했다.
+#
+# redis는 이번 5순위 작업 범위상 "운영 스택 구성요소로 함께 기동"까지만
+# 다룬다 - 현재 애플리케이션 코드는 아직 Redis를 사용하지 않는다(캐시/세션
+# 등에 실제로 연결하는 것은 새 기능 추가에 해당해 이번 범위에서 제외했다).
+# 추후 캐시/세션 스토어가 필요해지면 이 컨테이너를 그대로 재사용하면 된다.
+#
+# DB/JWT/암호화키 등은 데모용 기본값이며, 실제 배포 시에는 반드시
+# 별도의 안전한 값으로 교체해야 한다(.env.example과 동일한 항목들. 배포
+# 절차는 DEPLOYMENT.md 참고).
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: erp-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: erp_db
+      POSTGRES_USER: erp_user
+      POSTGRES_PASSWORD: erp_password_change_me
+    ports:
+      - "5432:5432"
+    volumes:
+      - erp_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U erp_user -d erp_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: erp-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - erp_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    container_name: erp-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://erp_user:erp_password_change_me@db:5432/erp_db
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: please-change-this-to-a-random-secret-string
+      CREDENTIAL_ENCRYPTION_KEY: please-change-this-to-a-generated-fernet-key
+      DEBUG: "false"
+    ports:
+      - "8000:8000"
+    command: sh -c "alembic upgrade head && python scripts/init_db.py && uvicorn api.main:app --host 0.0.0.0 --port 8000"
+    volumes:
+      - erp_logs:/app/logs
+      - erp_backup:/app/backup
+      - erp_reports:/app/reports
+
+  scheduler:
+    build: .
+    container_name: erp-scheduler
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql+psycopg://erp_user:erp_password_change_me@db:5432/erp_db
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: please-change-this-to-a-random-secret-string
+      CREDENTIAL_ENCRYPTION_KEY: please-change-this-to-a-generated-fernet-key
+      DEBUG: "false"
+    command: python scheduler/scheduler.py
+    volumes:
+      - erp_logs:/app/logs
+      - erp_backup:/app/backup
+      - erp_reports:/app/reports
+
+  web:
+    build: ./frontend
+    container_name: erp-web
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "80:80"
+
+volumes:
+  erp_pg_data:
+  erp_redis_data:
+  erp_logs:
+  erp_backup:
+  erp_reports:
