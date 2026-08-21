@@ -425,3 +425,211 @@ class TestSyncOrdersInventoryConflictDoesNotAbortBatch:
         db_session.refresh(inventory_row)
         assert inventory_row.reserved_stock == 80  # 성공한 2건만 예약
         assert inventory_row.reserved_stock <= inventory_row.sellable_stock  # I1 유지
+
+
+# ── 상품주문번호(platform_order_item_no) 하이브리드 로직 테스트 ──────────────
+
+
+class ConfigurableConnector(BaseMallConnector):
+    """raw 주문 목록을 그대로 반환하는 스텁(상품주문번호 라인 제어용)."""
+
+    platform_code = "stub-cfg"
+
+    def __init__(self, raw_orders):
+        self._raw = raw_orders
+
+    def fetch_orders(self, start_date, end_date):
+        return self._raw
+
+    def fetch_order_detail(self, platform_order_no):
+        raise NotImplementedError
+
+    def update_shipment(self, platform_order_no, carrier, tracking_no):
+        raise NotImplementedError
+
+    def fetch_settlements(self, start_date, end_date):
+        raise NotImplementedError
+
+
+def _raw_order(order_no, option_id, items):
+    """items: list of (poin, qty) - 모두 같은 platform_option_id(option_id)를 사용."""
+    return {
+        "platform_order_no": order_no,
+        "order_date": datetime.now(timezone.utc),
+        "status": "DELIVERED",  # 재고 예약/차감 분기를 타지 않도록 배송완료(release_reserved=False)
+        "customer_key": f"C-{order_no}",
+        "customer_name": "n",
+        "customer_phone": None,
+        "total_amount": 10000.0,
+        "discount_amount": 0.0,
+        "items": [
+            {"platform_order_item_no": poin, "platform_option_id": option_id, "quantity": qty, "unit_price": 5000.0}
+            for (poin, qty) in items
+        ],
+    }
+
+
+class TestPlatformOrderItemNo:
+    def _items(self, db_session, order_no):
+        order = db_session.query(Order).filter_by(platform_order_no=order_no).one()
+        return db_session.query(OrderItem).filter_by(order_id=order.id).all()
+
+    def test_same_sku_different_poin_creates_separate_lines(self, db_session, platform, warehouse, platform_map):
+        opt = platform_map.platform_option_id
+        conn = ConfigurableConnector([_raw_order("PO-A", opt, [("PON-1", 1), ("PON-2", 2)])])
+        OrderSyncService(db_session).sync_orders(conn, platform.id, warehouse.id, SYNC_START, SYNC_END)
+
+        items = self._items(db_session, "PO-A")
+        assert len(items) == 2  # 같은 SKU라도 상품주문번호가 다르면 별도 라인
+        assert {i.platform_order_item_no for i in items} == {"PON-1", "PON-2"}
+
+    def test_resync_same_poin_no_duplicate(self, db_session, platform, warehouse, platform_map):
+        opt = platform_map.platform_option_id
+        conn = ConfigurableConnector([_raw_order("PO-B", opt, [("PON-10", 1), ("PON-11", 1)])])
+        svc = OrderSyncService(db_session)
+        svc.sync_orders(conn, platform.id, warehouse.id, SYNC_START, SYNC_END)
+        svc.sync_orders(conn, platform.id, warehouse.id, SYNC_START, SYNC_END)  # 재수집
+
+        items = self._items(db_session, "PO-B")
+        assert len(items) == 2  # 재수집해도 중복 생성 없음(상품주문번호 재사용)
+
+    def test_duplicate_poin_in_batch_skips_second(self, db_session, platform, warehouse, platform_map, caplog):
+        import logging
+
+        opt = platform_map.platform_option_id
+        conn = ConfigurableConnector([_raw_order("PO-C", opt, [("PON-DUP", 1), ("PON-DUP", 1)])])
+        with caplog.at_level(logging.WARNING):
+            OrderSyncService(db_session).sync_orders(conn, platform.id, warehouse.id, SYNC_START, SYNC_END)
+
+        items = self._items(db_session, "PO-C")
+        assert len(items) == 1  # 동일 상품주문번호 두 라인 -> 하나만
+        assert "동일 상품주문번호" in caplog.text
+
+    def test_protection_skips_when_existing_null_poin(
+        self, db_session, platform, warehouse, product_option, platform_map, caplog
+    ):
+        import logging
+
+        # 과거 데이터: 상품주문번호 없는(NULL) OrderItem이 이미 있는 주문
+        order = Order(
+            platform_id=platform.id,
+            platform_order_no="PO-OLD",
+            status="DELIVERED",
+            order_date=datetime.now(timezone.utc),
+            total_amount=5000,
+            discount_amount=0,
+        )
+        db_session.add(order)
+        db_session.flush()
+        db_session.add(
+            OrderItem(
+                order_id=order.id,
+                product_option_id=product_option.id,
+                platform_order_item_no=None,
+                quantity=1,
+                unit_price=5000,
+                line_amount=5000,
+            )
+        )
+        db_session.flush()
+        before = self._items(db_session, "PO-OLD")
+
+        # 이제 상품주문번호가 있는 응답으로 재수집 -> 보호장치로 스킵되어야 함
+        conn = ConfigurableConnector([_raw_order("PO-OLD", platform_map.platform_option_id, [("PON-X", 1)])])
+        with caplog.at_level(logging.WARNING):
+            OrderSyncService(db_session).sync_orders(conn, platform.id, warehouse.id, SYNC_START, SYNC_END)
+
+        after = self._items(db_session, "PO-OLD")
+        assert len(after) == len(before) == 1  # 신규 라인 미생성(수량·금액 중복 방지)
+        assert after[0].platform_order_item_no is None  # 기존 NULL 라인 덮어쓰지 않음
+        assert "상품주문번호 매칭 필요" in caplog.text
+
+    def test_no_poin_uses_sku_dedup(self, db_session, platform, warehouse, platform_map):
+        # 상품주문번호 미제공(None) -> 기존 SKU 기반 dedup(같은 SKU 재수집 시 1행 유지)
+        opt = platform_map.platform_option_id
+        conn = ConfigurableConnector([_raw_order("PO-NOPOIN", opt, [(None, 1)])])
+        svc = OrderSyncService(db_session)
+        svc.sync_orders(conn, platform.id, warehouse.id, SYNC_START, SYNC_END)
+        svc.sync_orders(conn, platform.id, warehouse.id, SYNC_START, SYNC_END)
+        items = self._items(db_session, "PO-NOPOIN")
+        assert len(items) == 1
+        assert items[0].platform_order_item_no is None
+
+    def test_conflict_one_order_does_not_pollute_others(
+        self, db_session, platform, warehouse, product_option, platform_map, caplog
+    ):
+        import logging
+
+        # 모호(NULL 라인 보유) 주문 + 정상 신규 주문을 한 배치에 섞는다.
+        old = Order(
+            platform_id=platform.id,
+            platform_order_no="PO-CONFLICT",
+            status="DELIVERED",
+            order_date=datetime.now(timezone.utc),
+            total_amount=5000,
+            discount_amount=0,
+        )
+        db_session.add(old)
+        db_session.flush()
+        db_session.add(
+            OrderItem(
+                order_id=old.id,
+                product_option_id=product_option.id,
+                platform_order_item_no=None,
+                quantity=1,
+                unit_price=5000,
+                line_amount=5000,
+            )
+        )
+        db_session.flush()
+
+        opt = platform_map.platform_option_id
+        conn = ConfigurableConnector(
+            [
+                _raw_order("PO-CONFLICT", opt, [("PON-C1", 1)]),  # 보호장치로 스킵
+                _raw_order("PO-OK", opt, [("PON-OK1", 1)]),  # 정상 수집
+            ]
+        )
+        with caplog.at_level(logging.WARNING):
+            OrderSyncService(db_session).sync_orders(conn, platform.id, warehouse.id, SYNC_START, SYNC_END)
+
+        assert len(self._items(db_session, "PO-CONFLICT")) == 1  # 스킵(오염 없음)
+        ok = self._items(db_session, "PO-OK")
+        assert len(ok) == 1 and ok[0].platform_order_item_no == "PON-OK1"  # 정상 주문은 영향 없음
+
+    def test_null_poin_multiple_rows_allowed(
+        self, db_session, platform, warehouse, product_option, second_product_option
+    ):
+        # 서로 다른 SKU, 둘 다 상품주문번호 NULL -> 유니크 인덱스가 NULL 다중 허용
+        order = Order(
+            platform_id=platform.id,
+            platform_order_no="PO-NULLS",
+            status="DELIVERED",
+            order_date=datetime.now(timezone.utc),
+            total_amount=5000,
+            discount_amount=0,
+        )
+        db_session.add(order)
+        db_session.flush()
+        db_session.add(
+            OrderItem(
+                order_id=order.id,
+                product_option_id=product_option.id,
+                platform_order_item_no=None,
+                quantity=1,
+                unit_price=5000,
+                line_amount=5000,
+            )
+        )
+        db_session.add(
+            OrderItem(
+                order_id=order.id,
+                product_option_id=second_product_option.id,
+                platform_order_item_no=None,
+                quantity=1,
+                unit_price=5000,
+                line_amount=5000,
+            )
+        )
+        db_session.flush()  # NULL 2행이 유니크 제약에 걸리지 않아야 함
+        assert len(self._items(db_session, "PO-NULLS")) == 2

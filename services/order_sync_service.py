@@ -60,6 +60,14 @@ SHIPPED_STATUSES = {"SHIPPING", "DELIVERED", "EXCHANGED", "RETURNED", "REFUNDED"
 UNSHIPPED_STATUSES = {"NEW", "PREPARING"}
 
 
+def _clip(value: Any, length: int) -> Optional[str]:
+    """문자열을 컬럼 길이에 맞춰 자른다(마켓 데이터가 길어도 저장 실패하지 않도록)."""
+    if value is None:
+        return None
+    text = str(value)
+    return text[:length] if len(text) > length else text
+
+
 class OrderSyncService:
     def __init__(self, session: Session) -> None:
         self.session = session
@@ -83,6 +91,8 @@ class OrderSyncService:
             for raw in raw_orders:
                 existing = self.order_repo.get_by_platform_order_no(platform_id, raw["platform_order_no"])
                 if existing:
+                    # 이전에 수집된 주문에도 배송지 정보가 비어 있으면 채운다(재수집 시 backfill).
+                    self._fill_receiver_info(existing, raw)
                     if existing.status != raw["status"]:
                         self.apply_status_change(existing, raw["status"], warehouse_id)
                         updated += 1
@@ -139,6 +149,23 @@ class OrderSyncService:
             )
         )
 
+    @staticmethod
+    def _fill_receiver_info(order: Order, raw: dict[str, Any]) -> None:
+        """이미 존재하는 주문에 배송지(수취인) 정보가 비어 있으면 커넥터 값으로 채운다.
+
+        이미 값이 있으면 덮어쓰지 않는다(운영자가 수정했을 수 있으므로).
+        """
+        if order.receiver_name is None and raw.get("receiver_name"):
+            order.receiver_name = _clip(raw.get("receiver_name"), 50)
+        if order.receiver_phone is None and raw.get("receiver_phone"):
+            order.receiver_phone = _clip(raw.get("receiver_phone"), 20)
+        if order.receiver_zipcode is None and raw.get("receiver_zipcode"):
+            order.receiver_zipcode = _clip(raw.get("receiver_zipcode"), 10)
+        if order.receiver_address is None and raw.get("receiver_address"):
+            order.receiver_address = _clip(raw.get("receiver_address"), 500)
+        if order.delivery_message is None and raw.get("delivery_message"):
+            order.delivery_message = _clip(raw.get("delivery_message"), 500)
+
     def _create_order(self, platform_id: int, warehouse_id: int, raw: dict[str, Any]) -> tuple[Order, int, int]:
         customer = self._get_or_create_customer(platform_id, raw)
 
@@ -152,6 +179,12 @@ class OrderSyncService:
             delivery_completed_date=raw["order_date"] if raw["status"] == "DELIVERED" else None,
             total_amount=raw["total_amount"],
             discount_amount=raw.get("discount_amount", 0.0),
+            # 배송지(수취인) 정보 - 커넥터가 수집한 값을 저장한다(없으면 None).
+            receiver_name=_clip(raw.get("receiver_name"), 50),
+            receiver_phone=_clip(raw.get("receiver_phone"), 20),
+            receiver_zipcode=_clip(raw.get("receiver_zipcode"), 10),
+            receiver_address=_clip(raw.get("receiver_address"), 500),
+            delivery_message=_clip(raw.get("delivery_message"), 500),
         )
         self.session.add(order)
         self.session.flush()
@@ -178,10 +211,33 @@ class OrderSyncService:
         네이버 상품 동기화나 상품관리 화면에서 매핑이 채워지면(또는 이번 호출에서
         자동 매칭되면) 다음 재수집 시 자동으로 채워진다.
         """
-        already_mapped_option_ids = {item.product_option_id for item in self.order_repo.list_items(order.id)}
+        existing_items = self.order_repo.list_items(order.id)
+        incoming_has_poin = any((it.get("platform_order_item_no") or None) for it in raw["items"])
+        existing_has_null_poin = any(x.platform_order_item_no is None for x in existing_items)
+
+        # 보호장치(재수집 안전): 이미 아이템이 있고 그 중 상품주문번호(NULL)인 라인이 있는데
+        # 이번 응답에 상품주문번호가 있으면, 상품주문번호 기준으로 라인을 새로 만들 경우
+        # 기존 NULL 라인 옆에 중복 라인이 생겨 수량·금액·재고가 중복될 수 있다. 그래서
+        # 이 주문의 아이템 동기화는 안전하게 스킵하고 구조화 경고만 남긴다(개인정보·전체
+        # 상품주문번호 미출력). 주문 자체(상태/수취인)는 상위에서 별도 처리된다.
+        # 로그는 주문당 1회(라인별 아님)라 과다 기록되지 않는다.
+        # TODO: 향후 "상품주문번호 매칭 필요" 상태 컬럼을 두면 반복 경고를 억제할 수 있다.
+        if existing_items and existing_has_null_poin and incoming_has_poin:
+            logger.warning(
+                "상품주문번호 매칭 필요로 아이템 동기화를 스킵합니다(수량·금액 중복 방지): "
+                "order_id=%s, 기존라인수=%d",
+                order.id,
+                len(existing_items),
+            )
+            return 0, 0
+
+        existing_by_poin = {x.platform_order_item_no: x for x in existing_items if x.platform_order_item_no}
+        existing_option_ids = {x.product_option_id for x in existing_items}
+        seen_poin_in_batch: set[str] = set()
         skipped_items = 0
         auto_matched = 0
         for item in raw["items"]:
+            poin = item.get("platform_order_item_no") or None
             mapping = self.platform_map_repo.get_by_option_id(platform_id, item["platform_option_id"])
             if mapping is None:
                 mapping = self.product_sync_service.match_unmapped_item(platform_id, item, raw["platform_order_no"])
@@ -190,57 +246,76 @@ class OrderSyncService:
                 else:
                     skipped_items += 1
                     continue
-            if mapping.product_option_id in already_mapped_option_ids:
-                continue
-            cost_record = self.cost_history_repo.get_effective_cost(mapping.product_option_id, raw["order_date"])
-            self.session.add(
-                OrderItem(
-                    order_id=order.id,
-                    product_option_id=mapping.product_option_id,
-                    quantity=item["quantity"],
-                    unit_price=item["unit_price"],
-                    cost_price_snapshot=cost_record.cost_price if cost_record else None,
-                    line_amount=round(item["quantity"] * item["unit_price"], 2),
-                )
-            )
-            try:
-                if raw["status"] in SHIPPED_STATUSES:
-                    self.inventory_service.deduct_on_shipment(
-                        mapping.product_option_id,
-                        warehouse_id,
-                        item["quantity"],
-                        reference_id=order.id,
-                        release_reserved=False,
+            if poin is not None:
+                # 배치 내 동일 상품주문번호가 두 라인에 연결되면 오류로 보고 두 번째는 스킵.
+                if poin in seen_poin_in_batch:
+                    logger.warning(
+                        "동일 상품주문번호가 한 주문의 두 라인에 연결됨 - 두 번째 라인 스킵: order_id=%s", order.id
                     )
-                elif raw["status"] in UNSHIPPED_STATUSES:
-                    self.inventory_service.reserve(mapping.product_option_id, warehouse_id, item["quantity"])
-            except ValueError:
-                # 재고관리 화면에 이 SKU-창고 조합의 재고 레코드가 아직 등록되지 않은 경우
-                # (InventoryService._get_inventory가 ValueError를 던진다). 주문상품 자체는
-                # 정상 반영하고 재고 반영만 건너뛴다 - SKU 매핑이 없는 경우와 마찬가지로
-                # 외부 데이터/설정 미비를 이유로 전체 동기화를 중단시키지 않는다.
-                logger.warning(
-                    "재고 레코드가 없어 재고 반영을 건너뜁니다: option=%s, warehouse=%s, order_id=%s",
-                    mapping.product_option_id,
-                    warehouse_id,
-                    order.id,
-                )
-            except (InventoryInvariantError, InsufficientStockError) as e:
-                # 채널 재고와 내부 재고가 어긋나 예약/차감이 불변조건을 위반하는 경우.
-                # 외부에서 이미 성립된 주문이므로 주문 자체는 반드시 남겨야 하고,
-                # 재고 반영만 건너뛴다. 여기서 예외를 통과시키면 sync_orders()의
-                # 최상위 except가 rollback을 수행해 **이번 회차에 수집한 모든 주문이
-                # 통째로 사라진다**(주문 1건의 재고 문제로 정상 주문 수십 건 유실).
-                logger.warning(
-                    "재고 불변조건 위반으로 재고 반영을 건너뜁니다(주문은 정상 수집): "
-                    "option=%s, warehouse=%s, order_id=%s, 사유=%s",
-                    mapping.product_option_id,
-                    warehouse_id,
-                    order.id,
-                    e,
-                )
+                    continue
+                seen_poin_in_batch.add(poin)
+                if poin in existing_by_poin:
+                    continue  # 이미 수집된 상품주문 라인 - 재사용(중복 생성/덮어쓰기 안 함)
+                # 새 상품주문번호 -> 별도 라인 생성(같은 SKU라도 상품주문번호가 다르면 별개 라인)
+            else:
+                # 상품주문번호 미제공(다른 채널/과거 데이터) -> 기존 SKU 기반 호환 dedup
+                if mapping.product_option_id in existing_option_ids:
+                    continue
+                existing_option_ids.add(mapping.product_option_id)
+            self._create_order_item(order, warehouse_id, raw, mapping, item, poin)
         self.session.flush()
         return skipped_items, auto_matched
+
+    def _create_order_item(self, order: Order, warehouse_id: int, raw: dict[str, Any], mapping, item, poin) -> None:
+        """OrderItem 1행 생성 + 상태에 따른 재고 반영(예약/차감). 기존 로직 보존."""
+        cost_record = self.cost_history_repo.get_effective_cost(mapping.product_option_id, raw["order_date"])
+        self.session.add(
+            OrderItem(
+                order_id=order.id,
+                product_option_id=mapping.product_option_id,
+                platform_order_item_no=poin,
+                quantity=item["quantity"],
+                unit_price=item["unit_price"],
+                cost_price_snapshot=cost_record.cost_price if cost_record else None,
+                line_amount=round(item["quantity"] * item["unit_price"], 2),
+            )
+        )
+        try:
+            if raw["status"] in SHIPPED_STATUSES:
+                self.inventory_service.deduct_on_shipment(
+                    mapping.product_option_id,
+                    warehouse_id,
+                    item["quantity"],
+                    reference_id=order.id,
+                    release_reserved=False,
+                )
+            elif raw["status"] in UNSHIPPED_STATUSES:
+                self.inventory_service.reserve(mapping.product_option_id, warehouse_id, item["quantity"])
+        except ValueError:
+            # 재고관리 화면에 이 SKU-창고 조합의 재고 레코드가 아직 등록되지 않은 경우
+            # (InventoryService._get_inventory가 ValueError를 던진다). 주문상품 자체는
+            # 정상 반영하고 재고 반영만 건너뛴다 - SKU 매핑이 없는 경우와 마찬가지로
+            # 외부 데이터/설정 미비를 이유로 전체 동기화를 중단시키지 않는다.
+            logger.warning(
+                "재고 레코드가 없어 재고 반영을 건너뜁니다: option=%s, warehouse=%s, order_id=%s",
+                mapping.product_option_id,
+                warehouse_id,
+                order.id,
+            )
+        except (InventoryInvariantError, InsufficientStockError) as e:
+            # 채널 재고와 내부 재고가 어긋나 예약/차감이 불변조건을 위반하는 경우.
+            # 외부에서 이미 성립된 주문이므로 주문 자체는 반드시 남겨야 하고,
+            # 재고 반영만 건너뛴다. 여기서 예외를 통과시키면 sync_orders()의
+            # 최상위 except가 rollback을 수행해 **이번 회차에 수집한 모든 주문이
+            # 통째로 사라진다**(주문 1건의 재고 문제로 정상 주문 수십 건 유실).
+            logger.warning(
+                "재고 불변조건 위반으로 재고 반영을 건너뜁니다(주문은 정상 수집): "
+                "option=%s, warehouse=%s, order_id=%s, 사유=%s",
+                mapping.product_option_id,
+                warehouse_id,
+                order.id,
+                e,
+            )
 
     def apply_status_change(self, order: Order, new_status: str, warehouse_id: Optional[int] = None) -> None:
         """주문 상태를 바꾸고 order_status_history를 남긴 뒤, 필요하면 재고에 반영한다.

@@ -34,7 +34,6 @@ integrations/malls/naver_smartstore_connector.py
 """
 
 import base64
-import json
 import logging
 import time as time_module
 from collections import defaultdict
@@ -108,8 +107,8 @@ class NaverSmartstoreConnector(BaseMallConnector):
     def fetch_orders(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
         credentials = self._get_credentials()
         if credentials is not None:
-            client_id, client_secret = credentials
-            raw_contents = self._fetch_raw_orders_live(start_date, end_date, client_id, client_secret)
+            client_id, client_secret, seller_id = credentials
+            raw_contents = self._fetch_raw_orders_live(start_date, end_date, client_id, client_secret, seller_id)
             return self._normalize_live_orders(raw_contents)
         raw_orders = self._fetch_raw_orders_dummy(start_date, end_date)
         return [self._normalize_dummy(raw) for raw in raw_orders]
@@ -134,8 +133,8 @@ class NaverSmartstoreConnector(BaseMallConnector):
             return self._product_cache
         credentials = self._get_credentials()
         if credentials is not None:
-            client_id, client_secret = credentials
-            raw_pages = self._fetch_raw_products_live(client_id, client_secret)
+            client_id, client_secret, seller_id = credentials
+            raw_pages = self._fetch_raw_products_live(client_id, client_secret, seller_id)
             result = self._normalize_live_products(raw_pages)
         else:
             result = self._dummy_products()
@@ -144,16 +143,20 @@ class NaverSmartstoreConnector(BaseMallConnector):
 
     # --- 실제 API 연동 ---
 
-    def _get_credentials(self) -> Optional[tuple[str, str]]:
-        """api_credentials에 client_id/client_secret이 모두 등록돼 있으면 반환하고, 아니면 None(더미 폴백)."""
+    def _get_credentials(self) -> Optional[tuple[str, str, Optional[str]]]:
+        """(client_id, client_secret, seller_id)를 반환한다. client_id/client_secret이
+        모두 없으면 None(더미 폴백). seller_id(판매자 계정 ID)는 선택으로, 있으면 토큰
+        발급 시 SELLER 타입 + account_id로 사용하고, 없으면 SELF(본인 계정)로 처리한다."""
         if self.session is None or self.platform_id is None:
             return None
         credential_service = ApiCredentialService(self.session)
-        client_id = credential_service.get_decrypted("PLATFORM", self.platform_id, "client_id")
-        client_secret = credential_service.get_decrypted("PLATFORM", self.platform_id, "client_secret")
+        # 앞뒤 공백을 제거한다 - 화면에서 값을 붙여넣을 때 공백이 섞이면 서명/인증이 깨진다.
+        client_id = (credential_service.get_decrypted("PLATFORM", self.platform_id, "client_id") or "").strip()
+        client_secret = (credential_service.get_decrypted("PLATFORM", self.platform_id, "client_secret") or "").strip()
         if not client_id or not client_secret:
             return None
-        return client_id, client_secret
+        seller_id = (credential_service.get_decrypted("PLATFORM", self.platform_id, "seller_id") or "").strip()
+        return client_id, client_secret, seller_id or None
 
     def _http(self) -> httpx.Client:
         if self._http_client is None:
@@ -191,27 +194,49 @@ class NaverSmartstoreConnector(BaseMallConnector):
 
     @staticmethod
     def _sign(client_id: str, client_secret: str, timestamp_ms: str) -> str:
-        """네이버 커머스 API의 client_credentials 서명 규칙: bcrypt(client_id_timestamp, salt=client_secret)."""
+        """네이버 커머스 API의 client_credentials 서명 규칙: bcrypt(client_id_timestamp, salt=client_secret).
+
+        client_secret은 커머스API센터가 발급한 **전자서명 키**(bcrypt salt 형식, 보통
+        "$2a$..."로 시작)여야 한다. 형식이 잘못되면 bcrypt가 "Invalid salt"를 던지는데,
+        그대로 노출하면 원인을 알기 어려우므로 명확한 안내로 바꾼다.
+        """
         password = f"{client_id}_{timestamp_ms}".encode("utf-8")
-        hashed = bcrypt.hashpw(password, client_secret.encode("utf-8"))
+        try:
+            hashed = bcrypt.hashpw(password, client_secret.encode("utf-8"))
+        except (ValueError, TypeError) as e:
+            raise RuntimeError(
+                "네이버 전자서명 키(client_secret) 형식이 올바르지 않습니다. "
+                "커머스API센터에서 발급한 '전자서명 키'(보통 $2a$ 로 시작)를 공백/오타 없이 "
+                "정확히 등록했는지 확인하세요. (일반 애플리케이션 시크릿이 아니라 전자서명 키입니다.)"
+            ) from e
         return base64.urlsafe_b64encode(hashed).decode("utf-8")
 
-    def _fetch_access_token(self, client_id: str, client_secret: str) -> str:
+    def _fetch_access_token(self, client_id: str, client_secret: str, seller_id: Optional[str] = None) -> str:
         timestamp_ms = str(int(time_module.time() * 1000))
         signature = self._sign(client_id, client_secret, timestamp_ms)
-        response = self._request_with_retry(
-            "POST",
-            TOKEN_PATH,
-            data={
-                "client_id": client_id,
-                "timestamp": timestamp_ms,
-                "client_secret_sign": signature,
-                "grant_type": "client_credentials",
-                "type": "SELF",
-            },
-        )
+        data = {
+            "client_id": client_id,
+            "timestamp": timestamp_ms,
+            "client_secret_sign": signature,
+            "grant_type": "client_credentials",
+            "type": "SELF",
+        }
+        # 판매자 계정 ID가 있으면 SELLER 타입으로 그 계정의 토큰을 발급받는다.
+        if seller_id:
+            data["type"] = "SELLER"
+            data["account_id"] = seller_id
+        response = self._request_with_retry("POST", TOKEN_PATH, data=data)
         if response.status_code != 200:
-            raise RuntimeError(f"네이버 커머스 API 토큰 발급 실패: HTTP {response.status_code} {response.text[:200]}")
+            hint = ""
+            if seller_id and "type" in response.text:
+                hint = (
+                    " (판매자ID를 등록해 type=SELLER로 요청했는데 거부됐습니다. "
+                    "일반 판매자 앱은 SELF만 지원하므로, 커머스솔루션 대행 앱이 아니라면 "
+                    "설정에서 네이버 seller_id를 삭제하세요.)"
+                )
+            raise RuntimeError(
+                f"네이버 커머스 API 토큰 발급 실패: HTTP {response.status_code} {response.text[:200]}{hint}"
+            )
         access_token = response.json().get("access_token")
         if not access_token:
             raise RuntimeError("네이버 커머스 API 토큰 응답에 access_token이 없습니다.")
@@ -227,14 +252,14 @@ class NaverSmartstoreConnector(BaseMallConnector):
         return dt.strftime("%Y-%m-%dT%H:%M:%S.000") + "+09:00"
 
     def _fetch_raw_orders_live(
-        self, start_date: date, end_date: date, client_id: str, client_secret: str
+        self, start_date: date, end_date: date, client_id: str, client_secret: str, seller_id: Optional[str] = None
     ) -> list[dict[str, Any]]:
         """실운영 환경에서 확인된 제약: from/to는 최대 24시간 차이만 허용한다("최대 24시간
         차이로 설정해야 합니다" 오류로 확인됨). 여러 날짜에 걸친 조회는 하루(24시간) 단위로
         나눠 호출한 뒤 결과를 합친다."""
-        access_token = self._fetch_access_token(client_id, client_secret)
-        all_payloads = []
+        access_token = self._fetch_access_token(client_id, client_secret, seller_id)
         raw_orders: list[dict[str, Any]] = []
+        day_count = 0
 
         day = start_date
         while day < end_date:
@@ -250,17 +275,13 @@ class NaverSmartstoreConnector(BaseMallConnector):
                     f"네이버 커머스 API 주문 조회 실패: HTTP {response.status_code} {response.text[:200]}"
                 )
             payload = response.json()
-            all_payloads.append(payload)
             raw_orders.extend(payload.get("data", {}).get("contents", []))
             day = next_day
+            day_count += 1
 
-        logger.info("===== NAVER ORDER RESPONSE =====\n%s", json.dumps(all_payloads, ensure_ascii=False, indent=2))
-        try:
-            with open("/app/logs/naver_order_response.json", "w", encoding="utf-8") as f:
-                json.dump(all_payloads, f, ensure_ascii=False, indent=2)
-        except OSError:
-            logger.exception("네이버 주문 응답을 /app/logs/naver_order_response.json에 저장하지 못했습니다.")
-
+        # 개인정보 보호: 응답 원문(주문자·수취인·주소·연락처 포함)을 로그나 파일로 남기지 않는다.
+        # 개인정보가 없는 메타데이터(조회일수·수집 건수)만 기록한다.
+        logger.info("네이버 주문 조회 완료: 조회일수=%d, 수집 상품주문(라인)=%d건", day_count, len(raw_orders))
         return raw_orders
 
     def _fetch_raw_orders_dummy(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
@@ -334,6 +355,10 @@ class NaverSmartstoreConnector(BaseMallConnector):
                     "알 수 없는 네이버 productOrderStatus: %s (orderId=%s) - NEW로 처리", first_status, order_id
                 )
                 std_status = "NEW"
+            # 배송지(수취인) 정보 - 네이버는 productOrder.shippingAddress에 담긴다(주문 내 동일).
+            shipping = product_orders[0].get("shippingAddress") or {}
+            addr = " ".join(x for x in [shipping.get("baseAddress"), shipping.get("detailAddress")] if x) or None
+            delivery_memo = product_orders[0].get("shippingMemo") or order.get("deliveryMemo")
             normalized.append(
                 {
                     "platform_order_no": order_id,
@@ -344,8 +369,16 @@ class NaverSmartstoreConnector(BaseMallConnector):
                     "customer_phone": order.get("ordererTel"),
                     "total_amount": float(order.get("generalPaymentAmount", 0)),
                     "discount_amount": float(order.get("orderDiscountAmount", 0)),
+                    "receiver_name": shipping.get("name"),
+                    "receiver_phone": shipping.get("tel1") or shipping.get("tel2"),
+                    "receiver_zipcode": shipping.get("zipCode"),
+                    "receiver_address": addr,
+                    "delivery_message": delivery_memo,
                     "items": [
                         {
+                            # 상품주문번호(라인 단위 외부 식별자) - content.productOrder.productOrderId.
+                            # 발주확인·송장·클레임의 핵심 식별자. 빈 문자열은 None으로 정규화.
+                            "platform_order_item_no": (po.get("productOrderId") or None),
                             # 옵션(채널상품) 단위 식별자 - product_platform_map.platform_option_id와
                             # 매칭 키가 일치해야 한다.
                             "platform_option_id": po.get("itemNo"),
@@ -373,7 +406,9 @@ class NaverSmartstoreConnector(BaseMallConnector):
             )
         return normalized
 
-    def _fetch_raw_products_live(self, client_id: str, client_secret: str) -> list[dict[str, Any]]:
+    def _fetch_raw_products_live(
+        self, client_id: str, client_secret: str, seller_id: Optional[str] = None
+    ) -> list[dict[str, Any]]:
         """상품 검색 API를 페이지 단위로 끝까지 순회해 원본상품 목록을 모은다.
 
         페이지네이션 방식(page/size)과 응답 필드명은 네이버 커머스 API 공식 문서
@@ -381,7 +416,7 @@ class NaverSmartstoreConnector(BaseMallConnector):
         않았다 - 실 연동 후 오류가 나면 이 메서드와 _normalize_live_products만
         고치면 된다.
         """
-        access_token = self._fetch_access_token(client_id, client_secret)
+        access_token = self._fetch_access_token(client_id, client_secret, seller_id)
         all_contents: list[dict[str, Any]] = []
         page = 1
         while True:

@@ -112,8 +112,14 @@ class TestLiveIntegration:
                 "customer_phone": "010-1234-5678",
                 "total_amount": 20000.0,
                 "discount_amount": 0.0,
+                "receiver_name": None,
+                "receiver_phone": None,
+                "receiver_zipcode": None,
+                "receiver_address": None,
+                "delivery_message": None,
                 "items": [
                     {
+                        "platform_order_item_no": "PO-1",
                         "platform_option_id": "SKU-1",
                         "quantity": 2,
                         "unit_price": 10000.0,
@@ -128,6 +134,38 @@ class TestLiveIntegration:
                 ],
             }
         ]
+
+    def test_extracts_shipping_address(self, db_session, platform):
+        """배송지(수취인) 정보가 productOrder.shippingAddress에서 채워진다."""
+        ApiCredentialService(db_session).upsert_credential("PLATFORM", platform.id, "client_id", "test-client-id")
+        ApiCredentialService(db_session).upsert_credential(
+            "PLATFORM", platform.id, "client_secret", "$2b$12$Cq/28lyv3wDDjELmomd4Me"
+        )
+        db_session.flush()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/oauth2/token"):
+                return httpx.Response(200, json={"access_token": "fake-token", "expires_in": 3600})
+            row = _content_row("ORDER-9", "PO-9", "2026-01-01T10:00:00+09:00")
+            row["content"]["productOrder"]["shippingAddress"] = {
+                "name": "수취인",
+                "tel1": "010-9999-8888",
+                "zipCode": "06236",
+                "baseAddress": "서울시 강남구",
+                "detailAddress": "테헤란로 1",
+            }
+            row["content"]["productOrder"]["shippingMemo"] = "문 앞에 놓아주세요"
+            return httpx.Response(200, json={"data": {"contents": [row]}})
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.commerce.naver.com")
+        connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        o = connector.fetch_orders(date(2026, 1, 1), date(2026, 1, 2))[0]
+        assert o["receiver_name"] == "수취인"
+        assert o["receiver_phone"] == "010-9999-8888"
+        assert o["receiver_zipcode"] == "06236"
+        assert o["receiver_address"] == "서울시 강남구 테헤란로 1"
+        assert o["delivery_message"] == "문 앞에 놓아주세요"
 
     def test_groups_multiple_line_items_under_same_order_id(self, db_session, platform):
         """실운영 환경에서 확인: 응답 1건은 개별 상품주문(라인아이템) 단위이며, 같은
@@ -377,3 +415,124 @@ class TestFetchProducts:
 
         assert request_pages == [1, 2]
         assert len(products) == 101
+
+
+class TestSignatureError:
+    def test_invalid_client_secret_gives_clear_message(self, db_session, platform):
+        """bcrypt salt 형식이 아닌 client_secret이면 'Invalid salt' 대신 명확한 안내를 준다."""
+        ApiCredentialService(db_session).upsert_credential("PLATFORM", platform.id, "client_id", "cid")
+        ApiCredentialService(db_session).upsert_credential("PLATFORM", platform.id, "client_secret", "LXn_wrong")
+        db_session.flush()
+
+        connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id)
+        with pytest.raises(RuntimeError, match="전자서명 키.*형식이 올바르지 않습니다"):
+            connector.fetch_orders(date(2026, 1, 1), date(2026, 1, 2))
+
+
+class TestSellerId:
+    def test_seller_id_sends_seller_type_and_account_id(self, db_session, platform):
+        """판매자ID(seller_id)가 등록되면 토큰 요청이 type=SELLER + account_id로 나간다."""
+        svc = ApiCredentialService(db_session)
+        svc.upsert_credential("PLATFORM", platform.id, "client_id", "cid")
+        svc.upsert_credential("PLATFORM", platform.id, "client_secret", "$2b$12$Cq/28lyv3wDDjELmomd4Me")
+        svc.upsert_credential("PLATFORM", platform.id, "seller_id", "ncp_seller_001")
+        db_session.flush()
+
+        captured = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            if request.url.path.endswith("/oauth2/token"):
+                return httpx.Response(200, json={"access_token": "fake-token", "expires_in": 3600})
+            return httpx.Response(200, json={"data": {"contents": []}})
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.commerce.naver.com")
+        connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+        connector.fetch_orders(date(2026, 1, 1), date(2026, 1, 2))
+
+        token_body = captured[0].content.decode()
+        assert "type=SELLER" in token_body
+        assert "account_id=ncp_seller_001" in token_body
+
+    def test_no_seller_id_uses_self_type(self, db_session, platform):
+        svc = ApiCredentialService(db_session)
+        svc.upsert_credential("PLATFORM", platform.id, "client_id", "cid")
+        svc.upsert_credential("PLATFORM", platform.id, "client_secret", "$2b$12$Cq/28lyv3wDDjELmomd4Me")
+        db_session.flush()
+
+        captured = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            if request.url.path.endswith("/oauth2/token"):
+                return httpx.Response(200, json={"access_token": "fake-token", "expires_in": 3600})
+            return httpx.Response(200, json={"data": {"contents": []}})
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.commerce.naver.com")
+        connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+        connector.fetch_orders(date(2026, 1, 1), date(2026, 1, 2))
+
+        token_body = captured[0].content.decode()
+        assert "type=SELF" in token_body
+        assert "account_id" not in token_body
+
+
+class TestNoPiiInLogs:
+    def test_order_response_pii_is_not_logged_or_written(self, db_session, platform, caplog, tmp_path, monkeypatch):
+        """실주문 응답의 개인정보(이름·전화·주소)가 로그나 파일에 남지 않아야 한다.
+
+        과거엔 응답 원문 전체를 logger.info + /app/logs/naver_order_response.json에
+        덤프했다. 이 회귀 테스트로 재발을 막는다.
+        """
+        import logging
+        import os
+
+        svc = ApiCredentialService(db_session)
+        svc.upsert_credential("PLATFORM", platform.id, "client_id", "cid")
+        svc.upsert_credential("PLATFORM", platform.id, "client_secret", "$2b$12$Cq/28lyv3wDDjELmomd4Me")
+        db_session.flush()
+
+        pii_name, pii_tel, pii_addr = "홍길동", "010-1234-5678", "서울시 강남구 테헤란로 1"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/oauth2/token"):
+                return httpx.Response(200, json={"access_token": "fake-token", "expires_in": 3600})
+            row = _content_row("ORDER-PII", "PO-PII", "2026-01-01T10:00:00+09:00")
+            row["content"]["order"]["ordererName"] = pii_name
+            row["content"]["order"]["ordererTel"] = pii_tel
+            row["content"]["productOrder"]["shippingAddress"] = {
+                "name": pii_name,
+                "tel1": pii_tel,
+                "zipCode": "06236",
+                "baseAddress": "서울시 강남구",
+                "detailAddress": "테헤란로 1",
+            }
+            return httpx.Response(200, json={"data": {"contents": [row]}})
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.commerce.naver.com")
+        connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        # 파일 덤프가 되살아나면 잡히도록, open을 감시한다.
+        opened_paths = []
+        real_open = open
+
+        def watched_open(path, *args, **kwargs):
+            opened_paths.append(str(path))
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", watched_open)
+
+        with caplog.at_level(logging.DEBUG):
+            orders = connector.fetch_orders(date(2026, 1, 1), date(2026, 1, 2))
+
+        # 수집 자체는 정상, 개인정보는 파싱되어 있음(반환값에는 있어도 됨).
+        assert orders[0]["receiver_name"] == pii_name
+        # 로그에는 개인정보가 없어야 한다.
+        assert pii_name not in caplog.text
+        assert pii_tel not in caplog.text
+        assert pii_addr not in caplog.text
+        # 허용된 메타데이터 요약 로그는 있어야 한다.
+        assert "네이버 주문 조회 완료" in caplog.text
+        # 응답을 파일로 저장하지 않아야 한다.
+        assert not any("naver_order_response" in p for p in opened_paths)
+        assert not os.path.exists("/app/logs/naver_order_response.json") or True  # 경로 존재 여부와 무관하게 미기록

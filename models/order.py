@@ -63,6 +63,8 @@ class Order(Base, TimestampMixin, SoftDeleteMixin):
     receiver_phone: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     receiver_zipcode: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
     receiver_address: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    # 배송 요청 메세지(예: "문 앞에 놓아주세요") - 채널 주문 수집 시 배송지 정보와 함께 저장.
+    delivery_message: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
 
     items: Mapped[list["OrderItem"]] = relationship(back_populates="order", cascade="all, delete-orphan")
     status_history: Mapped[list["OrderStatusHistory"]] = relationship(
@@ -76,10 +78,20 @@ class OrderItem(Base):
     """주문상품. cost_price_snapshot은 매출 확정 시점에 원가를 스냅샷으로 고정한 값."""
 
     __tablename__ = "order_items"
+    # 같은 주문 안에서 상품주문번호는 유일하다(NULL은 여러 개 허용 - 상품주문번호 미제공
+    # 채널/과거 데이터). 유니크 "인덱스"로 구현: PostgreSQL·SQLite 모두 NULL 다중 허용 +
+    # SQLite 테이블 재생성(이름 없는 FK 충돌) 회피 + 마이그레이션과 동일 형태.
+    __table_args__ = (Index("uq_order_item_platform_no", "order_id", "platform_order_item_no", unique=True),)
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False)
     product_option_id: Mapped[int] = mapped_column(ForeignKey("product_options.id"), nullable=False)
+    # 쇼핑몰 상품주문번호(라인 단위 외부 식별자) - 네이버 productOrderId 등. 발주확인·송장·
+    # 클레임의 핵심 라인 식별자. 문자열(선행0/형식변경 대비), 빈 문자열은 NULL로 정규화.
+    # 유일성: UNIQUE(order_id, platform_order_item_no)(NULL 허용). 상품주문번호를 제공하지
+    # 않는 채널/과거 데이터는 NULL이며 SKU 기반 호환 로직으로 처리한다.
+    # TODO(SaaS): 멀티테넌시 전환 시 company_id + 판매자 계정 식별자를 포함한 유일성 재설계.
+    platform_order_item_no: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     quantity: Mapped[int] = mapped_column(nullable=False)
     unit_price: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False)
     cost_price_snapshot: Mapped[Optional[float]] = mapped_column(Numeric(14, 2), nullable=True)
