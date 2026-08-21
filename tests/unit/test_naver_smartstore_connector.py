@@ -15,6 +15,7 @@ from datetime import date
 import httpx
 import pytest
 
+from integrations.malls.errors import MarketplaceCredentialMissingError, MarketplaceExternalAPIError
 from integrations.malls.naver_smartstore_connector import NaverSmartstoreConnector
 from services.settings_service import ApiCredentialService
 
@@ -49,18 +50,31 @@ def _content_row(order_id: str, product_order_id: str, order_date: str, status: 
     }
 
 
-class TestDummyFallback:
-    def test_no_session_uses_dummy_data(self):
-        connector = NaverSmartstoreConnector()
-        orders = connector.fetch_orders(date(2026, 1, 1), date(2026, 1, 3))
-        assert isinstance(orders, list)
-        for order in orders:
-            assert order["platform_order_no"].startswith("N")
+class TestCredentialMissingFailsClosed:
+    """인증정보가 없거나 불완전하면 더미로 폴백하지 않고 명시적 오류를 던진다(운영 안전)."""
 
-    def test_session_without_credentials_falls_back_to_dummy(self, db_session, platform):
+    def test_no_session_raises_credential_missing(self):
+        connector = NaverSmartstoreConnector()
+        with pytest.raises(MarketplaceCredentialMissingError):
+            connector.fetch_orders(date(2026, 1, 1), date(2026, 1, 3))
+
+    def test_no_platform_id_raises_credential_missing(self, db_session):
+        connector = NaverSmartstoreConnector(session=db_session, platform_id=None)
+        with pytest.raises(MarketplaceCredentialMissingError):
+            connector.fetch_orders(date(2026, 1, 1), date(2026, 1, 3))
+
+    def test_session_without_credentials_raises_credential_missing(self, db_session, platform):
         connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id)
-        orders = connector.fetch_orders(date(2026, 1, 1), date(2026, 1, 3))
-        assert isinstance(orders, list)
+        with pytest.raises(MarketplaceCredentialMissingError):
+            connector.fetch_orders(date(2026, 1, 1), date(2026, 1, 3))
+
+    def test_partial_credentials_raises_credential_missing(self, db_session, platform):
+        # client_secret이 빠지면 실 연동 조건 미충족 -> 더미가 아니라 명시적 오류.
+        ApiCredentialService(db_session).upsert_credential("PLATFORM", platform.id, "client_id", "cid")
+        db_session.flush()
+        connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id)
+        with pytest.raises(MarketplaceCredentialMissingError):
+            connector.fetch_orders(date(2026, 1, 1), date(2026, 1, 3))
 
 
 class TestLiveIntegration:
@@ -263,8 +277,11 @@ class TestLiveIntegration:
         http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.commerce.naver.com")
         connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id, http_client=http_client)
 
-        with pytest.raises(RuntimeError, match="토큰 발급 실패"):
+        # 401 토큰 발급 실패는 응답 본문 없이 AUTH_FAILED(비재시도) 외부 API 오류로 변환된다.
+        with pytest.raises(MarketplaceExternalAPIError) as ei:
             connector.fetch_orders(date(2026, 1, 1), date(2026, 1, 2))
+        assert ei.value.reason_code == "AUTH_FAILED"
+        assert "invalid client" not in str(ei.value)
 
 
 def _channel_content(
@@ -290,13 +307,11 @@ def _channel_content(
 
 
 class TestFetchProducts:
-    def test_no_credentials_returns_dummy_product(self, db_session, platform):
+    def test_no_credentials_raises_credential_missing(self, db_session, platform):
+        # 상품 조회도 인증정보 없으면 더미로 위장하지 않고 명시적 오류를 던진다.
         connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id)
-
-        products = connector.fetch_products()
-
-        assert len(products) == 1
-        assert products[0]["items"][0]["platform_option_id"] == "N-DUMMY-ITEM-001"
+        with pytest.raises(MarketplaceCredentialMissingError):
+            connector.fetch_products()
 
     def test_live_groups_color_variants_under_shared_group_product_no(self, db_session, platform):
         """실제 응답으로 확인한 스키마: 색상 변형(아이보리/블루 등)은 서로 다른
@@ -418,15 +433,16 @@ class TestFetchProducts:
 
 
 class TestSignatureError:
-    def test_invalid_client_secret_gives_clear_message(self, db_session, platform):
-        """bcrypt salt 형식이 아닌 client_secret이면 'Invalid salt' 대신 명확한 안내를 준다."""
+    def test_invalid_client_secret_raises_credential_missing(self, db_session, platform):
+        """bcrypt salt 형식이 아닌 전자서명 키는 사용 불가 = 인증정보 오류(키 값 미노출)."""
         ApiCredentialService(db_session).upsert_credential("PLATFORM", platform.id, "client_id", "cid")
         ApiCredentialService(db_session).upsert_credential("PLATFORM", platform.id, "client_secret", "LXn_wrong")
         db_session.flush()
 
         connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id)
-        with pytest.raises(RuntimeError, match="전자서명 키.*형식이 올바르지 않습니다"):
+        with pytest.raises(MarketplaceCredentialMissingError) as ei:
             connector.fetch_orders(date(2026, 1, 1), date(2026, 1, 2))
+        assert "LXn_wrong" not in str(ei.value)
 
 
 class TestSellerId:

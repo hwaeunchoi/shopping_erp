@@ -486,8 +486,8 @@ class TestUnmatchedItems:
 
 
 class TestNaverProductSync:
-    def test_sync_from_naver_creates_products_via_dummy_fallback(self, client, auth_headers, api_session_factory):
-        """실 API 키가 없으면(테스트 기본값) 더미 상품으로 폴백해 정상 등록되는지 확인한다."""
+    def test_sync_from_naver_without_credentials_returns_409(self, client, auth_headers, api_session_factory):
+        """실 API 키가 없으면 더미 상품으로 위장하지 않고 연결정보 오류(409)를 준다."""
         from models.platform import Platform
 
         db = api_session_factory()
@@ -509,11 +509,8 @@ class TestNaverProductSync:
             "/api/products/sync-from-naver", json={"platform_id": naver_platform_id}, headers=auth_headers
         )
 
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["total_items"] == 1
-        assert body["created_products"] == 1
-        assert body["created_options"] == 1
+        assert resp.status_code == 409
+        assert resp.json()["error_code"] == "CREDENTIAL_MISSING"
 
     def test_sync_from_naver_unknown_platform_returns_404(self, client, auth_headers):
         resp = client.post("/api/products/sync-from-naver", json={"platform_id": 999999}, headers=auth_headers)

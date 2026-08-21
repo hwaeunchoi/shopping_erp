@@ -10,12 +10,33 @@ integration_status에는 "MALL"이 아니라 "MALL_PRODUCT" 타입으로 남겨
 order_collect_job이 쓰는 주문 수집 상태와 섞이지 않게 한다.
 """
 
+import logging
+import uuid
+
 from core.database import session_scope
 from integrations.malls import get_mall_connector
+from integrations.malls.errors import (
+    MarketplaceCapabilityUnsupportedError,
+    MarketplaceCredentialMissingError,
+    MarketplaceExternalAPIError,
+)
 from repositories.extra_repository import IntegrationStatusRepository
 from repositories.platform_repository import PlatformRepository
 from services.notification_service import NotificationService
 from services.product_sync_service import ProductSyncService
+
+logger = logging.getLogger(__name__)
+
+
+def _safe_error_summary(exc: Exception) -> str:
+    """개인정보·시크릿·원본 예외 문자열 없이 안전한 오류 요약을 만든다."""
+    if isinstance(exc, MarketplaceExternalAPIError):
+        return f"EXTERNAL_API:{exc.reason_code}:retryable={exc.retryable}"
+    if isinstance(exc, MarketplaceCredentialMissingError):
+        return "CREDENTIAL_MISSING"
+    if isinstance(exc, MarketplaceCapabilityUnsupportedError):
+        return "CAPABILITY_UNSUPPORTED"
+    return f"INTERNAL_ERROR:{type(exc).__name__}:trace={uuid.uuid4().hex[:8]}"
 
 
 def run() -> dict[str, dict]:
@@ -26,22 +47,30 @@ def run() -> dict[str, dict]:
         sync_service = ProductSyncService(db)
 
         for platform in PlatformRepository(db).list_active():
-            connector = get_mall_connector(platform.connector_class, session=db, platform_id=platform.id)
             try:
+                connector = get_mall_connector(platform.connector_class, session=db, platform_id=platform.id)
                 results[platform.code] = sync_service.sync_products_from_naver(connector, platform.id)
                 integration_status_repo.upsert_success("MALL_PRODUCT", platform.code)
                 db.commit()
-            except NotImplementedError:
-                # 아직 상품 API 연동을 지원하지 않는 플랫폼(더미 커넥터) - 실패로 취급하지 않는다.
+            except (MarketplaceCapabilityUnsupportedError, NotImplementedError):
+                # 상품 API 미지원 채널(쿠팡 등) - 실패가 아니라 스킵(DB 저장 없음, 과다 로그 방지).
                 db.rollback()
+                results[platform.code] = {"skipped": "unsupported"}
+                logger.debug("상품 동기화 스킵(미지원 채널): platform=%s", platform.code)
                 continue
-            except Exception as e:
-                integration_status_repo.upsert_error("MALL_PRODUCT", platform.code, str(e))
-                notification_service.notify(
-                    type_="API_FAILURE",
-                    severity="CRITICAL",
-                    message=f"상품 동기화 실패: platform={platform.code}, 오류={e}",
-                )
+            except Exception as e:  # noqa: BLE001 - 채널별 격리(예상 밖 예외도 다음 채널 진행)
+                db.rollback()
+                summary = _safe_error_summary(e)
+                results[platform.code] = {"error": summary}
+                integration_status_repo.upsert_error("MALL_PRODUCT", platform.code, summary)
+                try:
+                    notification_service.notify(
+                        type_="API_FAILURE",
+                        severity="CRITICAL",
+                        message=f"상품 동기화 실패: platform={platform.code}, reason={summary}",
+                    )
+                except Exception:  # noqa: BLE001 - 알림 실패가 배치를 중단시키지 않게 한다.
+                    logger.warning("상품 동기화 실패 알림 생성 실패: platform=%s", platform.code)
                 db.commit()
-                raise
+                continue
     return results

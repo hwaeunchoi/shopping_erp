@@ -45,6 +45,12 @@ from api.routers import (
 )
 from config.logging_config import setup_logging
 from config.settings import settings
+from integrations.malls.errors import (
+    MarketplaceCapabilityUnsupportedError,
+    MarketplaceCredentialMissingError,
+    MarketplaceError,
+    MarketplaceExternalAPIError,
+)
 from services.product_service import OptionInUseError
 
 setup_logging()
@@ -158,6 +164,57 @@ def handle_integrity_error(request: Request, exc: IntegrityError) -> JSONRespons
 def handle_option_in_use_error(request: Request, exc: OptionInUseError) -> JSONResponse:
     """이미 주문에서 사용 중인 옵션(SKU)을 삭제하려는 요청을 409로 변환한다."""
     return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"detail": str(exc)})
+
+
+@app.exception_handler(MarketplaceError)
+def handle_marketplace_error(request: Request, exc: MarketplaceError) -> JSONResponse:
+    """쇼핑몰 연동 오류를 안전한 HTTP 응답으로 변환한다.
+
+    - 인증정보 누락        -> 409 (사용자 조치: 연결정보 확인)
+    - 미지원 기능/채널      -> 501
+    - 외부 API 오류(재시도O) -> 503
+    - 외부 API 오류(재시도X) -> 502
+    - 기타 MarketplaceError  -> 500
+    응답에는 Secret/Authorization/원본 응답/스택트레이스/개인정보/전체 vendorId·sellerId를
+    담지 않는다 - 안전한 error_code·메시지·retryable·platform_code만 노출한다.
+    """
+    marketplace_code = getattr(exc, "marketplace_code", None)
+    if isinstance(exc, MarketplaceCredentialMissingError):
+        http_status, error_code, message, retryable = (
+            status.HTTP_409_CONFLICT,
+            "CREDENTIAL_MISSING",
+            "쇼핑몰 연결정보를 확인해 주세요.",
+            False,
+        )
+    elif isinstance(exc, MarketplaceCapabilityUnsupportedError):
+        http_status, error_code, message, retryable = (
+            status.HTTP_501_NOT_IMPLEMENTED,
+            "CAPABILITY_UNSUPPORTED",
+            "해당 채널/기능은 아직 지원하지 않습니다.",
+            False,
+        )
+    elif isinstance(exc, MarketplaceExternalAPIError):
+        retryable = bool(exc.retryable)
+        http_status = status.HTTP_503_SERVICE_UNAVAILABLE if retryable else status.HTTP_502_BAD_GATEWAY
+        error_code = "EXTERNAL_API_ERROR"
+        message = "쇼핑몰 연동 중 일시적인 오류가 발생했습니다." if retryable else "쇼핑몰 연동 중 오류가 발생했습니다."
+    else:
+        http_status, error_code, message, retryable = (
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "MARKETPLACE_ERROR",
+            "쇼핑몰 연동 처리 중 오류가 발생했습니다.",
+            False,
+        )
+    logger.warning("쇼핑몰 연동 오류: code=%s platform=%s", error_code, marketplace_code)
+    return JSONResponse(
+        status_code=http_status,
+        content={
+            "detail": message,
+            "error_code": error_code,
+            "retryable": retryable,
+            "platform_code": marketplace_code,
+        },
+    )
 
 
 @app.exception_handler(Exception)

@@ -106,7 +106,8 @@ class TestSync:
         )
         assert resp.status_code == 404
 
-    def test_sync_with_real_dummy_connector_succeeds(self, client, auth_headers, seed_data):
+    def test_sync_without_credentials_returns_409(self, client, auth_headers, seed_data):
+        # 인증정보가 없는 채널은 더미 주문을 성공으로 반환하지 않고 연결정보 오류(409)를 준다.
         resp = client.post(
             "/api/orders/sync",
             json={
@@ -117,8 +118,76 @@ class TestSync:
             },
             headers=auth_headers,
         )
-        assert resp.status_code == 200
-        assert set(resp.json().keys()) == {"total", "created", "updated", "skipped_items", "auto_matched_products"}
+        assert resp.status_code == 409
+        body = resp.json()
+        assert body["error_code"] == "CREDENTIAL_MISSING"
+        assert body["retryable"] is False
+        assert "secret" not in str(body).lower()
+
+    def test_sync_unverified_channel_returns_501(self, client, auth_headers, api_session_factory):
+        # 미검증 채널(ESM 등)은 팩토리에서 미지원 오류 -> 501(더미 유입 없음).
+        from models.platform import Platform
+
+        db = api_session_factory()
+        try:
+            esm = Platform(code="esm_x", name="ESM", connector_class="EsmConnector", is_active=True)
+            db.add(esm)
+            db.commit()
+            esm_id = esm.id
+        finally:
+            db.close()
+
+        resp = client.post(
+            "/api/orders/sync",
+            json={"platform_id": esm_id, "warehouse_id": 1, "start_date": "2026-01-01", "end_date": "2026-01-02"},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 501
+        assert resp.json()["error_code"] == "CAPABILITY_UNSUPPORTED"
+
+    def test_sync_external_api_retryable_returns_503(self, client, auth_headers, seed_data, monkeypatch):
+        from integrations.malls.errors import MarketplaceExternalAPIError
+
+        class _BoomConnector:
+            def fetch_orders(self, *a, **k):
+                raise MarketplaceExternalAPIError("coupang", "SERVER_ERROR", True, http_status=500)
+
+        monkeypatch.setattr("api.routers.orders.get_mall_connector", lambda *a, **k: _BoomConnector())
+        resp = client.post(
+            "/api/orders/sync",
+            json={
+                "platform_id": seed_data["platform_id"],
+                "warehouse_id": seed_data["warehouse_id"],
+                "start_date": "2026-01-01",
+                "end_date": "2026-01-02",
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 503
+        body = resp.json()
+        assert body["error_code"] == "EXTERNAL_API_ERROR"
+        assert body["retryable"] is True
+
+    def test_sync_external_api_non_retryable_returns_502(self, client, auth_headers, seed_data, monkeypatch):
+        from integrations.malls.errors import MarketplaceExternalAPIError
+
+        class _BoomConnector:
+            def fetch_orders(self, *a, **k):
+                raise MarketplaceExternalAPIError("coupang", "AUTH_FAILED", False, http_status=401)
+
+        monkeypatch.setattr("api.routers.orders.get_mall_connector", lambda *a, **k: _BoomConnector())
+        resp = client.post(
+            "/api/orders/sync",
+            json={
+                "platform_id": seed_data["platform_id"],
+                "warehouse_id": seed_data["warehouse_id"],
+                "start_date": "2026-01-01",
+                "end_date": "2026-01-02",
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 502
+        assert resp.json()["retryable"] is False
 
     def test_sync_requires_order_edit_permission(self, client, api_session_factory, seed_data):
         db = api_session_factory()

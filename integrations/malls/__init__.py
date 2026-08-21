@@ -9,6 +9,7 @@ from typing import Any, Optional
 from integrations.malls.base_mall_connector import BaseMallConnector  # noqa: F401
 from integrations.malls.coupang_connector import CoupangConnector  # noqa: F401
 from integrations.malls.elevenst_connector import ElevenstConnector  # noqa: F401
+from integrations.malls.errors import MarketplaceCapabilityUnsupportedError
 from integrations.malls.esm_connector import EsmConnector  # noqa: F401
 from integrations.malls.kakao_shopping_connector import KakaoShoppingConnector  # noqa: F401
 from integrations.malls.naver_smartstore_connector import NaverSmartstoreConnector  # noqa: F401
@@ -21,18 +22,25 @@ MALL_CONNECTORS: dict[str, type[BaseMallConnector]] = {
     "KakaoShoppingConnector": KakaoShoppingConnector,
 }
 
+# 런타임에서 실 API 연동이 검증된 채널만 인스턴스화를 허용한다. ESM·카카오·11번가는
+# 공식 API 미검증이라 여기 포함하지 않는다 - 등록된 커넥터라도 이 집합에 없으면
+# 더미/기본 커넥터로 폴백하지 않고 명시적 미지원 오류를 던진다. 클래스 참조로 관리해
+# 문자열 오타에 안전하다.
+SUPPORTED_CONNECTORS: frozenset[type[BaseMallConnector]] = frozenset({NaverSmartstoreConnector, CoupangConnector})
+
 
 def get_mall_connector(
     connector_class: str, session: Any = None, platform_id: Optional[int] = None
 ) -> BaseMallConnector:
     """Platform.connector_class 문자열로 커넥터 인스턴스를 생성한다.
 
-    session/platform_id를 넘기면 실제 API 연동을 지원하는 커넥터(예: 네이버)가
-    api_credentials에서 실제 키를 찾아 사용을 시도한다(없으면 더미로 폴백).
+    실 API 연동이 검증된 채널(SUPPORTED_CONNECTORS)만 생성한다. 미검증 채널·미등록
+    커넥터·잘못된 설정은 더미/기본 커넥터로 폴백하지 않고
+    MarketplaceCapabilityUnsupportedError를 던진다(운영 경로에 더미 유입 차단).
     """
     cls = MALL_CONNECTORS.get(connector_class)
-    if cls is None:
-        raise ValueError(f"등록되지 않은 쇼핑몰 커넥터입니다: {connector_class}")
+    if cls is None or cls not in SUPPORTED_CONNECTORS:
+        raise MarketplaceCapabilityUnsupportedError(connector_class, "runtime-connector")
     return cls(session=session, platform_id=platform_id)
 
 

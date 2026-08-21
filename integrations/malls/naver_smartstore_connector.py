@@ -44,6 +44,13 @@ import bcrypt
 import httpx
 
 from integrations.malls.base_mall_connector import BaseMallConnector
+from integrations.malls.errors import (
+    MarketplaceCapabilityUnsupportedError,
+    MarketplaceCredentialMissingError,
+    MarketplaceExternalAPIError,
+    external_call,
+    raise_for_status,
+)
 from services.settings_service import ApiCredentialService
 
 logger = logging.getLogger(__name__)
@@ -106,21 +113,23 @@ class NaverSmartstoreConnector(BaseMallConnector):
 
     def fetch_orders(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
         credentials = self._get_credentials()
-        if credentials is not None:
-            client_id, client_secret, seller_id = credentials
-            raw_contents = self._fetch_raw_orders_live(start_date, end_date, client_id, client_secret, seller_id)
-            return self._normalize_live_orders(raw_contents)
-        raw_orders = self._fetch_raw_orders_dummy(start_date, end_date)
-        return [self._normalize_dummy(raw) for raw in raw_orders]
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("naver")
+        client_id, client_secret, seller_id = credentials
+        raw_contents = self._fetch_raw_orders_live(start_date, end_date, client_id, client_secret, seller_id)
+        return self._normalize_live_orders(raw_contents)
 
     def fetch_order_detail(self, platform_order_no: str) -> dict[str, Any]:
-        return self._dummy_single_order(platform_order_no)
+        # 주문 상세 단건 조회는 아직 미구현 - 더미로 위장하지 않고 미지원 오류를 던진다.
+        raise MarketplaceCapabilityUnsupportedError("naver", "order_detail")
 
     def update_shipment(self, platform_order_no: str, carrier: str, tracking_no: str) -> bool:
+        # ⚠️ 미구현 스텁(실 API 미호출). 현재 자동 호출 경로 없음 - 안전화는 S3에서 처리한다.
         return True
 
     def fetch_settlements(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
-        return self._dummy_settlements(start_date, end_date, cycle_days=7)
+        # 정산 연동 미구현 - 더미로 위장하지 않고 미지원 오류를 던진다.
+        raise MarketplaceCapabilityUnsupportedError("naver", "settlement")
 
     def fetch_products(self) -> list[dict[str, Any]]:
         """상품(원본상품 + 채널상품 + 옵션조합) 목록을 정규화된 형식으로 조회한다.
@@ -132,12 +141,11 @@ class NaverSmartstoreConnector(BaseMallConnector):
         if self._product_cache is not None:
             return self._product_cache
         credentials = self._get_credentials()
-        if credentials is not None:
-            client_id, client_secret, seller_id = credentials
-            raw_pages = self._fetch_raw_products_live(client_id, client_secret, seller_id)
-            result = self._normalize_live_products(raw_pages)
-        else:
-            result = self._dummy_products()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("naver")
+        client_id, client_secret, seller_id = credentials
+        raw_pages = self._fetch_raw_products_live(client_id, client_secret, seller_id)
+        result = self._normalize_live_products(raw_pages)
         self._product_cache = result
         return result
 
@@ -169,7 +177,8 @@ class NaverSmartstoreConnector(BaseMallConnector):
         429가 아닌 응답은 그대로(재시도 없이) 반환한다 - 상태코드 처리는 호출부 책임."""
         attempt = 0
         while True:
-            response = self._http().request(method, path, **kwargs)
+            with external_call("naver"):
+                response = self._http().request(method, path, **kwargs)
             if response.status_code != 429:
                 return response
             attempt += 1
@@ -204,11 +213,9 @@ class NaverSmartstoreConnector(BaseMallConnector):
         try:
             hashed = bcrypt.hashpw(password, client_secret.encode("utf-8"))
         except (ValueError, TypeError) as e:
-            raise RuntimeError(
-                "네이버 전자서명 키(client_secret) 형식이 올바르지 않습니다. "
-                "커머스API센터에서 발급한 '전자서명 키'(보통 $2a$ 로 시작)를 공백/오타 없이 "
-                "정확히 등록했는지 확인하세요. (일반 애플리케이션 시크릿이 아니라 전자서명 키입니다.)"
-            ) from e
+            # 전자서명 키 형식이 잘못돼 서명을 만들 수 없다 = 인증정보를 사용할 수 없음.
+            # 키 값은 노출하지 않고 연결정보 누락 오류로 처리한다(사용자 조치 필요).
+            raise MarketplaceCredentialMissingError("naver") from e
         return base64.urlsafe_b64encode(hashed).decode("utf-8")
 
     def _fetch_access_token(self, client_id: str, client_secret: str, seller_id: Optional[str] = None) -> str:
@@ -226,20 +233,14 @@ class NaverSmartstoreConnector(BaseMallConnector):
             data["type"] = "SELLER"
             data["account_id"] = seller_id
         response = self._request_with_retry("POST", TOKEN_PATH, data=data)
-        if response.status_code != 200:
-            hint = ""
-            if seller_id and "type" in response.text:
-                hint = (
-                    " (판매자ID를 등록해 type=SELLER로 요청했는데 거부됐습니다. "
-                    "일반 판매자 앱은 SELF만 지원하므로, 커머스솔루션 대행 앱이 아니라면 "
-                    "설정에서 네이버 seller_id를 삭제하세요.)"
-                )
-            raise RuntimeError(
-                f"네이버 커머스 API 토큰 발급 실패: HTTP {response.status_code} {response.text[:200]}{hint}"
-            )
-        access_token = response.json().get("access_token")
+        # 응답 본문(원인 문자열)은 노출하지 않고 안전한 외부 API 오류로 변환한다.
+        # (401/403은 AUTH_FAILED - seller_id를 SELLER로 요청했다 거부된 경우도 포함되며,
+        #  세부 안내가 필요하면 설정 화면에서 seller_id 등록 여부를 확인한다.)
+        raise_for_status("naver", response.status_code)
+        with external_call("naver"):
+            access_token = response.json().get("access_token")
         if not access_token:
-            raise RuntimeError("네이버 커머스 API 토큰 응답에 access_token이 없습니다.")
+            raise MarketplaceExternalAPIError("naver", "PARSE_FAILED", False, http_status=response.status_code)
         return access_token
 
     @staticmethod
@@ -270,12 +271,11 @@ class NaverSmartstoreConnector(BaseMallConnector):
                 headers={"Authorization": f"Bearer {access_token}"},
                 params={"from": self._to_naver_datetime(day), "to": self._to_naver_datetime(next_day)},
             )
-            if response.status_code != 200:
-                raise RuntimeError(
-                    f"네이버 커머스 API 주문 조회 실패: HTTP {response.status_code} {response.text[:200]}"
-                )
-            payload = response.json()
-            raw_orders.extend(payload.get("data", {}).get("contents", []))
+            # 비200은 응답 본문(개인정보 가능)을 노출하지 않고 안전한 외부 API 오류로 변환한다.
+            raise_for_status("naver", response.status_code)
+            with external_call("naver"):
+                payload = response.json()
+                raw_orders.extend(payload.get("data", {}).get("contents", []))
             day = next_day
             day_count += 1
 
@@ -426,12 +426,11 @@ class NaverSmartstoreConnector(BaseMallConnector):
                 headers={"Authorization": f"Bearer {access_token}"},
                 json={"page": page, "size": PRODUCT_PAGE_SIZE},
             )
-            if response.status_code != 200:
-                raise RuntimeError(
-                    f"네이버 커머스 API 상품 조회 실패: HTTP {response.status_code} {response.text[:200]}"
-                )
-            payload = response.json()
-            contents = payload.get("contents", [])
+            # 비200은 응답 본문을 노출하지 않고 안전한 외부 API 오류로 변환한다.
+            raise_for_status("naver", response.status_code)
+            with external_call("naver"):
+                payload = response.json()
+                contents = payload.get("contents", [])
             all_contents.extend(contents)
             if len(contents) < PRODUCT_PAGE_SIZE:
                 break
