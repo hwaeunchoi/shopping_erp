@@ -15,7 +15,11 @@ from datetime import date
 import httpx
 import pytest
 
-from integrations.malls.errors import MarketplaceCredentialMissingError, MarketplaceExternalAPIError
+from integrations.malls.errors import (
+    MarketplaceCapabilityUnsupportedError,
+    MarketplaceCredentialMissingError,
+    MarketplaceExternalAPIError,
+)
 from integrations.malls.naver_smartstore_connector import NaverSmartstoreConnector
 from services.settings_service import ApiCredentialService
 
@@ -48,6 +52,28 @@ def _content_row(order_id: str, product_order_id: str, order_date: str, status: 
             "productOrder": product_order,
         },
     }
+
+
+class TestShipmentUpdateUnsupported:
+    """미구현 송장 전송은 True 성공으로 위장하지 않고 미지원 오류를 던진다(외부 호출 없음)."""
+
+    def test_update_shipment_raises_capability_unsupported_without_http(self, db_session, platform):
+        captured = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(200, json={})
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.commerce.naver.com")
+        connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        with pytest.raises(MarketplaceCapabilityUnsupportedError) as ei:
+            connector.update_shipment("ORDER-SECRET-1", "CJ대한통운", "TRACK-SECRET-9")
+
+        assert ei.value.marketplace_code == "naver"
+        assert captured == []  # 외부 HTTP 요청이 발생하지 않는다.
+        msg = str(ei.value)
+        assert "ORDER-SECRET-1" not in msg and "TRACK-SECRET-9" not in msg
 
 
 class TestCredentialMissingFailsClosed:

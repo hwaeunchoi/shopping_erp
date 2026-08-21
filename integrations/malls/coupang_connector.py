@@ -105,8 +105,9 @@ class CoupangConnector(BaseMallConnector):
         raise MarketplaceCapabilityUnsupportedError("coupang", "order_detail")
 
     def update_shipment(self, platform_order_no: str, carrier: str, tracking_no: str) -> bool:
-        # ⚠️ 미구현 스텁(실 API 미호출). 현재 자동 호출 경로 없음 - 안전화는 S3에서 처리한다.
-        return True
+        # 송장 전송(마켓 반영) 실 API 미구현 - True 성공 위장 없이 미지원 오류를 던진다.
+        # 오류에는 marketplace_code만 담고 주문번호/송장번호/개인정보는 담지 않는다.
+        raise MarketplaceCapabilityUnsupportedError("coupang", "shipment_update")
 
     def fetch_settlements(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
         # 정산 연동 미구현 - 더미로 위장하지 않고 미지원 오류를 던진다.
