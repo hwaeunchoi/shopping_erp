@@ -62,6 +62,9 @@ repos:
         language: system
         types: [python]
         pass_filenames: false
+        # 전체 타입검사는 커밋마다 stash된 불완전 트리를 검사해 증분 커밋을
+        # 막으므로 push 단계로 옮긴다(빠른 커밋 훅과 분리; 전체 검증은 CI/Docker).
+        stages: [pre-push]
         exclude: ^(venv/|frontend/|migrations/)
         args:
           [
@@ -83,3 +86,7 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+        # 전체 테스트는 커밋마다 pre-commit이 stash한 불완전 트리(unstaged 되돌림 +
+        # untracked 잔존)를 검사해 증분 커밋을 구조적으로 막는다. push 단계로 옮기고,
+        # 각 커밋 검증은 clean-worktree Docker에서 별도 수행한다.
+        stages: [pre-push]
