@@ -27,7 +27,8 @@ class Product(Base, TimestampMixin, SoftDeleteMixin):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
-    category: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    # 마켓 카테고리명은 길어질 수 있어 100자로 둔다(쿠팡 등 실데이터 대응).
+    category: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     brand: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     manufacturer: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     base_price: Mapped[Optional[float]] = mapped_column(Numeric(14, 2), nullable=True)
@@ -44,7 +45,8 @@ class ProductOption(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), nullable=False)
-    option_name: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    # 마켓 옵션명은 옵션조합을 이어붙여 길어진다(쿠팡 실데이터 60자+ 관측) - 255자.
+    option_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     color: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
     size: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
     # ERP 내부 식별자 - 판매자상품코드/플랫폼코드와 절대 동일시하지 않는다(seller_product_code는
@@ -162,8 +164,8 @@ class UnmatchedPlatformItem(Base):
     platform_option_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     # 상품(그룹상품) 단위 식별자 - product_platform_map.platform_product_id와 동일 의미.
     platform_product_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    product_name: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
-    option_name: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    product_name: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    option_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     seller_product_code: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     quantity: Mapped[Optional[int]] = mapped_column(nullable=True)
     unit_price: Mapped[Optional[float]] = mapped_column(Numeric(14, 2), nullable=True)
