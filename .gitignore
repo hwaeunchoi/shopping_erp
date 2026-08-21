@@ -28,3 +28,18 @@ frontend/dist/
 # 테스트 캐시
 .pytest_cache/
 .coverage
+
+# --- 보안: 민감 산출물/시크릿 제외 ---
+# backup/*/ 규칙은 하위 "디렉터리"만 매칭하므로, backup/ 루트에 놓인 DB 덤프
+# (개인정보·자격증명 포함 가능)를 걸러내지 못한다. 아래로 보강한다.
+backup/*.sql
+backup/*.dump
+backup/*.sql.gz
+# 로컬/운영 DB 파일 (*.db, *.sqlite3 는 위에서 이미 제외)
+*.sqlite
+# 환경변수 파일 (.env 는 위에서 이미 제외). 예제 파일은 추적 유지.
+.env.*
+!.env.example
+# 인증서/개인키
+*.pem
+*.key
