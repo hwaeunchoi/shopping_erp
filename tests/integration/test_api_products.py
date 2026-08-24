@@ -238,6 +238,231 @@ class TestOptionCRUD:
         remaining = client.get(f"/api/products/{product['id']}/options", headers=auth_headers).json()
         assert remaining == []
 
+    def test_update_missing_option_returns_404(self, client, auth_headers):
+        resp = client.patch("/api/products/options/999999", json={"size": "L"}, headers=auth_headers)
+        assert resp.status_code == 404
+
+    def test_update_option_missing_fields_keep_existing_values(self, client, auth_headers):
+        product = client.post("/api/products", json={"name": "부분수정 테스트 상품"}, headers=auth_headers).json()
+        option = client.post(
+            f"/api/products/{product['id']}/options",
+            json={"sku_code": "PARTIAL-SKU-001", "option_name": "블랙", "color": "레드", "unit_cost_price": 3000},
+            headers=auth_headers,
+        ).json()
+
+        updated = client.patch(f"/api/products/options/{option['id']}", json={"size": "L"}, headers=auth_headers)
+
+        assert updated.status_code == 200
+        body = updated.json()
+        assert body["size"] == "L"
+        assert body["option_name"] == "블랙"  # 요청 본문에 없던 필드는 그대로 유지된다
+        assert body["color"] == "레드"
+        assert body["unit_cost_price"] == 3000.0
+        assert body["sale_price"] is None
+
+    def test_update_option_explicit_null_clears_field(self, client, auth_headers):
+        product = client.post("/api/products", json={"name": "NULL삭제 테스트 상품"}, headers=auth_headers).json()
+        option = client.post(
+            f"/api/products/{product['id']}/options",
+            json={"sku_code": "NULL-SKU-001", "option_name": "블랙", "barcode": "8801234567890"},
+            headers=auth_headers,
+        ).json()
+
+        updated = client.patch(
+            f"/api/products/options/{option['id']}", json={"option_name": None, "barcode": None}, headers=auth_headers
+        )
+
+        assert updated.status_code == 200
+        body = updated.json()
+        assert body["option_name"] is None
+        assert body["barcode"] is None
+
+    def test_update_option_blank_string_normalizes_to_null(self, client, auth_headers):
+        product = client.post("/api/products", json={"name": "공백정규화 테스트 상품"}, headers=auth_headers).json()
+        option = client.post(
+            f"/api/products/{product['id']}/options",
+            json={"sku_code": "BLANK-SKU-001", "option_name": "블랙", "color": "레드"},
+            headers=auth_headers,
+        ).json()
+
+        updated = client.patch(
+            f"/api/products/options/{option['id']}", json={"option_name": "", "color": "   "}, headers=auth_headers
+        )
+
+        assert updated.status_code == 200
+        body = updated.json()
+        assert body["option_name"] is None
+        assert body["color"] is None
+
+    def test_update_option_name_255_chars_succeeds(self, client, auth_headers):
+        product = client.post("/api/products", json={"name": "255자 성공 테스트 상품"}, headers=auth_headers).json()
+        option = client.post(
+            f"/api/products/{product['id']}/options", json={"sku_code": "LEN255-SKU-001"}, headers=auth_headers
+        ).json()
+
+        updated = client.patch(
+            f"/api/products/options/{option['id']}", json={"option_name": "A" * 255}, headers=auth_headers
+        )
+
+        assert updated.status_code == 200
+        assert updated.json()["option_name"] == "A" * 255
+        assert len(updated.json()["option_name"]) == 255
+
+    def test_update_option_name_255_korean_chars_succeeds(self, client, auth_headers):
+        product = client.post("/api/products", json={"name": "한글255 테스트 상품"}, headers=auth_headers).json()
+        option = client.post(
+            f"/api/products/{product['id']}/options", json={"sku_code": "LEN255-KR-SKU-001"}, headers=auth_headers
+        ).json()
+
+        updated = client.patch(
+            f"/api/products/options/{option['id']}", json={"option_name": "가" * 255}, headers=auth_headers
+        )
+
+        assert updated.status_code == 200
+        assert updated.json()["option_name"] == "가" * 255
+        assert len(updated.json()["option_name"]) == 255
+
+    def test_update_option_name_256_chars_returns_422_with_string_detail(self, client, auth_headers):
+        product = client.post("/api/products", json={"name": "256자 거부 테스트 상품"}, headers=auth_headers).json()
+        option = client.post(
+            f"/api/products/{product['id']}/options", json={"sku_code": "LEN256-SKU-001"}, headers=auth_headers
+        ).json()
+
+        resp = client.patch(
+            f"/api/products/options/{option['id']}", json={"option_name": "B" * 256}, headers=auth_headers
+        )
+
+        assert resp.status_code == 422
+        assert isinstance(resp.json()["detail"], str)
+        unchanged = client.get(f"/api/products/{product['id']}/options", headers=auth_headers).json()
+        assert unchanged[0]["option_name"] is None  # 거부된 요청은 저장되지 않는다
+
+    def test_update_option_negative_unit_cost_price_returns_422_with_string_detail(self, client, auth_headers):
+        product = client.post("/api/products", json={"name": "음수원가 거부 테스트 상품"}, headers=auth_headers).json()
+        option = client.post(
+            f"/api/products/{product['id']}/options",
+            json={"sku_code": "NEG-SKU-001", "unit_cost_price": 3000},
+            headers=auth_headers,
+        ).json()
+
+        resp = client.patch(f"/api/products/options/{option['id']}", json={"unit_cost_price": -1}, headers=auth_headers)
+
+        assert resp.status_code == 422
+        assert isinstance(resp.json()["detail"], str)
+        unchanged = client.get(f"/api/products/{product['id']}/options", headers=auth_headers).json()
+        assert unchanged[0]["unit_cost_price"] == 3000.0  # 거부된 요청은 저장되지 않는다
+
+    def test_update_option_zero_unit_cost_price_succeeds(self, client, auth_headers):
+        product = client.post("/api/products", json={"name": "원가0 성공 테스트 상품"}, headers=auth_headers).json()
+        option = client.post(
+            f"/api/products/{product['id']}/options",
+            json={"sku_code": "ZERO-SKU-001", "unit_cost_price": 3000},
+            headers=auth_headers,
+        ).json()
+
+        updated = client.patch(
+            f"/api/products/options/{option['id']}", json={"unit_cost_price": 0}, headers=auth_headers
+        )
+
+        assert updated.status_code == 200
+        assert updated.json()["unit_cost_price"] == 0.0
+
+    def test_update_option_barcode_set_and_clear(self, client, auth_headers):
+        product = client.post("/api/products", json={"name": "바코드 테스트 상품"}, headers=auth_headers).json()
+        option = client.post(
+            f"/api/products/{product['id']}/options", json={"sku_code": "BARCODE-SKU-001"}, headers=auth_headers
+        ).json()
+
+        set_resp = client.patch(
+            f"/api/products/options/{option['id']}", json={"barcode": "8801234567890"}, headers=auth_headers
+        )
+        assert set_resp.status_code == 200
+        assert set_resp.json()["barcode"] == "8801234567890"
+
+        clear_resp = client.patch(f"/api/products/options/{option['id']}", json={"barcode": None}, headers=auth_headers)
+        assert clear_resp.status_code == 200
+        assert clear_resp.json()["barcode"] is None
+
+    def test_update_option_response_matches_persisted_value(self, client, auth_headers):
+        """응답 body가 실제 DB 저장값과 일치하는지 - PATCH 응답과 별도 GET 조회 결과를 비교한다."""
+        product = client.post("/api/products", json={"name": "응답일치 테스트 상품"}, headers=auth_headers).json()
+        option = client.post(
+            f"/api/products/{product['id']}/options", json={"sku_code": "SYNC-SKU-001"}, headers=auth_headers
+        ).json()
+
+        patch_resp = client.patch(
+            f"/api/products/options/{option['id']}",
+            json={"option_name": "블랙-수정", "color": "블랙"},
+            headers=auth_headers,
+        )
+        refetched = client.get(f"/api/products/{product['id']}/options", headers=auth_headers).json()
+        refetched_option = next(o for o in refetched if o["id"] == option["id"])
+
+        assert patch_resp.json()["option_name"] == refetched_option["option_name"] == "블랙-수정"
+        assert patch_resp.json()["color"] == refetched_option["color"] == "블랙"
+
+    def test_create_option_name_255_chars_succeeds(self, client, auth_headers):
+        product = client.post("/api/products", json={"name": "등록255 성공 테스트 상품"}, headers=auth_headers).json()
+
+        resp = client.post(
+            f"/api/products/{product['id']}/options",
+            json={"sku_code": "CREATE-LEN255-SKU-001", "option_name": "C" * 255},
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 201
+        assert resp.json()["option_name"] == "C" * 255
+        assert len(resp.json()["option_name"]) == 255
+
+    def test_create_option_name_256_chars_returns_422(self, client, auth_headers):
+        product = client.post("/api/products", json={"name": "등록256 거부 테스트 상품"}, headers=auth_headers).json()
+
+        resp = client.post(
+            f"/api/products/{product['id']}/options",
+            json={"sku_code": "CREATE-LEN256-SKU-001", "option_name": "D" * 256},
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 422
+        assert isinstance(resp.json()["detail"], str)
+
+    def test_create_option_zero_unit_cost_price_succeeds(self, client, auth_headers):
+        product = client.post("/api/products", json={"name": "등록원가0 테스트 상품"}, headers=auth_headers).json()
+
+        resp = client.post(
+            f"/api/products/{product['id']}/options",
+            json={"sku_code": "CREATE-ZERO-SKU-001", "unit_cost_price": 0},
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 201
+        assert resp.json()["unit_cost_price"] == 0.0
+
+    def test_create_option_negative_unit_cost_price_returns_422(self, client, auth_headers):
+        product = client.post("/api/products", json={"name": "등록음수원가 테스트 상품"}, headers=auth_headers).json()
+
+        resp = client.post(
+            f"/api/products/{product['id']}/options",
+            json={"sku_code": "CREATE-NEG-SKU-001", "unit_cost_price": -500},
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 422
+        assert isinstance(resp.json()["detail"], str)
+
+    def test_create_option_blank_string_normalizes_to_null(self, client, auth_headers):
+        product = client.post("/api/products", json={"name": "등록공백정규화 테스트 상품"}, headers=auth_headers).json()
+
+        resp = client.post(
+            f"/api/products/{product['id']}/options",
+            json={"sku_code": "CREATE-BLANK-SKU-001", "option_name": "   ", "color": ""},
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 201
+        assert resp.json()["option_name"] is None
+        assert resp.json()["color"] is None
+
     def test_delete_missing_option_returns_404(self, client, auth_headers):
         resp = client.delete("/api/products/options/999999", headers=auth_headers)
         assert resp.status_code == 404

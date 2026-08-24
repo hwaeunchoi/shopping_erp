@@ -5,7 +5,7 @@ api/routers/products.py
 """
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict
@@ -436,25 +436,56 @@ def list_product_options(product_id: int, db: Session = Depends(get_db)) -> list
     return ProductOptionRepository(db).list_by_product(product_id)
 
 
+_OPTION_TEXT_FIELDS = ("option_name", "color", "size", "barcode")
+_OPTION_NAME_MAX_LENGTH = 255
+
+
+def _normalize_option_text(value: Optional[str]) -> Optional[str]:
+    """옵션 텍스트 필드(옵션명/색상/사이즈/바코드) 공통 정규화 - 앞뒤 공백을 지우고
+    그 결과가 빈 문자열이면 NULL로 취급한다(빈 문자열과 공백만 있는 값을 동일하게
+    처리해, "지운다"는 사용자 의도가 실제로 반영되게 한다)."""
+    if value is None:
+        return None
+    trimmed = value.strip()
+    return trimmed or None
+
+
+def _validate_option_fields(option_name: Optional[str], unit_cost_price: Optional[float]) -> None:
+    """옵션명 길이(255자)/단가(0 이상) 제약을 SQLite·PostgreSQL 등 DB 엔진과
+    무관하게 애플리케이션 레이어에서 강제한다. 조용히 자르거나 무시하지 않고
+    422로 명시적으로 거부한다."""
+    if option_name is not None and len(option_name) > _OPTION_NAME_MAX_LENGTH:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"옵션명은 {_OPTION_NAME_MAX_LENGTH}자를 초과할 수 없습니다.",
+        )
+    if unit_cost_price is not None and unit_cost_price < 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="단가(매입원가)는 0 이상이어야 합니다."
+        )
+
+
 @router.post(
     "/{product_id}/options",
     response_model=ProductOptionOut,
     status_code=status.HTTP_201_CREATED,
     summary="상품 옵션(SKU) 등록",
-    responses={404: {"description": "상품을 찾을 수 없습니다."}, 409: {"description": "이미 존재하는 SKU 코드입니다."}},
+    responses={
+        404: {"description": "상품을 찾을 수 없습니다."},
+        409: {"description": "이미 존재하는 SKU 코드입니다."},
+        422: {"description": "옵션명이 255자를 초과하거나 단가가 음수입니다."},
+    },
 )
 def create_product_option(product_id: int, payload: ProductOptionCreate, db: Session = Depends(get_db)):
     if ProductRepository(db).get_by_id(product_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="상품을 찾을 수 없습니다.")
+    option_name = _normalize_option_text(payload.option_name)
+    color = _normalize_option_text(payload.color)
+    size = _normalize_option_text(payload.size)
+    barcode = _normalize_option_text(payload.barcode)
+    _validate_option_fields(option_name, payload.unit_cost_price)
     option = ProductService(db).create_option(
-        product_id,
-        payload.sku_code,
-        payload.option_name,
-        payload.color,
-        payload.size,
-        payload.barcode,
-        payload.unit_cost_price,
-        payload.sale_price,
+        product_id, payload.sku_code, option_name, color, size, barcode, payload.unit_cost_price, payload.sale_price
     )
     db.commit()
     return option
@@ -479,21 +510,23 @@ def reorder_product_options(product_id: int, payload: ProductOptionReorder, db: 
     "/options/{option_id}",
     response_model=ProductOptionOut,
     summary="상품 옵션(SKU) 수정",
-    responses={404: {"description": "옵션을 찾을 수 없습니다."}},
+    description="부분 수정(PATCH) - 요청 본문에 없는 필드는 기존 값을 그대로 유지하고, "
+    "명시적으로 null을 보낸 nullable 필드는 실제로 NULL로 지운다.",
+    responses={
+        404: {"description": "옵션을 찾을 수 없습니다."},
+        422: {"description": "옵션명이 255자를 초과하거나 단가가 음수입니다."},
+    },
 )
 def update_product_option(option_id: int, payload: ProductOptionUpdate, db: Session = Depends(get_db)):
     option = ProductOptionRepository(db).get_by_id(option_id)
     if option is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="옵션을 찾을 수 없습니다.")
-    updated = ProductService(db).update_option(
-        option,
-        payload.option_name,
-        payload.color,
-        payload.size,
-        payload.barcode,
-        payload.unit_cost_price,
-        payload.sale_price,
-    )
+    updates: dict[str, Any] = payload.model_dump(exclude_unset=True)
+    for field in _OPTION_TEXT_FIELDS:
+        if field in updates:
+            updates[field] = _normalize_option_text(updates[field])
+    _validate_option_fields(updates.get("option_name"), updates.get("unit_cost_price"))
+    updated = ProductService(db).update_option(option, updates)
     db.commit()
     return updated
 

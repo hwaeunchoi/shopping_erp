@@ -11,7 +11,7 @@ ProductCostHistory는 effective_from~effective_to로 시점별 원가를 추적�
 """
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
@@ -178,28 +178,23 @@ class ProductService:
         )
         return self.option_repo.add(option)
 
-    def update_option(
-        self,
-        option: ProductOption,
-        option_name: Optional[str] = None,
-        color: Optional[str] = None,
-        size: Optional[str] = None,
-        barcode: Optional[str] = None,
-        unit_cost_price: Optional[float] = None,
-        sale_price: Optional[float] = None,
-    ) -> ProductOption:
-        if option_name is not None:
-            option.option_name = option_name
-        if color is not None:
-            option.color = color
-        if size is not None:
-            option.size = size
-        if barcode is not None:
-            option.barcode = barcode
-        if unit_cost_price is not None:
-            option.unit_cost_price = unit_cost_price
-        if sale_price is not None:
-            option.sale_price = sale_price
+    def update_option(self, option: ProductOption, updates: dict[str, Any]) -> ProductOption:
+        """PATCH 방식 부분 수정 - updates에 키가 없는 필드는 손대지 않고(기존 값
+        유지), 키가 있으면 값이 None이어도(명시적 NULL) 그대로 반영해 지운다.
+        허용된 6개 필드만 이름으로 직접 대입하고 그 외 키는 무시한다(임의 키를
+        setattr로 반영하지 않는다)."""
+        if "option_name" in updates:
+            option.option_name = updates["option_name"]
+        if "color" in updates:
+            option.color = updates["color"]
+        if "size" in updates:
+            option.size = updates["size"]
+        if "barcode" in updates:
+            option.barcode = updates["barcode"]
+        if "unit_cost_price" in updates:
+            option.unit_cost_price = updates["unit_cost_price"]
+        if "sale_price" in updates:
+            option.sale_price = updates["sale_price"]
         self.session.flush()
         return option
 

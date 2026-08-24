@@ -32,12 +32,58 @@ class TestProductCRUD:
         option = service.create_option(product.id, "SKU-TEST-001", option_name="블랙")
         assert option.is_active is True
 
-        updated = service.update_option(option, color="블랙", size="L")
+        updated = service.update_option(option, {"color": "블랙", "size": "L"})
         assert updated.color == "블랙"
         assert updated.size == "L"
 
         deactivated = service.set_option_active(option, False)
         assert deactivated.is_active is False
+
+    def test_update_option_missing_keys_keep_existing_values(self, db_session):
+        service = ProductService(db_session)
+        product = service.create_product("갱신 미포함 테스트", None, None)
+        option = service.create_option(
+            product.id, "SKU-PARTIAL-001", option_name="블랙", color="레드", unit_cost_price=3000
+        )
+
+        updated = service.update_option(option, {"size": "L"})
+
+        assert updated.size == "L"
+        assert updated.option_name == "블랙"  # updates에 없던 키는 그대로 유지된다
+        assert updated.color == "레드"
+        assert updated.unit_cost_price == 3000
+
+    def test_update_option_explicit_none_clears_nullable_field(self, db_session):
+        service = ProductService(db_session)
+        product = service.create_product("NULL 삭제 테스트", None, None)
+        option = service.create_option(product.id, "SKU-NULLABLE-001", option_name="블랙", barcode="8801234567890")
+
+        updated = service.update_option(option, {"option_name": None, "barcode": None})
+
+        assert updated.option_name is None  # updates에 키가 있으면 값이 None이어도 반영된다
+        assert updated.barcode is None
+
+    def test_update_option_preserves_255_char_names(self, db_session):
+        service = ProductService(db_session)
+        product = service.create_product("255자 테스트", None, None)
+        option = service.create_option(product.id, "SKU-255-001")
+
+        updated = service.update_option(option, {"option_name": "A" * 255})
+        assert updated.option_name == "A" * 255
+        assert len(updated.option_name) == 255
+
+        updated_kr = service.update_option(option, {"option_name": "가" * 255})
+        assert updated_kr.option_name == "가" * 255
+        assert len(updated_kr.option_name) == 255
+
+    def test_update_option_zero_unit_cost_price_succeeds(self, db_session):
+        service = ProductService(db_session)
+        product = service.create_product("원가0 테스트", None, None)
+        option = service.create_option(product.id, "SKU-ZERO-001", unit_cost_price=3000)
+
+        updated = service.update_option(option, {"unit_cost_price": 0})
+
+        assert updated.unit_cost_price == 0
 
     def test_duplicate_sku_raises_integrity_error(self, db_session):
         service = ProductService(db_session)
