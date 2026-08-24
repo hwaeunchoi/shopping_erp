@@ -305,6 +305,193 @@ class TestSyncProductsFromNaver:
         images = ProductImageRepository(db_session).list_by_product(option.product_id)
         assert len(images) == 1
 
+    def test_registration_preserves_full_255_char_option_name(self, db_session, platform):
+        option_name_255 = "A" * 255
+        connector = StubProductConnector(
+            [
+                _naver_product(
+                    items=[
+                        {
+                            "platform_option_id": "ITEM-255",
+                            "platform_product_id": "PRODUCT-255",
+                            "option_name": option_name_255,
+                            "seller_product_code": "SELLER-255",
+                            "sale_price": 12345,
+                            "is_selling": True,
+                        }
+                    ]
+                )
+            ]
+        )
+        service = ProductSyncService(db_session)
+
+        service.sync_products_from_naver(connector, platform.id)
+
+        mapping = (
+            db_session.query(ProductPlatformMap).filter_by(platform_id=platform.id, platform_option_id="ITEM-255").one()
+        )
+        option = ProductOptionRepository(db_session).get_by_id(mapping.product_option_id)
+        assert option is not None
+        assert option.option_name == option_name_255
+        assert len(option.option_name) == 255
+        # 옵션명 길이 변경과 무관한 다른 필드는 그대로 저장된다.
+        assert option.sale_price == 12345
+        assert option.is_active is True
+        assert option.sku_code == f"SKU-{option.id:06d}"
+        assert mapping.seller_product_code == "SELLER-255"
+        assert mapping.platform_product_id == "PRODUCT-255"
+
+    def test_registration_truncates_256_char_option_name_to_255(self, db_session, platform):
+        option_name_256 = "B" * 256
+        connector = StubProductConnector(
+            [
+                _naver_product(
+                    items=[
+                        {
+                            "platform_option_id": "ITEM-256",
+                            "platform_product_id": "PRODUCT-256",
+                            "option_name": option_name_256,
+                            "seller_product_code": "SELLER-256",
+                            "sale_price": 9900,
+                            "is_selling": True,
+                        }
+                    ]
+                )
+            ]
+        )
+        service = ProductSyncService(db_session)
+
+        service.sync_products_from_naver(connector, platform.id)
+
+        mapping = (
+            db_session.query(ProductPlatformMap).filter_by(platform_id=platform.id, platform_option_id="ITEM-256").one()
+        )
+        option = ProductOptionRepository(db_session).get_by_id(mapping.product_option_id)
+        assert option is not None
+        assert option.option_name == option_name_256[:255]
+        assert len(option.option_name) == 255
+        # 절단은 옵션명에만 적용되고 다른 필드는 영향받지 않는다.
+        assert option.sale_price == 9900
+        assert option.is_active is True
+
+    def test_registration_preserves_255_korean_characters(self, db_session, platform):
+        option_name_255_kr = "가" * 255
+        connector = StubProductConnector(
+            [
+                _naver_product(
+                    items=[
+                        {
+                            "platform_option_id": "ITEM-KR-255",
+                            "platform_product_id": "PRODUCT-KR-255",
+                            "option_name": option_name_255_kr,
+                            "is_selling": True,
+                        }
+                    ]
+                )
+            ]
+        )
+        service = ProductSyncService(db_session)
+
+        service.sync_products_from_naver(connector, platform.id)
+
+        mapping = (
+            db_session.query(ProductPlatformMap)
+            .filter_by(platform_id=platform.id, platform_option_id="ITEM-KR-255")
+            .one()
+        )
+        option = ProductOptionRepository(db_session).get_by_id(mapping.product_option_id)
+        assert option is not None
+        assert option.option_name == option_name_255_kr
+        assert len(option.option_name) == 255  # 문자(코드포인트) 단위 - 바이트 단위가 아니다
+
+    def test_update_preserves_full_255_char_option_name(self, db_session, platform):
+        connector = StubProductConnector([_naver_product()])
+        service = ProductSyncService(db_session)
+        service.sync_products_from_naver(connector, platform.id)
+
+        option_name_255 = "C" * 255
+        connector2 = StubProductConnector(
+            [
+                _naver_product(
+                    items=[
+                        {
+                            "platform_option_id": "ITEM-001",
+                            "platform_product_id": "PRODUCT-001",
+                            "option_name": option_name_255,
+                            "seller_product_code": "SELLER-001",
+                            "sale_price": 21900,
+                            "is_selling": True,
+                        }
+                    ]
+                )
+            ]
+        )
+
+        result = service.sync_products_from_naver(connector2, platform.id)
+
+        assert result["updated_options"] == 1
+        mapping = (
+            db_session.query(ProductPlatformMap).filter_by(platform_id=platform.id, platform_option_id="ITEM-001").one()
+        )
+        option = ProductOptionRepository(db_session).get_by_id(mapping.product_option_id)
+        assert option is not None
+        assert option.option_name == option_name_255
+        assert len(option.option_name) == 255
+        # 갱신 경로에서도 다른 필드는 정상 반영된다.
+        assert option.sale_price == 21900
+        assert option.is_active is True
+
+    def test_option_name_none_or_empty_keeps_existing_policy(self, db_session, platform):
+        """등록 시 option_name이 없으면 None으로 저장되고(기존 정책 유지), 갱신 시
+        빈 문자열이 오면 `if option_name:` 가드에 걸려 기존 값을 덮어쓰지 않는다
+        (255자로 상한을 늘린 것과 무관하게 원래 동작 그대로)."""
+        connector = StubProductConnector(
+            [
+                _naver_product(
+                    items=[
+                        {
+                            "platform_option_id": "ITEM-NONE",
+                            "platform_product_id": "PRODUCT-NONE",
+                            "option_name": None,
+                            "is_selling": True,
+                        }
+                    ]
+                )
+            ]
+        )
+        service = ProductSyncService(db_session)
+        service.sync_products_from_naver(connector, platform.id)
+
+        mapping = (
+            db_session.query(ProductPlatformMap)
+            .filter_by(platform_id=platform.id, platform_option_id="ITEM-NONE")
+            .one()
+        )
+        option = ProductOptionRepository(db_session).get_by_id(mapping.product_option_id)
+        assert option is not None
+        assert option.option_name is None
+
+        connector2 = StubProductConnector(
+            [
+                _naver_product(
+                    items=[
+                        {
+                            "platform_option_id": "ITEM-NONE",
+                            "platform_product_id": "PRODUCT-NONE",
+                            "option_name": "",
+                            "sale_price": 5000,
+                            "is_selling": True,
+                        }
+                    ]
+                )
+            ]
+        )
+        service.sync_products_from_naver(connector2, platform.id)
+
+        db_session.refresh(option)
+        assert option.option_name is None  # 빈 문자열은 기존 값을 덮어쓰지 않는다(기존 정책)
+        assert option.sale_price == 5000  # 다른 필드는 정상 갱신된다
+
 
 class TestMatchUnmappedItem:
     """3단계 자동매칭(platform_option_id -> platform_product_id -> seller_product_code,

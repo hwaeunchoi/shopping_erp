@@ -174,7 +174,7 @@ class ProductSyncService:
             ProductOption(
                 product_id=product_id,
                 sku_code=f"PENDING-{platform_id}-{platform_option_id}"[:50],
-                option_name=option_name[:50] if option_name else None,
+                option_name=option_name[:255] if option_name else None,
                 sale_price=item.get("sale_price"),
                 is_active=item.get("is_selling", True),
             )
@@ -209,7 +209,7 @@ class ProductSyncService:
         assert option is not None
         option_name = item.get("option_name")
         if option_name:
-            option.option_name = option_name[:50]
+            option.option_name = option_name[:255]
         if "sale_price" in item and item["sale_price"] is not None:
             option.sale_price = item["sale_price"]
         if "is_selling" in item:
