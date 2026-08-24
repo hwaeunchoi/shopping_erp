@@ -208,6 +208,14 @@ input, select {
   flex-wrap: wrap;
 }
 
+/* 표 안에서 바로 편집하는 입력칸(옵션명/색상/사이즈/바코드/단가) */
+.cell-input { width: 130px; padding: 4px 6px; font-size: 12.5px; border: 1px solid var(--border); border-radius: 5px; background: var(--panel-bg); color: var(--text); }
+.cell-input.sm { width: 70px; }
+.cell-input:focus { outline: none; border-color: var(--accent, #4c5bd4); }
+/* 옵션 인라인 편집 저장 버튼 - 이 영역 전용(전역 버튼 스타일에는 영향을 주지 않는다),
+   변경사항이 있을 때만(.is-dirty) 강조한다. */
+.option-save-btn.is-dirty { background: var(--accent, #4c5bd4); color: #fff; border-color: var(--accent, #4c5bd4); }
+
 .inline-form {
   display: flex;
   gap: 8px;

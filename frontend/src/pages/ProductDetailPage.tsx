@@ -1,4 +1,4 @@
-import { Fragment, useState, type FormEvent } from 'react'
+import { Fragment, useEffect, useRef, useState, type ChangeEvent, type FormEvent, type KeyboardEvent } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, ApiError } from '../api/client'
 import { useApiData } from '../api/useApiData'
@@ -8,12 +8,15 @@ import type {
   ProductCostHistory,
   ProductDetail,
   ProductImage,
+  ProductOption,
   ProductOptionCreate,
   ProductOptionDetail,
+  ProductOptionUpdate,
   ProductPlatformMap,
 } from '../api/types'
 
 const OPTIONS_TABLE_COLUMNS = 11
+const OPTION_NAME_MAX_LENGTH = 255
 
 function ProductInfoEdit({ product, onSaved }: { product: ProductDetail; onSaved: () => void }) {
   const navigate = useNavigate()
@@ -94,8 +97,8 @@ function ProductInfoEdit({ product, onSaved }: { product: ProductDetail; onSaved
         min={0}
       />
       <select value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value })}>
-        <option value="ACTIVE">ACTIVE</option>
-        <option value="DISCONTINUED">DISCONTINUED</option>
+        <option value="ACTIVE">판매중</option>
+        <option value="DISCONTINUED">단종</option>
       </select>
       <button type="submit" disabled={isSaving}>{isSaving ? '저장 중...' : '상품정보 저장'}</button>
       <button type="button" onClick={handleDuplicate}>상품 복제</button>
@@ -105,65 +108,197 @@ function ProductInfoEdit({ product, onSaved }: { product: ProductDetail; onSaved
   )
 }
 
-function OptionEditRow({ option, onSaved }: { option: ProductOptionDetail; onSaved: () => void }) {
-  const [form, setForm] = useState({
+function deriveOptionForm(option: ProductOption) {
+  return {
     option_name: option.option_name ?? '',
     color: option.color ?? '',
     size: option.size ?? '',
     barcode: option.barcode ?? '',
     unit_cost_price: option.unit_cost_price ?? undefined,
-  })
+  }
+}
+
+// 저장 시 보낼 문자열을 정규화한다 - 앞뒤 공백을 지우고, 그 결과가 빈 문자열이면
+// 명시적 null로 보낸다(서버가 "생략"과 "명시적 null"을 구분하므로, 지운다는
+// 의도가 실제로 반영되게 하려면 빈 값도 null로 보내야 한다).
+function normalizeOptionText(value: string): string | null {
+  const trimmed = value.trim()
+  return trimmed === '' ? null : trimmed
+}
+
+// 옵션(SKU) 한 행 - 옵션명/색상/사이즈/바코드/단가를 셀에서 바로 편집하고 행마다
+// 저장한다(예전엔 '수정'을 눌러 아래에 폼을 펼쳐야 해서 번거로웠음).
+//
+// prop 동기화 정책: 사용자가 편집 중(dirty)인 동안에는 option prop이 바뀌어도
+// (다른 행 순서변경 등으로 인한 목록 재조회 포함) 입력값을 덮어쓰지 않는다.
+// dirty가 아닐 때만 prop 값으로 폼을 다시 맞춘다. 저장 성공 시에는 서버가 실제로
+// 반영한 응답값을 폼에 직접 대입하므로, 뒤이어 도착하는 option prop 갱신은 이미
+// 같은 값이라 재동기화되어도 화면이 다시 바뀌지 않는다(낡은 props로 덮이지 않음).
+function OptionRow({
+  option,
+  index,
+  total,
+  onReload,
+  onMove,
+  onToggleActive,
+  onDelete,
+  onManage,
+  isManaging,
+}: {
+  option: ProductOptionDetail
+  index: number
+  total: number
+  onReload: () => void
+  onMove: (index: number, dir: -1 | 1) => void
+  onToggleActive: (o: ProductOptionDetail) => void
+  onDelete: (o: ProductOptionDetail) => void
+  onManage: (id: number) => void
+  isManaging: boolean
+}) {
+  const [form, setForm] = useState(() => deriveOptionForm(option))
   const [error, setError] = useState<string | null>(null)
   const [isSaving, setIsSaving] = useState(false)
+  const [savedAt, setSavedAt] = useState(false)
+  const savingRef = useRef(false)
 
-  const handleSave = async (e: FormEvent) => {
-    e.preventDefault()
+  const dirty =
+    form.option_name !== (option.option_name ?? '') ||
+    form.color !== (option.color ?? '') ||
+    form.size !== (option.size ?? '') ||
+    form.barcode !== (option.barcode ?? '') ||
+    (form.unit_cost_price ?? undefined) !== (option.unit_cost_price ?? undefined)
+
+  useEffect(() => {
+    if (!dirty) {
+      setForm(deriveOptionForm(option))
+    }
+    // dirty는 매 렌더 재계산되는 파생값이라 의도적으로 deps에서 제외한다 -
+    // option이 바뀔 때만 재동기화 여부를 판단하면 된다.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [option])
+
+  const priceInvalid = form.unit_cost_price !== undefined && form.unit_cost_price < 0
+
+  const handlePriceChange = (e: ChangeEvent<HTMLInputElement>) => {
+    const raw = e.target.value
+    const parsed = raw ? Number(raw) : undefined
+    // NaN이 폼/페이로드에 들어가지 않도록 방어한다(예: "-"만 입력된 중간 상태).
+    setForm({ ...form, unit_cost_price: parsed !== undefined && Number.isFinite(parsed) ? parsed : undefined })
+  }
+
+  const handleSave = async () => {
+    // useRef 기반 잠금 - isSaving(state)만으로는 같은 렌더 프레임 안에서 Enter를
+    // 연타할 때 중복 요청을 완전히 막지 못할 수 있어, 동기적으로 즉시 반영되는
+    // ref로 이중 방어한다. 버튼 클릭과 Enter 저장 모두 이 handleSave를 거친다.
+    if (savingRef.current || priceInvalid) return
+    savingRef.current = true
     setError(null)
     setIsSaving(true)
     try {
-      await api.patch(`/api/products/options/${option.id}`, {
-        option_name: form.option_name || null,
-        color: form.color || null,
-        size: form.size || null,
-        barcode: form.barcode || null,
+      const payload: ProductOptionUpdate = {
+        option_name: normalizeOptionText(form.option_name),
+        color: normalizeOptionText(form.color),
+        size: normalizeOptionText(form.size),
+        barcode: normalizeOptionText(form.barcode),
         unit_cost_price: form.unit_cost_price ?? null,
-      })
-      onSaved()
+      }
+      const updated = await api.patch<ProductOption>(`/api/products/options/${option.id}`, payload)
+      setForm(deriveOptionForm(updated))  // 서버가 실제로 반영한 값으로만 재동기화한다
+      setSavedAt(true)
+      setTimeout(() => setSavedAt(false), 1500)
+      onReload()
     } catch (err) {
+      // 실패 시 사용자가 입력한 값(form)은 그대로 유지한다 - 재입력할 필요 없음.
       setError(err instanceof ApiError ? err.message : '옵션 수정 중 오류가 발생했습니다.')
     } finally {
+      savingRef.current = false
       setIsSaving(false)
     }
   }
 
+  // Enter 키로도 저장되게 한다(편집 편의) - 클릭과 동일한 handleSave를 타므로
+  // savingRef 가드도 그대로 적용된다.
+  const onKeyDown = (e: KeyboardEvent) => {
+    if (e.key === 'Enter') handleSave()
+  }
+
   return (
-    <tr className="detail-subrow">
-      <td colSpan={OPTIONS_TABLE_COLUMNS}>
-        <form className="inline-form" onSubmit={handleSave}>
-          <input
-            value={form.option_name}
-            onChange={(e) => setForm({ ...form, option_name: e.target.value })}
-            placeholder="옵션명"
-          />
-          <input value={form.color} onChange={(e) => setForm({ ...form, color: e.target.value })} placeholder="색상" />
-          <input value={form.size} onChange={(e) => setForm({ ...form, size: e.target.value })} placeholder="사이즈" />
-          <input
-            value={form.barcode}
-            onChange={(e) => setForm({ ...form, barcode: e.target.value })}
-            placeholder="바코드"
-          />
-          <input
-            type="number"
-            value={form.unit_cost_price ?? ''}
-            onChange={(e) =>
-              setForm({ ...form, unit_cost_price: e.target.value ? Number(e.target.value) : undefined })
-            }
-            placeholder="단가(매입원가)"
-            min={0}
-          />
-          <button type="submit" disabled={isSaving}>{isSaving ? '저장 중...' : '옵션정보 저장'}</button>
-          {error && <span className="form-error">{error}</span>}
-        </form>
+    <tr>
+      <td>
+        <button type="button" disabled={index === 0} onClick={() => onMove(index, -1)}>▲</button>
+        <button type="button" disabled={index === total - 1} onClick={() => onMove(index, 1)}>▼</button>
+      </td>
+      <td>{option.sku_code}</td>
+      <td>
+        <input
+          className="cell-input"
+          value={form.option_name}
+          onChange={(e) => setForm({ ...form, option_name: e.target.value })}
+          onKeyDown={onKeyDown}
+          placeholder="옵션명"
+          maxLength={OPTION_NAME_MAX_LENGTH}
+          aria-label={`${option.sku_code} 옵션명`}
+        />
+      </td>
+      <td>
+        <input
+          className="cell-input sm"
+          value={form.color}
+          onChange={(e) => setForm({ ...form, color: e.target.value })}
+          onKeyDown={onKeyDown}
+          placeholder="색상"
+          aria-label={`${option.sku_code} 색상`}
+        />
+      </td>
+      <td>
+        <input
+          className="cell-input sm"
+          value={form.size}
+          onChange={(e) => setForm({ ...form, size: e.target.value })}
+          onKeyDown={onKeyDown}
+          placeholder="사이즈"
+          aria-label={`${option.sku_code} 사이즈`}
+        />
+      </td>
+      <td>
+        <input
+          className="cell-input"
+          value={form.barcode}
+          onChange={(e) => setForm({ ...form, barcode: e.target.value })}
+          onKeyDown={onKeyDown}
+          placeholder="바코드"
+          aria-label={`${option.sku_code} 바코드`}
+        />
+      </td>
+      <td>
+        <input
+          className="cell-input sm"
+          type="number"
+          min={0}
+          value={form.unit_cost_price ?? ''}
+          onChange={handlePriceChange}
+          onKeyDown={onKeyDown}
+          placeholder="단가"
+          aria-label={`${option.sku_code} 단가(매입원가)`}
+        />
+        {priceInvalid && <div className="form-error">단가는 0 이상이어야 합니다</div>}
+      </td>
+      <td><span className="status-badge">{option.is_active ? '판매중' : '미판매'}</span></td>
+      <td>
+        <button
+          type="button"
+          className={`option-save-btn${dirty ? ' is-dirty' : ''}`}
+          disabled={isSaving || !dirty || priceInvalid}
+          onClick={handleSave}
+        >
+          {isSaving ? '저장 중...' : savedAt ? '저장됨 ✓' : '저장'}
+        </button>
+      </td>
+      <td><button type="button" onClick={() => onToggleActive(option)}>{option.is_active ? '미판매로' : '판매중으로'}</button></td>
+      <td>
+        <button type="button" onClick={() => onDelete(option)}>삭제</button>
+        <button type="button" onClick={() => onManage(option.id)}>{isManaging ? '닫기' : '관리'}</button>
+        {error && <span className="form-error">{error}</span>}
       </td>
     </tr>
   )
@@ -502,7 +637,6 @@ export function ProductDetailPage() {
   const [optionForm, setOptionForm] = useState<ProductOptionCreate>({ sku_code: '' })
   const [optionError, setOptionError] = useState<string | null>(null)
   const [selectedOptionId, setSelectedOptionId] = useState<number | null>(null)
-  const [editingOptionId, setEditingOptionId] = useState<number | null>(null)
 
   const handleCreateOption = async (e: FormEvent) => {
     e.preventDefault()
@@ -602,55 +736,27 @@ export function ProductDetailPage() {
       </form>
       {optionError && <p className="form-error">{optionError}</p>}
 
+      <p className="hint-text">옵션명·색상·사이즈·바코드·단가를 칸에서 바로 고친 뒤 <strong>저장</strong>을 누르세요(Enter로도 저장).</p>
       <table className="data-table">
         <thead>
           <tr>
-            <th>순서</th><th>ID</th><th>SKU</th><th>옵션명</th><th>색상</th><th>사이즈</th><th>단가</th><th>상태</th><th></th><th></th><th></th>
+            <th>순서</th><th>SKU</th><th>옵션명</th><th>색상</th><th>사이즈</th><th>바코드</th><th>단가</th><th>상태</th><th>저장</th><th>판매설정</th><th>삭제/관리</th>
           </tr>
         </thead>
         <tbody>
           {product?.options.map((o, index) => (
             <Fragment key={o.id}>
-              <tr>
-                <td>
-                  <button type="button" disabled={index === 0} onClick={() => handleMoveOption(index, -1)}>▲</button>
-                  <button
-                    type="button"
-                    disabled={index === product.options.length - 1}
-                    onClick={() => handleMoveOption(index, 1)}
-                  >
-                    ▼
-                  </button>
-                </td>
-                <td>{o.id}</td>
-                <td>{o.sku_code}</td>
-                <td>{o.option_name ?? '-'}</td>
-                <td>{o.color ?? '-'}</td>
-                <td>{o.size ?? '-'}</td>
-                <td>{o.unit_cost_price?.toLocaleString() ?? '-'}</td>
-                <td><span className="status-badge">{o.is_active ? 'ACTIVE' : 'INACTIVE'}</span></td>
-                <td><button type="button" onClick={() => handleToggleActive(o)}>{o.is_active ? '비활성화' : '활성화'}</button></td>
-                <td>
-                  <button type="button" onClick={() => setEditingOptionId(editingOptionId === o.id ? null : o.id)}>
-                    {editingOptionId === o.id ? '닫기' : '수정'}
-                  </button>
-                  <button type="button" onClick={() => handleDeleteOption(o)}>삭제</button>
-                </td>
-                <td>
-                  <button type="button" onClick={() => setSelectedOptionId(selectedOptionId === o.id ? null : o.id)}>
-                    {selectedOptionId === o.id ? '닫기' : '관리'}
-                  </button>
-                </td>
-              </tr>
-              {editingOptionId === o.id && (
-                <OptionEditRow
-                  option={o}
-                  onSaved={() => {
-                    setEditingOptionId(null)
-                    reload()
-                  }}
-                />
-              )}
+              <OptionRow
+                option={o}
+                index={index}
+                total={product.options.length}
+                onReload={reload}
+                onMove={handleMoveOption}
+                onToggleActive={handleToggleActive}
+                onDelete={handleDeleteOption}
+                onManage={(id) => setSelectedOptionId(selectedOptionId === id ? null : id)}
+                isManaging={selectedOptionId === o.id}
+              />
               {selectedOptionId === o.id && <OptionSubDetail option={o} warehousePlatformId={1} />}
             </Fragment>
           ))}
