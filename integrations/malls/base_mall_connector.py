@@ -44,6 +44,8 @@ from abc import ABC, abstractmethod
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
+from integrations.malls.errors import MarketplaceCapabilityUnsupportedError
+
 ORDER_STATUSES = ["NEW", "PREPARING", "SHIPPING", "DELIVERED", "CANCELED"]
 DUMMY_CUSTOMER_NAMES = ["김민준", "이서연", "박도윤", "최지우", "정하은", "강시우", "조수아"]
 DUMMY_PRODUCT_PRICES = [12900.0, 15900.0, 19900.0, 24900.0, 29900.0, 39900.0, 59900.0]
@@ -53,6 +55,17 @@ class BaseMallConnector(ABC):
     """모든 쇼핑몰 커넥터가 구현해야 하는 공통 인터페이스."""
 
     platform_code: str  # models.platform.Platform.code와 일치해야 한다.
+
+    # 클레임(취소/반품/교환) 수집 지원 여부 - 채널별로 독립. 기본 False(미지원).
+    # 실제 공식 API 구현이 있는 커넥터만 True로 오버라이드한다. 서비스는 이 플래그가
+    # False면 fetch_* 를 호출하지 않는다(미지원과 "결과 0건"을 구분하기 위함).
+    supports_cancellation_sync: bool = False
+    supports_return_sync: bool = False
+    supports_exchange_sync: bool = False
+
+    def _marketplace_code(self) -> str:
+        """오류 메시지용 안전한 채널 식별자(Secret/PII 아님). platform_code가 없으면 클래스명."""
+        return getattr(self, "platform_code", type(self).__name__)
 
     def __init__(self, session: Any = None, platform_id: Optional[int] = None) -> None:
         """session/platform_id는 실제 API 연동을 지원하는 커넥터(예: 네이버)만 사용한다.
@@ -82,6 +95,40 @@ class BaseMallConnector(ABC):
     def fetch_settlements(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
         """기간 내 정산 내역을 정규화된 형식으로 조회한다."""
         raise NotImplementedError
+
+    def fetch_cancellations(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+        """기간 내 주문취소 내역을 정규화된 형식으로 조회한다.
+
+        기본 구현은 미지원 오류를 던진다(빈 목록으로 "결과 0건"을 위장하지 않는다).
+        supports_cancellation_sync=True인 커넥터만 오버라이드한다. 서비스는 capability가
+        False면 이 메서드를 호출하지 않으므로, 이 raise는 직접 호출에 대한 2차 방어다.
+
+        반환 형식(정규화):
+            {"platform_order_no": str, "reason": Optional[str],
+             "status": "REQUESTED"|"COMPLETED", "requested_at": datetime,
+             "refund_amount": Optional[float]}
+        """
+        raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "cancellation_sync")
+
+    def fetch_returns(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+        """기간 내 반품 내역을 정규화된 형식으로 조회한다(기본: 미지원 오류).
+
+        반환 형식(정규화):
+            {"platform_order_no": str, "reason": Optional[str],
+             "status": "REQUESTED"|"APPROVED"|"RECEIVED"|"REFUNDED"|"REJECTED",
+             "requested_at": datetime, "refund_amount": Optional[float]}
+        """
+        raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "return_sync")
+
+    def fetch_exchanges(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+        """기간 내 교환 내역을 정규화된 형식으로 조회한다(기본: 미지원 오류).
+
+        반환 형식(정규화):
+            {"platform_order_no": str, "reason": Optional[str],
+             "status": "REQUESTED"|"APPROVED"|"SHIPPED"|"COMPLETED"|"REJECTED",
+             "requested_at": datetime}
+        """
+        raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "exchange_sync")
 
     def fetch_products(self) -> list[dict[str, Any]]:
         """상품 목록을 정규화된 형식으로 조회한다(services.product_sync_service.

@@ -232,6 +232,124 @@ class TestSync:
         assert forbidden.status_code == 403
 
 
+class _StubClaimConnector:
+    """API 테스트용 클레임 스텁(capability·기능별 데이터/예외 제어, 실 네트워크 없음)."""
+
+    def __init__(self, *, supports=(), errors=None, data=None):
+        self.supports_cancellation_sync = "cancellation" in supports
+        self.supports_return_sync = "return" in supports
+        self.supports_exchange_sync = "exchange" in supports
+        self._errors = errors or {}
+        self._data = data or {}
+
+    def fetch_cancellations(self, s, e):
+        if "cancellations" in self._errors:
+            raise self._errors["cancellations"]
+        return self._data.get("cancellations", [])
+
+    def fetch_returns(self, s, e):
+        if "returns" in self._errors:
+            raise self._errors["returns"]
+        return self._data.get("returns", [])
+
+    def fetch_exchanges(self, s, e):
+        if "exchanges" in self._errors:
+            raise self._errors["exchanges"]
+        return self._data.get("exchanges", [])
+
+
+class TestSyncClaims:
+    def _post(self, client, auth_headers, seed_data):
+        return client.post(
+            "/api/orders/sync-claims",
+            json={
+                "platform_id": seed_data["platform_id"],
+                "warehouse_id": seed_data["warehouse_id"],
+                "start_date": "2026-01-01",
+                "end_date": "2026-01-31",
+            },
+            headers=auth_headers,
+        )
+
+    def _patch(self, monkeypatch, conn):
+        monkeypatch.setattr("api.routers.orders.get_mall_connector", lambda *a, **k: conn)
+
+    def test_all_unsupported_returns_501_with_structured_body(self, client, auth_headers, seed_data):
+        # seed 플랫폼(쿠팡)은 세 capability 모두 False -> 전 기능 미지원 -> 501(성공 위장 아님).
+        resp = self._post(client, auth_headers, seed_data)
+        assert resp.status_code == 501
+        body = resp.json()
+        assert body["overall_status"] == "UNSUPPORTED"
+        assert body["cancellations"]["status"] == "UNSUPPORTED"
+        assert body["returns"]["status"] == "UNSUPPORTED"
+        assert body["exchanges"]["status"] == "UNSUPPORTED"
+        assert "secret" not in str(body).lower()
+
+    def test_success_returns_200(self, client, auth_headers, seed_data, monkeypatch):
+        self._patch(monkeypatch, _StubClaimConnector(supports=("cancellation", "return", "exchange")))
+        resp = self._post(client, auth_headers, seed_data)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["overall_status"] == "SUCCESS"
+        # 지원+0건은 SUCCESS(count 0) - 미지원과 구분됨
+        assert body["cancellations"] == {"status": "SUCCESS", "count": 0, "reason_code": None, "retryable": None}
+
+    def test_partial_returns_200(self, client, auth_headers, seed_data, monkeypatch):
+        from integrations.malls.errors import MarketplaceExternalAPIError
+
+        conn = _StubClaimConnector(
+            supports=("cancellation", "return"),
+            errors={"returns": MarketplaceExternalAPIError("x", "SERVER_ERROR", True)},
+        )
+        self._patch(monkeypatch, conn)
+        resp = self._post(client, auth_headers, seed_data)
+        assert resp.status_code == 200
+        assert resp.json()["overall_status"] == "PARTIAL"
+
+    def test_all_credential_missing_returns_409(self, client, auth_headers, seed_data, monkeypatch):
+        from integrations.malls.errors import MarketplaceCredentialMissingError
+
+        conn = _StubClaimConnector(
+            supports=("cancellation", "return", "exchange"),
+            errors={k: MarketplaceCredentialMissingError("x") for k in ("cancellations", "returns", "exchanges")},
+        )
+        self._patch(monkeypatch, conn)
+        resp = self._post(client, auth_headers, seed_data)
+        assert resp.status_code == 409
+        assert resp.json()["overall_status"] == "FAILED"
+
+    def test_all_external_retryable_returns_503(self, client, auth_headers, seed_data, monkeypatch):
+        from integrations.malls.errors import MarketplaceExternalAPIError
+
+        conn = _StubClaimConnector(
+            supports=("cancellation", "return", "exchange"),
+            errors={
+                k: MarketplaceExternalAPIError("x", "SERVER_ERROR", True)
+                for k in ("cancellations", "returns", "exchanges")
+            },
+        )
+        self._patch(monkeypatch, conn)
+        resp = self._post(client, auth_headers, seed_data)
+        assert resp.status_code == 503
+        # 비200에서도 구조화 body 유지
+        assert resp.json()["cancellations"]["reason_code"] == "SERVER_ERROR"
+
+    def test_all_external_non_retryable_returns_502(self, client, auth_headers, seed_data, monkeypatch):
+        from integrations.malls.errors import MarketplaceExternalAPIError
+
+        conn = _StubClaimConnector(
+            supports=("cancellation", "return", "exchange"),
+            errors={
+                k: MarketplaceExternalAPIError("x", "AUTH_FAILED", False)
+                for k in ("cancellations", "returns", "exchanges")
+            },
+        )
+        self._patch(monkeypatch, conn)
+        resp = self._post(client, auth_headers, seed_data)
+        assert resp.status_code == 502
+        assert resp.json()["overall_status"] == "FAILED"
+
+
 class TestFilters:
     def test_filters_by_platform_id(self, client, auth_headers, api_session_factory, seed_data):
         from models.platform import Platform

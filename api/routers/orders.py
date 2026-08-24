@@ -8,12 +8,15 @@ services.OrderSyncService를 그대로 호출한다 - API 계층은 여기서도
 Repository/커넥터를 직접 다루지 않고 Service만 호출한다.
 """
 
+import logging
+import uuid
 from datetime import date, datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from api.deps import get_current_user, get_db, require_permission
@@ -25,6 +28,7 @@ from repositories.extra_repository import MemoRepository
 from repositories.order_repository import OrderRepository
 from repositories.platform_repository import PlatformRepository
 from repositories.product_repository import ProductOptionRepository, ProductRepository
+from services.claim_sync_service import ClaimSyncService
 from services.exchange_return_service import CancellationService, ExchangeService, OrderRateService, ReturnService
 from services.export_service import orders_to_excel
 from services.order_sync_service import OrderSyncService
@@ -32,6 +36,8 @@ from services.order_view_service import OrderViewService
 from services.shipment_service import ShipmentAlreadyExistsError, ShipmentService
 
 router = APIRouter(prefix="/api/orders", tags=["orders"])
+
+logger = logging.getLogger(__name__)
 
 
 class OrderOut(BaseModel):
@@ -552,3 +558,94 @@ def sync_orders(payload: OrderSyncRequest, db: Session = Depends(get_db)) -> Ord
     )
     db.commit()
     return OrderSyncResult(**result)
+
+
+class ClaimFeatureResult(BaseModel):
+    """클레임 기능(취소/반품/교환)별 결과. 미지원과 결과 0건을 status로 구분한다."""
+
+    status: str  # SUCCESS | UNSUPPORTED | FAILED
+    count: int
+    reason_code: Optional[str] = None
+    retryable: Optional[bool] = None
+
+
+class ClaimSyncResult(BaseModel):
+    overall_status: str  # SUCCESS | PARTIAL | UNSUPPORTED | FAILED
+    cancellations: ClaimFeatureResult
+    returns: ClaimFeatureResult
+    exchanges: ClaimFeatureResult
+    skipped_no_order: int
+
+
+# 외부 API 실패로 분류되는 안전 reason_code(HTTP 502/503 판정용). CREDENTIAL_MISSING/
+# CAPABILITY_UNSUPPORTED/INTERNAL_ERROR/DB_WRITE_FAILED 는 외부 오류가 아니다.
+_EXTERNAL_REASONS = {
+    "AUTH_FAILED",
+    "RATE_LIMITED",
+    "SERVER_ERROR",
+    "BAD_RESPONSE",
+    "TIMEOUT",
+    "CONNECT_FAILED",
+    "TRANSPORT_ERROR",
+    "PARSE_FAILED",
+}
+
+
+def _claim_http_status(result: dict) -> int:
+    """구조화된 클레임 결과 -> HTTP 상태. 전 기능 미지원을 200 성공으로 보이지 않게 한다."""
+    overall = result["overall_status"]
+    if overall in ("SUCCESS", "PARTIAL"):
+        return status.HTTP_200_OK
+    if overall == "UNSUPPORTED":  # 지원 기능이 하나도 없음
+        return status.HTTP_501_NOT_IMPLEMENTED
+    # overall == FAILED: 지원 기능이 모두 실패(SUCCESS 없음). 실패 원인으로 상태 결정.
+    failed = [result[k] for k in ("cancellations", "returns", "exchanges") if result[k]["status"] == "FAILED"]
+    codes = {f["reason_code"] for f in failed}
+    if codes == {"CREDENTIAL_MISSING"}:
+        return status.HTTP_409_CONFLICT
+    if codes and codes <= _EXTERNAL_REASONS:
+        return (
+            status.HTTP_503_SERVICE_UNAVAILABLE if any(f["retryable"] for f in failed) else status.HTTP_502_BAD_GATEWAY
+        )
+    # 내부/DB 오류 또는 혼합 원인 - 안전한 기본값(내부 오류)으로 처리한다.
+    return status.HTTP_500_INTERNAL_SERVER_ERROR
+
+
+@router.post(
+    "/sync-claims",
+    response_model=ClaimSyncResult,
+    dependencies=[Depends(require_permission("ORDER_EDIT"))],
+    summary="교환/반품/취소 수집",
+    description="지정한 플랫폼에서 [start_date, end_date] 구간의 교환/반품/취소를 capability 기준으로 "
+    "수집해 이미 수집된 주문에 연결한다(미러링). 기능별 결과(SUCCESS/UNSUPPORTED/FAILED)를 구조화해 "
+    "반환하며, HTTP 상태는 전체 결과에 따라 200/409/501/502/503/500이 될 수 있으나 body 형식은 동일하다. "
+    "필요 권한: ORDER_EDIT",
+    responses={404: {"description": "플랫폼을 찾을 수 없습니다."}},
+)
+def sync_claims(payload: OrderSyncRequest, db: Session = Depends(get_db)) -> JSONResponse:
+    platform = PlatformRepository(db).get_by_id(payload.platform_id)
+    if platform is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="플랫폼을 찾을 수 없습니다.")
+
+    # 미검증 채널은 팩토리가 MarketplaceCapabilityUnsupportedError -> 전역 핸들러 501.
+    connector = get_mall_connector(platform.connector_class, session=db, platform_id=platform.id)
+    result = ClaimSyncService(db).sync_claims(connector, platform.id, payload.start_date, payload.end_date)
+    try:
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.warning("클레임 수집 커밋 실패: trace=%s", uuid.uuid4().hex[:8])
+        failed = {"status": "FAILED", "count": 0, "reason_code": "DB_WRITE_FAILED", "retryable": False}
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "overall_status": "FAILED",
+                "cancellations": failed,
+                "returns": failed,
+                "exchanges": failed,
+                "skipped_no_order": result.get("skipped_no_order", 0),
+            },
+        )
+
+    # 200/409/501/502/503/500 어떤 경우에도 동일한 구조화 body를 유지한다.
+    return JSONResponse(status_code=_claim_http_status(result), content=result)
