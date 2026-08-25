@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import { api, ApiError } from '../api/client'
 import { useApiData } from '../api/useApiData'
 import type {
@@ -218,11 +218,21 @@ function PermissionsTab() {
   )
 }
 
-// 커넥터(integrations/malls/naver_smartstore_connector.py _get_credentials())가 실제로
-// 조회하는 key_name과 정확히 일치해야 한다 - 자유 입력을 허용하면 오탈자/임의 명칭으로
-// 등록해도 저장 자체는 성공해버려서, 실제로는 계속 더미 데이터로 폴백되는데도 사용자가
-// 이를 알아챌 방법이 없다(실제로 이 문제가 발생했었음). 그래서 드롭다운으로 못박는다.
-const CREDENTIAL_KEY_NAMES = ['client_id', 'client_secret'] as const
+// 커넥터별 _get_credentials()가 실제로 조회하는 key_name과 정확히 일치해야 한다 -
+// 자유 입력을 허용하면 오탈자/임의 명칭으로 등록해도 저장 자체는 성공해버려서, 실제로는
+// 계속 연결정보 오류로 실패하는데도 사용자가 이를 알아챌 방법이 없다(실제로 이 문제가
+// 발생했었음). 그래서 플랫폼(connector_class)별로 필요한 키만 드롭다운으로 못박는다.
+// required=필수(전부 등록돼야 실제 호출), optional=선택(없어도 실제 호출은 됨).
+//
+// 이 맵에는 integrations/malls.SUPPORTED_CONNECTORS(실 API 연동이 검증된 채널)에 있는
+// 커넥터만 등록한다 - ESM/11번가/카카오쇼핑은 팩토리(get_mall_connector)가 인스턴스화
+// 자체를 차단하고(MarketplaceCapabilityUnsupportedError) 커넥터 코드에도 credential을
+// 읽는 로직이 없으므로, 여기에 항목을 만들면 실제로는 아무 효과가 없는 credential을
+// 등록할 수 있는 것처럼 보이게 된다(지원되는 것처럼 오인시키지 않는다).
+const CREDENTIAL_KEYS_BY_CONNECTOR: Record<string, { required: string[]; optional: string[] }> = {
+  NaverSmartstoreConnector: { required: ['client_id', 'client_secret'], optional: ['seller_id'] },
+  CoupangConnector: { required: ['access_key', 'secret_key', 'vendor_id'], optional: [] },
+}
 
 function CredentialsTab() {
   const { data: platforms } = useApiData<Platform[]>(() => api.get('/api/platforms'), [])
@@ -231,8 +241,17 @@ function CredentialsTab() {
     () => (ownerId ? api.get(`/api/settings/api-credentials?owner_type=PLATFORM&owner_id=${ownerId}`) : Promise.resolve([])),
     [ownerId],
   )
-  const [form, setForm] = useState({ key_name: CREDENTIAL_KEY_NAMES[0] as string, plain_value: '' })
+  const selectedPlatform = platforms?.find((p) => p.id === ownerId)
+  const keySpec = selectedPlatform ? CREDENTIAL_KEYS_BY_CONNECTOR[selectedPlatform.connector_class] : undefined
+  const allKeyNames = keySpec ? [...keySpec.required, ...keySpec.optional] : []
+  const [form, setForm] = useState({ key_name: '', plain_value: '' })
   const [formError, setFormError] = useState<string | null>(null)
+
+  // 플랫폼을 바꾸면 그 플랫폼의 첫 번째 키로 선택을 초기화한다.
+  useEffect(() => {
+    setForm({ key_name: allKeyNames[0] ?? '', plain_value: '' })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ownerId])
 
   const handleSave = async (e: FormEvent) => {
     e.preventDefault()
@@ -244,7 +263,8 @@ function CredentialsTab() {
     try {
       const payload: ApiCredentialUpsert = { owner_type: 'PLATFORM', owner_id: ownerId, key_name: form.key_name, plain_value: form.plain_value }
       await api.post('/api/settings/api-credentials', payload)
-      setForm({ key_name: CREDENTIAL_KEY_NAMES[0], plain_value: '' })
+      // 값만 비우고 방금 선택한 키 이름은 유지한다(여러 키를 연달아 등록하기 쉽게).
+      setForm({ key_name: form.key_name, plain_value: '' })
       reload()
     } catch (err) {
       setFormError(err instanceof ApiError ? err.message : 'API Credential 저장 중 오류가 발생했습니다.')
@@ -257,35 +277,54 @@ function CredentialsTab() {
   }
 
   const registeredKeyNames = new Set(data?.map((c) => c.key_name) ?? [])
-  const missingKeys = CREDENTIAL_KEY_NAMES.filter((k) => !registeredKeyNames.has(k))
+  const missingRequiredKeys = (keySpec?.required ?? []).filter((k) => !registeredKeyNames.has(k))
 
   return (
     <div>
       <p className="hint-text">
-        API 키/시크릿은 서버에 암호화(Fernet)되어 저장되며, 조회 시 마지막 4자리만 표시됩니다. 현재 네이버
-        스마트스토어(NaverSmartstoreConnector)만 실제 API 연동을 지원하며, client_id/client_secret 두 개가 모두
-        등록돼야 실제 호출을 시도합니다(하나라도 없으면 더미 데이터로 동작합니다).
+        API 키/시크릿은 서버에 암호화(Fernet)되어 저장되며, 조회 시 마지막 4자리만 표시됩니다. 플랫폼을 선택하면
+        그 플랫폼의 커넥터가 요구하는 키 목록이 나타납니다. 필수 연결정보가 모두 등록되어야 실제 API를 호출할 수
+        있습니다. 누락된 정보가 있으면 동기화를 시작하지 않고 연결정보 오류를 반환합니다.
       </p>
+      <p className="hint-text">쿠팡 Open API 호출 IP 허용등록이 별도로 필요합니다.</p>
       <form className="inline-form" onSubmit={handleSave}>
         <select value={ownerId} onChange={(e) => setOwnerId(Number(e.target.value))}>
           <option value={0}>플랫폼 선택</option>
           {platforms?.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
         </select>
-        <select value={form.key_name} onChange={(e) => setForm({ ...form, key_name: e.target.value })}>
-          {CREDENTIAL_KEY_NAMES.map((k) => <option key={k} value={k}>{k}</option>)}
+        <select
+          value={form.key_name}
+          onChange={(e) => setForm({ ...form, key_name: e.target.value })}
+          disabled={allKeyNames.length === 0}
+        >
+          {allKeyNames.length === 0 && <option value="">플랫폼을 먼저 선택하세요</option>}
+          {allKeyNames.map((k) => (
+            <option key={k} value={k}>
+              {k}
+              {keySpec?.optional.includes(k) ? ' (선택)' : ''}
+            </option>
+          ))}
         </select>
         <input
           type="password"
+          autoComplete="new-password"
           value={form.plain_value}
           onChange={(e) => setForm({ ...form, plain_value: e.target.value })}
           placeholder="값"
+          disabled={allKeyNames.length === 0}
         />
-        <button type="submit">저장</button>
+        <button type="submit" disabled={allKeyNames.length === 0}>저장</button>
       </form>
       {formError && <p className="form-error">{formError}</p>}
-      {ownerId > 0 && missingKeys.length > 0 && (
+      {ownerId > 0 && !keySpec && (
         <p className="form-error">
-          아직 등록되지 않은 키: {missingKeys.join(', ')} - 이 상태에서는 실제 API를 호출하지 않고 더미 데이터로 동작합니다.
+          현재 실제 API 연동을 지원하지 않는 플랫폼입니다. 인증정보를 저장할 수 없습니다.
+        </p>
+      )}
+      {ownerId > 0 && keySpec && missingRequiredKeys.length > 0 && (
+        <p className="form-error">
+          아직 등록되지 않은 필수 연결정보: {missingRequiredKeys.join(', ')} — 필요한 정보를 모두 등록하기 전에는
+          동기화를 시작할 수 없습니다.
         </p>
       )}
 
