@@ -27,6 +27,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -67,13 +68,19 @@ ROLE_PERMISSION_MAP = {
     "Viewer": [code for code, _, _ in DEFAULT_PERMISSIONS if code.endswith("_VIEW")],
 }
 
+# is_active: 이 플랫폼을 신규 설치 시 기본으로 켜둘지 여부. integrations/malls의
+# SUPPORTED_CONNECTORS(실 API 연동이 검증된 채널)와 일치시켜 네이버·쿠팡만 True로
+# 둔다 - ESM/11번가/카카오쇼핑은 아직 더미 커넥터라 신규 설치에서부터 활성화된
+# 것처럼 보이면 안 된다. 다른 모듈의 커넥터 클래스 집합을 참조해 자동 추론하지
+# 않고 여기 명시적인 값으로 고정한다(초기화 스크립트의 의존성·순환 import를
+# 늘리지 않기 위함 - integrations/malls는 반대로 이 모듈을 참조하지 않는다).
 DEFAULT_PLATFORMS = [
-    # code, name, connector_class, settlement_cycle_days
-    ("naver_smartstore", "네이버 스마트스토어", "NaverSmartstoreConnector", 7),
-    ("coupang", "쿠팡", "CoupangConnector", 15),
-    ("esm", "ESM(G마켓/옥션)", "EsmConnector", 14),
-    ("elevenst", "11번가", "ElevenstConnector", 14),
-    ("kakao_shopping", "카카오쇼핑", "KakaoShoppingConnector", 7),
+    # code, name, connector_class, settlement_cycle_days, is_active
+    ("naver_smartstore", "네이버 스마트스토어", "NaverSmartstoreConnector", 7, True),
+    ("coupang", "쿠팡", "CoupangConnector", 15, True),
+    ("esm", "ESM(G마켓/옥션)", "EsmConnector", 14, False),
+    ("elevenst", "11번가", "ElevenstConnector", 14, False),
+    ("kakao_shopping", "카카오쇼핑", "KakaoShoppingConnector", 7, False),
 ]
 
 # 플랫폼별 기본 수수료율(%) - platform_fee_rules에 최초 1건씩 시딩한다.
@@ -159,22 +166,28 @@ def seed_default_admin() -> None:
         print("[OK] 기본 관리자 계정 생성 완료 (username=admin / password=ChangeMe!123 - 로그인 후 반드시 변경하세요)")
 
 
-def seed_platforms() -> None:
-    with session_scope() as db:
-        if db.execute(select(func.count()).select_from(Platform)).scalar_one() > 0:
-            print("[SKIP] 플랫폼 데이터가 이미 존재합니다.")
-            return
-        for code, name, connector_class, cycle_days in DEFAULT_PLATFORMS:
-            db.add(
-                Platform(
-                    code=code,
-                    name=name,
-                    connector_class=connector_class,
-                    settlement_cycle_days=cycle_days,
-                    is_active=True,
-                )
+def seed_platforms(db: Session) -> None:
+    """신규 설치(플랫폼 테이블이 완전히 비어 있을 때)에서만 DEFAULT_PLATFORMS를
+    시딩한다. 테이블에 행이 하나라도 있으면 아무것도 추가·수정하지 않고 그대로
+    반환한다 - 기존 운영 DB에서 사용자가 바꾼 is_active 값을 이 함수가 되돌릴
+    방법 자체가 없다(플랫폼별 upsert가 아니라 테이블 전체 단위 가드).
+
+    세션의 commit/rollback은 호출자 책임이다(main()의 session_scope() 참고) -
+    이 함수는 add()만 하고 커밋하지 않는다."""
+    if db.execute(select(func.count()).select_from(Platform)).scalar_one() > 0:
+        print("[SKIP] 플랫폼 데이터가 이미 존재합니다.")
+        return
+    for code, name, connector_class, cycle_days, is_active in DEFAULT_PLATFORMS:
+        db.add(
+            Platform(
+                code=code,
+                name=name,
+                connector_class=connector_class,
+                settlement_cycle_days=cycle_days,
+                is_active=is_active,
             )
-        print(f"[OK] 쇼핑몰 플랫폼 {len(DEFAULT_PLATFORMS)}개 생성 완료")
+        )
+    print(f"[OK] 쇼핑몰 플랫폼 {len(DEFAULT_PLATFORMS)}개 생성 완료")
 
 
 def seed_platform_fee_rules() -> None:
@@ -221,7 +234,8 @@ def main() -> None:
     init_schema()
     seed_roles_and_permissions()
     seed_default_admin()
-    seed_platforms()
+    with session_scope() as db:
+        seed_platforms(db)
     seed_platform_fee_rules()
     seed_default_warehouse()
     print("DB 초기화가 완료되었습니다.")
