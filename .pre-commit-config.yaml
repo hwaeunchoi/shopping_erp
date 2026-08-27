@@ -17,19 +17,30 @@
 #      venvScriptspython.exe) 여전히 깨진다. 그래서 백슬래시를 두 번(\\) 써서
 #      shlex가 한 번 풀어낸 뒤 올바른 단일 백슬래시 경로가 되도록 한다.
 # 프로젝트 루트에서 `pre-commit run`을 실행한다고 가정한다.
+#
+# default_stages: stages를 명시하지 않은 훅(trailing-whitespace/isort/black/ruff 등
+# 파일을 고치는 훅 포함)은 기본적으로 pre-commit과 pre-push 등 설치된 모든 훅
+# 타입에서 실행된다. push 시 이 훅들이 다시 돌면서 (core.autocrlf 등으로) 파일을
+# 고치는 일이 실제로 발생했다 - 수정형 훅은 커밋 시점(pre-commit)에서만 걸러지면
+# 충분하므로, stages 미지정 훅을 pre-commit 단계로 한정한다. pytest/mypy는 이미
+# 각자 stages: [pre-push]를 명시하고 있어 이 기본값의 영향을 받지 않는다.
+default_stages: [pre-commit]
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
       - id: trailing-whitespace
+        stages: [pre-commit]
       - id: end-of-file-fixer
+        stages: [pre-commit]
       - id: check-yaml
         exclude: ^frontend/
       - id: check-toml
       - id: check-merge-conflict
       - id: check-added-large-files
         args: ["--maxkb=2000"]
+        stages: [pre-commit]
       - id: mixed-line-ending
         args: ["--fix=lf"]
 
