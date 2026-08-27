@@ -7,22 +7,42 @@ pytest 공용 픽스처.
 SQLite에 models.Base.metadata로 스키마를 새로 만들어 사용한다. Service/
 Repository는 세션을 생성자에서 주입받는 설계라 core.database를 거치지
 않고도 그대로 테스트할 수 있다.
+
+아래 두 os.environ 대입은 이 파일의 다른 어떤 import보다도 먼저 실행돼야
+한다 - config.settings.Settings()는 모듈이 처음 import될 때 딱 한 번만
+생성되고(lru_cache) 그 이후로는 아무리 os.environ이 바뀌어도 값이 갱신되지
+않는다. pytest는 이 rootdir conftest.py를 다른 어떤 테스트 모듈/하위
+conftest(tests/integration/conftest.py 포함)보다 먼저 임포트하므로, 여기서
+os.environ에 "테스트 전용" 값을 직접 대입(대입이지 setdefault가 아님 -
+setdefault는 만약 셸에 이미 실제 운영/데모 값이 설정돼 있으면 그걸 그대로
+남겨버려 테스트 격리가 깨진다)해두면 이후 api.main.app이 생성되고
+validate_startup_secrets()가 실행될 때(예: tests/integration/conftest.py의
+`with TestClient(app) as c:`) 항상 이 안전한 dummy 값을 보게 된다.
+
+.env 파일은 건드리지 않는다 - 이 값은 이 pytest 프로세스의 메모리에만
+존재하고, 알려진 데모 기본값(CHANGE_ME_IN_PRODUCTION 등)과도 다르며
+validate_production_secret()의 최소 길이 기준을 만족하고 서로 다른 값이다.
 """
 
-from datetime import date, datetime, timezone
-from typing import Generator
+import os
 
-import pytest
-from sqlalchemy import create_engine, event
-from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session, sessionmaker
+os.environ["JWT_SECRET_KEY"] = "test-only-dummy-jwt-secret-DO-NOT-USE-IN-PRODUCTION-0000"
+os.environ["CREDENTIAL_ENCRYPTION_KEY"] = "test-only-dummy-credential-secret-DO-NOT-USE-IN-PRODUCTION-1111"
 
-from models import Base
-from models.customer import Customer
-from models.inventory import Inventory, Warehouse
-from models.platform import Platform, PlatformFeeRule
-from models.product import Product, ProductOption, ProductPlatformMap
-from models.supplier import Supplier
+from datetime import date, datetime, timezone  # noqa: E402
+from typing import Generator  # noqa: E402
+
+import pytest  # noqa: E402
+from sqlalchemy import create_engine, event  # noqa: E402
+from sqlalchemy.engine import Engine  # noqa: E402
+from sqlalchemy.orm import Session, sessionmaker  # noqa: E402
+
+from models import Base  # noqa: E402
+from models.customer import Customer  # noqa: E402
+from models.inventory import Inventory, Warehouse  # noqa: E402
+from models.platform import Platform, PlatformFeeRule  # noqa: E402
+from models.product import Product, ProductOption, ProductPlatformMap  # noqa: E402
+from models.supplier import Supplier  # noqa: E402
 
 
 @pytest.fixture()

@@ -25,6 +25,8 @@ from apscheduler.triggers.cron import CronTrigger  # noqa: E402
 from apscheduler.triggers.interval import IntervalTrigger  # noqa: E402
 
 from config.logging_config import setup_logging  # noqa: E402
+from config.settings import settings  # noqa: E402
+from core.crypto import validate_startup_secrets  # noqa: E402
 from core.database import session_scope  # noqa: E402
 from repositories.extra_repository import TaskExecutionHistoryRepository  # noqa: E402
 from scheduler.jobs import (  # noqa: E402
@@ -119,6 +121,9 @@ def build_scheduler() -> BlockingScheduler:
 
 
 def main() -> None:
+    # DB 접속·잡 등록 전에 먼저 검증한다 - Secret이 안전하지 않으면 그 어떤 작업도
+    # 시도하지 않고 즉시 종료한다(fail-closed). 값 자체는 예외 메시지에 담기지 않는다.
+    validate_startup_secrets(settings.jwt_secret_key, settings.credential_encryption_key)
     setup_logging()
     scheduler = build_scheduler()
     logger.info("스케줄러를 시작합니다. (Ctrl+C로 종료)")

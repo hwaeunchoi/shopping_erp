@@ -27,18 +27,29 @@ docker compose up --build
 - API 문서(Swagger): `http://localhost:8000/docs`
 - 기본 관리자 계정: `admin` / `ChangeMe!123` — **최초 로그인 후 반드시 변경**
 
-## 2. 배포 전 반드시 교체해야 하는 값
+## 2. 배포 전 반드시 채워야 하는 값
 
-`docker-compose.yml`의 `environment` 항목은 전부 데모용 기본값입니다. 실제
-배포 전 아래 값을 반드시 안전한 값으로 교체하세요(.env 파일로 분리해 관리하는
-것을 권장합니다 — `.env.example` 참고).
+`docker-compose.yml`은 `POSTGRES_PASSWORD`/`DATABASE_URL`/`JWT_SECRET_KEY`/
+`CREDENTIAL_ENCRYPTION_KEY`를 전부 `${VAR:?message}`(필수 변수) 문법으로
+받습니다 — 리터럴 데모 기본값이 파일에 없으므로, `.env`(또는 셸 환경)에 이
+값들을 채우지 않으면 `docker compose config`/`up` 자체가 즉시 오류로
+실패합니다(fail-closed, 조용히 데모값으로 폴백하지 않음). **이 값들은 절대
+Git에 커밋하지 않습니다** — `.env`는 `.gitignore`에 포함되어 있고,
+`.env.example`에는 플레이스홀더와 생성 명령만 있습니다.
 
-| 환경변수 | 설명 | 교체 방법 |
+| 환경변수 | 설명 | 생성 방법 |
 |---|---|---|
-| `POSTGRES_PASSWORD` | PostgreSQL 비밀번호 | 무작위 강력한 비밀번호로 교체 |
+| `POSTGRES_PASSWORD` | PostgreSQL 비밀번호 | 무작위 강력한 비밀번호. `DATABASE_URL` 안의 비밀번호와 반드시 일치시킬 것 |
+| `DATABASE_URL` | SQLAlchemy 연결 문자열 전체 | `postgresql+psycopg://erp_user:<POSTGRES_PASSWORD와 동일값>@db:5432/erp_db` — `POSTGRES_PASSWORD`와 문자열로 조합하지 않고 완성된 값을 그대로 넣는다(비밀번호에 URL 예약문자가 섞이면 조합 시 깨질 수 있어서) |
 | `JWT_SECRET_KEY` | JWT 서명 키 | `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
-| `CREDENTIAL_ENCRYPTION_KEY` | API Credential 암호화(Fernet) 마스터 키 | `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` — **이 값을 분실/변경하면 기존에 저장된 모든 API Credential을 복호화할 수 없게 되므로 별도 안전한 곳에 백업 필수** |
+| `CREDENTIAL_ENCRYPTION_KEY` | API Credential 암호화 마스터 키 | `python -c "import secrets; print(secrets.token_urlsafe(32))"` — Fernet 자체 포맷일 필요는 없다(`core/crypto.py`가 이 문자열을 SHA-256 해시 후 urlsafe base64로 변환해 Fernet 키로 파생한다, 8.1절 참고). **이 값을 분실하면 기존에 저장된 모든 API Credential을 복호화할 수 없으므로 별도 안전한 곳에 백업 필수** |
 | `admin` 계정 비밀번호 | 최초 로그인 후 설정 화면(사용자 관리)에서 변경 | UI에서 직접 변경 |
+
+`JWT_SECRET_KEY`와 `CREDENTIAL_ENCRYPTION_KEY`는 서로 다른 값이어야 하며,
+둘 다 알려진 데모 기본값(`CHANGE_ME_IN_PRODUCTION` 등)이면 안 됩니다 — 이
+조건은 `scheduler/scheduler.py` 시작 시 `core.crypto.validate_startup_secrets()`로
+자동 검증되어, 위반 시 스케줄러가 어떤 작업도 시도하지 않고 즉시 종료됩니다
+(fail-closed).
 
 ## 3. PostgreSQL 전환 확인 사항
 
@@ -120,3 +131,104 @@ Redis를 실제로 활용하는 것은 새 기능 추가에 해당해 이번 "�
   (자세한 내용은 해당 파일 주석 참고). **PostgreSQL 운영 전환 시 반드시
   이 부분을 `pg_dump` 기반으로 교체해야 자동 백업이 동작합니다** — 이번
   "신규 기능 추가 금지" 범위상 구현하지 않고 리스크로 남깁니다.
+
+## 8. Secret 회전 절차 (JWT / Credential 암호화 키)
+
+### 8.1 암호화 계약 (변경 금지)
+
+`core/crypto.py`의 `build_fernet(secret)`이 앱 전체가 공유하는 **유일한**
+키 파생 함수입니다:
+
+```
+raw secret 문자열 → SHA-256 다이제스트 → urlsafe base64 → Fernet 32바이트 키
+```
+
+`CREDENTIAL_ENCRYPTION_KEY`는 Fernet 자체 포맷(`Fernet.generate_key()`
+결과물)일 필요가 없습니다 — 이 함수가 어떤 문자열이든 해시해 파생하기
+때문입니다. **이 파생 규칙 자체를 바꾸면 기존에 저장된 모든 API Credential
+암호문을 복호화할 수 없게 됩니다** — 절대 `Fernet(raw_secret)`을 직접
+호출하지 않습니다. 앱의 `encrypt_value`/`decrypt_value`와
+`scripts/rotate_credential_key.py`(구키·신키를 동시에 다뤄야 하는 회전
+도구)는 반드시 이 함수 하나만 거칩니다.
+
+### 8.2 사전 준비
+
+1. **DB 백업 필수**: `pg_dump -Fc erp_db > backup_$(date +%Y%m%d_%H%M%S).dump`
+   재암호화는 되돌릴 수 없는 작업이 아니지만(구키를 보관하면 재복구 가능),
+   백업 없이 진행하지 않습니다.
+2. **구키를 잃어버리지 않습니다**: 재암호화가 신키로 완전히 검증(8.4절)될
+   때까지 구키(현재 운영 중인 `CREDENTIAL_ENCRYPTION_KEY` 값)를 안전한
+   곳(예: 별도 시크릿 매니저, 오프라인 저장소)에 보관합니다. 구키
+   폐기(decommission)는 이 회전 작업과 별도의 명시적 승인을 받은 뒤에만
+   수행합니다.
+3. **최종 정책: 회전 중에는 `api`와 `scheduler`를 모두 정지합니다.**
+   ("API는 유지하고 Credential 등록 화면 접근만 막는" 방식은 검토 후
+   기각했습니다 — 실행 중인 `api` 프로세스가 이미 구키로 만든 캐시된
+   Fernet 인스턴스(`core.crypto._fernet()`, `lru_cache`)를 계속 들고
+   있어 재암호화 시점과 프로세스 재시작 시점 사이에 구키/신키가 섞여
+   쓰일 위험이 있고, 그 창을 안전하게 좁히는 것보다 아예 없애는 편이
+   단순하고 확실하기 때문입니다.)
+
+### 8.3 절차 (방식 1 — 선 재암호화, 후 컨테이너 재기동)
+
+1. `docker compose stop api scheduler` (db/redis/web은 유지 가능 — web은
+   백엔드가 죽어도 정적 파일은 서빙되나 API 호출은 실패합니다)
+2. DB 백업(8.2절)
+3. dry-run으로 먼저 검증:
+   ```
+   OLD_CREDENTIAL_ENCRYPTION_KEY=<구키> NEW_CREDENTIAL_ENCRYPTION_KEY=<신키> \
+     python scripts/rotate_credential_key.py \
+       --old-key-env OLD_CREDENTIAL_ENCRYPTION_KEY \
+       --new-key-env NEW_CREDENTIAL_ENCRYPTION_KEY
+   ```
+   출력이 "처리 대상 N건, 구키 복호화 검증 통과"인지 확인합니다(이 단계는
+   DB를 전혀 변경하지 않습니다).
+4. 문제 없으면 `--execute`로 실제 재암호화:
+   ```
+   python scripts/rotate_credential_key.py \
+     --old-key-env OLD_CREDENTIAL_ENCRYPTION_KEY \
+     --new-key-env NEW_CREDENTIAL_ENCRYPTION_KEY --execute
+   ```
+   내부적으로 전체 레코드를 하나의 트랜잭션에서 재암호화 → 신키로 재복호화해
+   원래 평문과 완전히 일치하는지 재검증 → 전부 성공해야만 commit합니다.
+   재검증에서 하나라도 실패하면 **자동으로 롤백**되어 DB는 재암호화 이전
+   상태 그대로 남습니다(구키가 여전히 유효).
+5. **재암호화와 컨테이너 재기동 사이에는 어떤 credential 쓰기도 없어야
+   합니다** — 4단계 완료 후 즉시 5단계로 진행합니다.
+6. `.env`(또는 배포 환경변수)의 `JWT_SECRET_KEY`/`CREDENTIAL_ENCRYPTION_KEY`를
+   신키로 갱신합니다. (같은 주기에 함께 회전하는 경우) `JWT_SECRET_KEY`도
+   이 시점에 새 값으로 바꿉니다.
+7. `docker compose up -d api scheduler` (또는 `restart`)로 신키를 읽은
+   프로세스로 재기동합니다. 스케줄러는 시작 시
+   `validate_startup_secrets()`로 신키가 안전 기준을 만족하는지 다시
+   확인한 뒤에만 잡을 등록합니다.
+8. 스모크 테스트: 로그인 → 설정 화면에서 기존 API Credential 마스킹 표시가
+   정상 조회되는지 → (가능하면) 실제 플랫폼 커넥터 1회 수동 동기화로 신키
+   복호화가 실제 운영 트래픽에서도 성공하는지 확인.
+9. 문제가 있으면 롤백: 구키/구 이미지/구 환경변수로 되돌리고 재기동합니다
+   (DB는 4단계에서 실패 시 이미 자동 롤백되어 구키 상태이므로, 구키로
+   되돌리기만 하면 됩니다. **DB 다운그레이드는 하지 않습니다** — 재암호화는
+   스키마 변경이 아니라 컬럼 값 재작성이므로 downgrade 대상이 아닙니다).
+
+### 8.4 JWT 회전이 사용자에게 미치는 영향
+
+- `JWT_SECRET_KEY`를 바꾸면 그 즉시 기존에 발급된 모든 액세스 토큰이
+  거부됩니다(`core/security.py`가 매 검증 시 현재 `settings.jwt_secret_key`로
+  서명을 확인하는 stateless 방식이라 별도 토큰 무효화 로직이 없습니다) —
+  **모든 사용자가 다시 로그인해야 합니다.** 이는 데이터 손실이 아니라 예상된
+  동작입니다.
+- 비밀번호 해시(`users.password_hash`, bcrypt)는 JWT 서명 키와 완전히
+  독립적입니다 — JWT 키 회전이 저장된 비밀번호 해시를 바꾸지 않습니다
+  (`tests/unit/test_security.py`로 회귀 검증).
+
+### 8.5 시크릿 값 보관 원칙
+
+- 실제 시크릿 값은 이 저장소(Git)에 절대 두지 않습니다 — `.env`는
+  `.gitignore`에 포함되어 있고, `.env.example`에는 플레이스홀더와 생성
+  명령만 있습니다.
+- 배포 서버에서는 `.env` 파일 권한을 소유자만 읽기 가능하도록 제한하는 것을
+  권장합니다(`chmod 600 .env`). 별도 시크릿 매니저(예: Docker secrets,
+  Vault, 클라우드 Secret Manager)를 쓸 수 있으면 그쪽을 우선 고려하세요 —
+  이번 작업 범위에서는 `.env` 파일 기반 주입까지만 다룹니다.
+- 구키 폐기(완전 삭제)는 신키로의 전환이 충분히 검증된 뒤, 별도의 명시적
+  승인을 받은 다음 단계에서 진행합니다.

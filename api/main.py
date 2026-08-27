@@ -10,6 +10,8 @@ Swagger UI: http://127.0.0.1:8000/docs
 """
 
 import logging
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
 
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
@@ -45,6 +47,7 @@ from api.routers import (
 )
 from config.logging_config import setup_logging
 from config.settings import settings
+from core.crypto import validate_startup_secrets
 from integrations.malls.errors import (
     MarketplaceCapabilityUnsupportedError,
     MarketplaceCredentialMissingError,
@@ -109,6 +112,22 @@ openapi_tags = [
     },
 ]
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """서버가 요청을 받기 전에 먼저 실행된다(uvicorn 실제 기동·TestClient의
+    `with TestClient(app) as c:` 진입 모두 이 lifespan을 거친다 - 우회 불가능).
+
+    scheduler/scheduler.py와 동일한 validate_startup_secrets()를 그대로
+    사용한다 - Secret이 안전하지 않으면(누락/데모 기본값/최소 길이 미달/
+    JWT==Credential) 여기서 예외가 발생해 서버가 요청을 하나도 받지 않고
+    기동에 실패한다(fail-closed). DB 마이그레이션(alembic)은 이 프로세스
+    시작 전 별도 단계(docker-compose command)에서 이미 끝나 있고, 이 검증은
+    문자열 비교만 하므로 DB 연결·외부 API 호출보다 먼저 실행된다."""
+    validate_startup_secrets(settings.jwt_secret_key, settings.credential_encryption_key)
+    yield
+
+
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
@@ -116,6 +135,7 @@ app = FastAPI(
     description="쇼핑몰 통합 ERP 백엔드 API. 인증은 OAuth2 password flow(JWT)를 사용하며, "
     "/api/auth/login에서 발급받은 access_token을 Authorization: Bearer 헤더에 담아 호출한다.",
     openapi_tags=openapi_tags,
+    lifespan=lifespan,
 )
 
 app.include_router(auth.router)
