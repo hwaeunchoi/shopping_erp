@@ -169,46 +169,89 @@ raw secret 문자열 → SHA-256 다이제스트 → urlsafe base64 → Fernet 3
    쓰일 위험이 있고, 그 창을 안전하게 좁히는 것보다 아예 없애는 편이
    단순하고 확실하기 때문입니다.)
 
-### 8.3 절차 (방식 1 — 선 재암호화, 후 컨테이너 재기동)
+### 8.3 절차 (JWT/Credential/PostgreSQL password를 한 주기에 함께 회전)
+
+**순서가 중요합니다** — DB 접속 정보(`POSTGRES_PASSWORD`/`DATABASE_URL`)
+회전은 credential 재암호화보다 **먼저**, 그러나 `.env` 교체·컨테이너
+재기동보다는 **먼저** 실행합니다. 이유: `api`/`scheduler`가 이미 정지된
+상태에서 `scripts/rotate_postgres_password.py`는 자신의 DB 연결로 직접
+`ALTER ROLE`을 실행하므로 애플리케이션 컨테이너가 떠 있을 필요가
+없고(오히려 떠 있으면 안 됩니다 — 8.2절 3번 정책과 동일 이유), 이 순서를
+지키면 "새 `.env`로 컨테이너를 올렸는데 아직 DB의 실제 password는 구
+password"인 상태(연결 실패)가 아예 생기지 않습니다.
 
 1. `docker compose stop api scheduler` (db/redis/web은 유지 가능 — web은
    백엔드가 죽어도 정적 파일은 서빙되나 API 호출은 실패합니다)
-2. DB 백업(8.2절)
-3. dry-run으로 먼저 검증:
+2. 최종 시점 DB 백업(8.2절, `pg_dump -Fc`) — 반드시 이 시점에 새로 받습니다
+   (오래된 백업이 아니라 지금 막 정지시킨 시점 기준).
+3. credential 구키→신키 재암호화:
    ```
    OLD_CREDENTIAL_ENCRYPTION_KEY=<구키> NEW_CREDENTIAL_ENCRYPTION_KEY=<신키> \
      python scripts/rotate_credential_key.py \
        --old-key-env OLD_CREDENTIAL_ENCRYPTION_KEY \
        --new-key-env NEW_CREDENTIAL_ENCRYPTION_KEY
    ```
-   출력이 "처리 대상 N건, 구키 복호화 검증 통과"인지 확인합니다(이 단계는
-   DB를 전혀 변경하지 않습니다).
-4. 문제 없으면 `--execute`로 실제 재암호화:
+   dry-run으로 "처리 대상 N건, 구키 복호화 검증 통과"를 먼저 확인한 뒤
+   `--execute`. 내부적으로 전체 레코드를 하나의 트랜잭션에서 재암호화 →
+   신키로 재복호화해 원래 평문과 완전히 일치하는지 재검증 → 전부 성공해야만
+   commit합니다. 재검증에서 하나라도 실패하면 **자동으로 롤백**되어 DB는
+   재암호화 이전 상태 그대로 남습니다(구키가 여전히 유효).
+4. PostgreSQL role(`erp_user`) password 회전:
    ```
-   python scripts/rotate_credential_key.py \
-     --old-key-env OLD_CREDENTIAL_ENCRYPTION_KEY \
-     --new-key-env NEW_CREDENTIAL_ENCRYPTION_KEY --execute
+   OLD_DATABASE_URL=<현재 DATABASE_URL> \
+   NEW_DATABASE_URL=<신규 DATABASE_URL - 새 password 포함> \
+   NEW_POSTGRES_PASSWORD=<신규 POSTGRES_PASSWORD> \
+     python scripts/rotate_postgres_password.py \
+       --current-url-env OLD_DATABASE_URL \
+       --new-url-env NEW_DATABASE_URL \
+       --new-password-env NEW_POSTGRES_PASSWORD
    ```
-   내부적으로 전체 레코드를 하나의 트랜잭션에서 재암호화 → 신키로 재복호화해
-   원래 평문과 완전히 일치하는지 재검증 → 전부 성공해야만 commit합니다.
-   재검증에서 하나라도 실패하면 **자동으로 롤백**되어 DB는 재암호화 이전
-   상태 그대로 남습니다(구키가 여전히 유효).
-5. **재암호화와 컨테이너 재기동 사이에는 어떤 credential 쓰기도 없어야
-   합니다** — 4단계 완료 후 즉시 5단계로 진행합니다.
-6. `.env`(또는 배포 환경변수)의 `JWT_SECRET_KEY`/`CREDENTIAL_ENCRYPTION_KEY`를
-   신키로 갱신합니다. (같은 주기에 함께 회전하는 경우) `JWT_SECRET_KEY`도
-   이 시점에 새 값으로 바꿉니다.
-7. `docker compose up -d api scheduler` (또는 `restart`)로 신키를 읽은
-   프로세스로 재기동합니다. 스케줄러는 시작 시
-   `validate_startup_secrets()`로 신키가 안전 기준을 만족하는지 다시
-   확인한 뒤에만 잡을 등록합니다.
-8. 스모크 테스트: 로그인 → 설정 화면에서 기존 API Credential 마스킹 표시가
-   정상 조회되는지 → (가능하면) 실제 플랫폼 커넥터 1회 수동 동기화로 신키
-   복호화가 실제 운영 트래픽에서도 성공하는지 확인.
-9. 문제가 있으면 롤백: 구키/구 이미지/구 환경변수로 되돌리고 재기동합니다
-   (DB는 4단계에서 실패 시 이미 자동 롤백되어 구키 상태이므로, 구키로
-   되돌리기만 하면 됩니다. **DB 다운그레이드는 하지 않습니다** — 재암호화는
-   스키마 변경이 아니라 컬럼 값 재작성이므로 downgrade 대상이 아닙니다).
+   dry-run으로 현재 URL 접속·대상 일치·신규 password 정책을 먼저 확인한 뒤
+   `--execute`. **주의: 이 작업은 credential 재암호화와 달리 완전한 단일
+   트랜잭션 원자성이 없습니다**(`ALTER ROLE ... WITH PASSWORD`는 그 자체로
+   커밋되는 순간 즉시 유효해지고, "새 password가 실제로 통하는지"는 정의상
+   별도의 새 연결로만 확인할 수 있기 때문 — PostgreSQL 자체의 근본적 제약이지
+   이 도구의 결함이 아닙니다). 대신 **검증 후 보상 롤백** 방식으로 안전을
+   확보합니다: commit 직후 새 연결로 재검증하고, 실패하면 아직 열려 있는
+   기존 연결(구 password로 이미 인증된 세션이라 role의 password가 바뀌어도
+   끊기지 않음)로 즉시 구 password로 되돌립니다. 이 도구의 종료 코드로 결과를
+   구분합니다: `0`=성공, `1`=변경 시도 전 안전 중단(DB 무변경), `2`=시도했으나
+   실패 후 구 password로 안전 복구 완료, `3`=**CRITICAL**(복구조차 실패 —
+   즉시 수동 개입 필요, 아래 "짧은 비원자 구간" 참고).
+
+   **짧은 비원자 구간**: `ALTER ROLE` commit과 새 연결 검증 사이에는
+   "role의 실제 password는 이미 새 값인데 아직 아무도 그걸로 접속을 확인하지
+   못한" 찰나의 구간이 존재합니다. 이 구간에 프로세스가 죽으면(예: 서버
+   전원 차단) — 이번 절차상 4단계 시작 **전에** 이미 5단계에서 쓸 새
+   Secret 파일(`erp_production_next_<timestamp>.env` 등, `POSTGRES_PASSWORD`/
+   `DATABASE_URL` 포함)이 저장소 밖에 준비돼 있어야 하므로, 그 파일을 그대로
+   `.env`에 반영하면 복구됩니다(role의 실제 password도 이미 그 값이므로
+   일치). 이 도구 자체가 그 Secret 파일을 만들거나 수정하지 않습니다 —
+   준비는 별도 단계(운영 Secret 전환 준비 단계)에서 미리 끝나 있어야 합니다.
+5. **재암호화/password 회전과 `.env` 교체 사이에는 어떤 credential 쓰기도,
+   추가 DB 변경도 없어야 합니다** — 3·4단계 완료 후 즉시 5단계로 진행합니다.
+6. root `.env`(또는 배포 환경변수)를 새 Secret 파일 내용으로 통째로
+   교체합니다(`JWT_SECRET_KEY`/`CREDENTIAL_ENCRYPTION_KEY`/
+   `POSTGRES_PASSWORD`/`DATABASE_URL` 전부 — 4단계에서 실제로 적용한 값과
+   반드시 동일해야 합니다).
+7. 새 이미지로 `api`를 기동합니다(`docker compose up -d api`). `api`는
+   시작 시 lifespan에서 `validate_startup_secrets()`로 신키가 안전 기준을
+   만족하는지 확인한 뒤에만 요청을 받기 시작합니다.
+8. DB·credential 검증: 로그인 → 설정 화면에서 기존 API Credential 마스킹
+   표시가 정상 조회되는지(신 `CREDENTIAL_ENCRYPTION_KEY`로 기존 암호문이
+   실제로 복호화되는지) → DB 연결 자체가 신 `POSTGRES_PASSWORD`로 정상
+   동작하는지 확인.
+9. `scheduler`를 기동합니다(`docker compose up -d scheduler`) — 동일하게
+   `validate_startup_secrets()` 통과 후에만 잡을 등록합니다.
+10. 자연 실행 잡 관찰: 다음 주기(주문수집/상품동기화 등)가 스케줄대로
+    자동 실행되고 실패 없이 완료되는지 시스템 모니터링 → 작업이력에서
+    확인합니다(수동으로 동기화 엔드포인트를 호출하지 않습니다).
+11. 문제가 있으면 롤백: 구 이미지(롤백 태그)/구 `.env`/구 PostgreSQL
+    password로 되돌리고 재기동합니다. DB는 3·4단계에서 실패 시 이미
+    자동/보상 롤백되어 구 키·구 password 상태이므로, 구 값으로 되돌리기만
+    하면 됩니다. **DB 다운그레이드는 하지 않습니다** — 재암호화/password
+    회전 모두 스키마 변경이 아니라 값 재작성이므로 downgrade 대상이
+    아닙니다.
 
 ### 8.4 JWT 회전이 사용자에게 미치는 영향
 
