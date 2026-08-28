@@ -100,6 +100,19 @@ class TestValidateProductionSecret:
         with pytest.raises(InsecureSecretError):
             validate_production_secret("TEST_KEY", "short-secret")  # 20자 미만
 
+    def test_allow_demo_default_true_permits_known_demo_value(self):
+        # scripts/rotate_credential_key.py의 --allow-legacy-insecure-old-key
+        # 전용 우회 경로 - 기본값(allow_demo_default=False)에서는 여전히 거부된다.
+        validate_production_secret("TEST_KEY", "CHANGE_ME_IN_PRODUCTION", allow_demo_default=True)  # 예외 없이 통과
+
+    def test_allow_demo_default_true_still_rejects_too_short_secret(self):
+        with pytest.raises(InsecureSecretError):
+            validate_production_secret("TEST_KEY", "short", allow_demo_default=True)
+
+    def test_allow_demo_default_true_still_rejects_missing_value(self):
+        with pytest.raises(InsecureSecretError):
+            validate_production_secret("TEST_KEY", "", allow_demo_default=True)
+
     def test_error_message_never_contains_actual_value(self):
         secret = "a-short-but-unique-marker-value-1234567890"
         try:

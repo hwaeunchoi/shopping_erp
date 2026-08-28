@@ -209,6 +209,111 @@ class TestRotateCredentialsFailureIsolation:
         assert c1.key_value_encrypted == after_first_rotation
 
 
+class TestLegacyInsecureOldKeyMigration:
+    """--allow-legacy-insecure-old-key(=allow_legacy_insecure_old_key=True)는
+    구키가 알려진 공개 데모 기본값이라는 이유 하나만 우회한다. 신키 검증,
+    구키 누락/빈값 검증, 구키==신키 거부, 구키 복호화 실패 시 전체 중단은
+    이 옵션과 무관하게 항상 그대로 유지돼야 한다."""
+
+    DEMO_OLD_SECRET = "CHANGE_ME_IN_PRODUCTION"  # 실제 운영에서 쓰이고 있던 값과 동일한 알려진 데모 기본값
+
+    def test_demo_old_key_without_flag_is_still_rejected(self, db_session):
+        _seed_credential(db_session, "PLATFORM", 1, "client_id", "plain-1", self.DEMO_OLD_SECRET)
+
+        with pytest.raises(InsecureSecretError):
+            rotate_credentials(db_session, self.DEMO_OLD_SECRET, NEW_SECRET, execute=False)
+
+    def test_demo_old_key_with_flag_dry_run_succeeds_with_zero_changes(self, db_session):
+        c1 = _seed_credential(db_session, "PLATFORM", 1, "client_id", "plain-1", self.DEMO_OLD_SECRET)
+        before = c1.key_value_encrypted
+
+        result = rotate_credentials(
+            db_session, self.DEMO_OLD_SECRET, NEW_SECRET, execute=False, allow_legacy_insecure_old_key=True
+        )
+        db_session.rollback()
+
+        assert result.total == 1
+        assert result.executed is False
+        assert c1.key_value_encrypted == before
+
+    def test_demo_old_key_with_flag_execute_succeeds_and_new_key_decrypts(self, db_session):
+        c1 = _seed_credential(db_session, "PLATFORM", 1, "client_id", "plain-value-1", self.DEMO_OLD_SECRET)
+
+        result = rotate_credentials(
+            db_session, self.DEMO_OLD_SECRET, NEW_SECRET, execute=True, allow_legacy_insecure_old_key=True
+        )
+        db_session.commit()
+
+        assert result.total == 1
+        assert result.executed is True
+        new_fernet = build_fernet(NEW_SECRET)
+        assert new_fernet.decrypt(c1.key_value_encrypted.encode()).decode() == "plain-value-1"
+
+    def test_flag_does_not_weaken_new_key_validation(self, db_session):
+        _seed_credential(db_session, "PLATFORM", 1, "client_id", "plain-1", self.DEMO_OLD_SECRET)
+
+        with pytest.raises(InsecureSecretError):
+            rotate_credentials(
+                db_session,
+                self.DEMO_OLD_SECRET,
+                "please-change-this-to-a-generated-fernet-key",
+                execute=True,
+                allow_legacy_insecure_old_key=True,
+            )
+        with pytest.raises(InsecureSecretError):
+            rotate_credentials(
+                db_session, self.DEMO_OLD_SECRET, "short", execute=True, allow_legacy_insecure_old_key=True
+            )
+
+    def test_flag_does_not_bypass_old_equals_new_check(self, db_session):
+        same_secret = "same-secret-for-both-old-and-new-00000000"
+        _seed_credential(db_session, "PLATFORM", 1, "client_id", "plain-1", same_secret)
+
+        with pytest.raises(RotationAborted):
+            rotate_credentials(db_session, same_secret, same_secret, execute=True, allow_legacy_insecure_old_key=True)
+
+    def test_flag_does_not_bypass_wrong_old_key_decrypt_failure(self, db_session):
+        c1 = _seed_credential(db_session, "PLATFORM", 1, "client_id", "plain-1", self.DEMO_OLD_SECRET)
+        before = c1.key_value_encrypted
+        wrong_old_secret = "totally-wrong-old-secret-9999999999"
+
+        with pytest.raises(RotationAborted):
+            rotate_credentials(
+                db_session, wrong_old_secret, NEW_SECRET, execute=True, allow_legacy_insecure_old_key=True
+            )
+        db_session.rollback()
+
+        assert c1.key_value_encrypted == before
+
+    def test_legacy_migration_stdout_and_errors_never_contain_secrets_or_plaintext(self, db_session, monkeypatch):
+        _seed_credential(db_session, "PLATFORM", 1, "client_id", "super-secret-plaintext", self.DEMO_OLD_SECRET)
+        monkeypatch.setenv("TEST_OLD_KEY", self.DEMO_OLD_SECRET)
+        monkeypatch.setenv("TEST_NEW_KEY", NEW_SECRET)
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "rotate_credential_key.py",
+                "--old-key-env",
+                "TEST_OLD_KEY",
+                "--new-key-env",
+                "TEST_NEW_KEY",
+                "--allow-legacy-insecure-old-key",
+            ],
+        )
+        monkeypatch.setattr("scripts.rotate_credential_key.SessionLocal", lambda: db_session)
+        monkeypatch.setattr(db_session, "close", lambda: None)
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            exit_code = main()
+        output = buf.getvalue()
+
+        assert exit_code == 0
+        assert self.DEMO_OLD_SECRET not in output
+        assert NEW_SECRET not in output
+        assert "super-secret-plaintext" not in output
+
+
 class TestRotateCredentialsNoSecretLeakage:
     def test_dry_run_stdout_never_contains_secrets_or_plaintext(self, db_session, monkeypatch):
         _seed_credential(db_session, "PLATFORM", 1, "client_id", "super-secret-plaintext", OLD_SECRET)

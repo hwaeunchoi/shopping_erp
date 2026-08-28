@@ -196,6 +196,23 @@ password"인 상태(연결 실패)가 아예 생기지 않습니다.
    신키로 재복호화해 원래 평문과 완전히 일치하는지 재검증 → 전부 성공해야만
    commit합니다. 재검증에서 하나라도 실패하면 **자동으로 롤백**되어 DB는
    재암호화 이전 상태 그대로 남습니다(구키가 여전히 유효).
+
+   **구키가 알려진 공개 데모 기본값(`CHANGE_ME_IN_PRODUCTION` 등)인 경우** —
+   바로 이 상황(데모 기본값에서 벗어나는 것)이 회전의 목적 그 자체이므로,
+   기본 검증은 이를 거부하지만 `--allow-legacy-insecure-old-key` 옵션을
+   추가하면 **구키에 한해서만** 그 거부를 우회합니다:
+   ```
+   OLD_CREDENTIAL_ENCRYPTION_KEY=<데모 기본값이었던 구키> NEW_CREDENTIAL_ENCRYPTION_KEY=<신키> \
+     python scripts/rotate_credential_key.py \
+       --old-key-env OLD_CREDENTIAL_ENCRYPTION_KEY \
+       --new-key-env NEW_CREDENTIAL_ENCRYPTION_KEY \
+       --allow-legacy-insecure-old-key --execute
+   ```
+   이 옵션은 **안전하지 않은 기존 키에서 벗어나는 일회성 마이그레이션 전용**이며,
+   신키 검증(데모 기본값 거부·최소 길이 등)·구키 누락 검증·구키==신키 거부·
+   구키 복호화 실패 시 전체 중단은 이 옵션과 무관하게 항상 그대로 적용됩니다.
+   회전이 끝나 신키가 실제 운영 값으로 자리 잡은 뒤에는 이 옵션을 다시 쓸
+   이유가 없습니다(신키 자체는 데모 기본값이 될 수 없으므로).
 4. PostgreSQL role(`erp_user`) password 회전:
    ```
    OLD_DATABASE_URL=<현재 DATABASE_URL> \

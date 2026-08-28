@@ -34,6 +34,23 @@ _fernet(), 즉 현재 settings.credential_encryption_key 하나만 아는 함수
         --old-key-env OLD_CREDENTIAL_ENCRYPTION_KEY \\
         --new-key-env NEW_CREDENTIAL_ENCRYPTION_KEY --execute
 
+레거시(안전하지 않은) 구키에서 벗어나는 일회성 마이그레이션:
+  기본 동작은 구키가 알려진 공개 데모 기본값(예: CHANGE_ME_IN_PRODUCTION)이면
+  거부한다. 하지만 바로 그 데모 기본값에서 벗어나는 것이 이 도구의 존재
+  이유인 경우(실제로 지금까지 그 값이 운영 키로 쓰이고 있었던 경우)가 있어,
+  --allow-legacy-insecure-old-key를 명시했을 때만 "구키"에 한해 그 데모
+  기본값 거부만 우회한다:
+    python scripts/rotate_credential_key.py \\
+        --old-key-env OLD_CREDENTIAL_ENCRYPTION_KEY \\
+        --new-key-env NEW_CREDENTIAL_ENCRYPTION_KEY \\
+        --allow-legacy-insecure-old-key --execute
+  이 옵션이 있어도 신키(new key)는 여전히 기존 운영 안전 기준(데모 기본값
+  거부·최소 길이 등)을 100% 그대로 통과해야 하고, 구키의 누락/빈 값 검증과
+  "구키==신키" 거부, "구키로 전 레코드 복호화 안 되면 즉시 중단(DB 무변경)"
+  가드도 전부 그대로 유지된다 - 오직 "구키가 공개 데모 기본값이라는 이유
+  하나"만 우회한다. 다른 이유로 안전하지 않은 구키(너무 짧음 등)는 이
+  옵션으로도 통과되지 않는다.
+
 SQLite(단위 테스트) vs PostgreSQL(운영) 차이:
   - with_for_update()는 PostgreSQL에서만 실제로 행 잠금을 건다. SQLite는
     FOR UPDATE 구문을 지원하지 않아 SQLAlchemy가 조용히 생략한다(오류는
@@ -73,7 +90,9 @@ class RotationResult:
     executed: bool
 
 
-def rotate_credentials(db: Session, old_secret: str, new_secret: str, execute: bool) -> RotationResult:
+def rotate_credentials(
+    db: Session, old_secret: str, new_secret: str, execute: bool, allow_legacy_insecure_old_key: bool = False
+) -> RotationResult:
     """전체 api_credentials를 old_secret 기준으로 검증한 뒤 execute=True면
     new_secret으로 재암호화한다.
 
@@ -81,8 +100,12 @@ def rotate_credentials(db: Session, old_secret: str, new_secret: str, execute: b
     경계를 정한다(테스트에서 커밋 여부를 직접 확인할 수 있도록 순수 함수로
     분리했다). 정상 반환(RotationAborted를 던지지 않음)했을 때만 호출자가
     commit해야 하며, dry-run(execute=False)일 때는 세션에 아무 변경도 만들지
-    않는다(조회·메모리상 복호화 시도만 수행)."""
-    validate_production_secret("old key", old_secret)
+    않는다(조회·메모리상 복호화 시도만 수행).
+
+    allow_legacy_insecure_old_key=True는 구키에 한해서만 "공개 데모 기본값"
+    거부를 우회한다(모듈 docstring 참고) - new key 검증에는 절대 전달하지
+    않는다."""
+    validate_production_secret("old key", old_secret, allow_demo_default=allow_legacy_insecure_old_key)
     validate_production_secret("new key", new_secret)
     if old_secret == new_secret:
         raise RotationAborted("구키와 신키가 동일합니다.")
@@ -142,6 +165,15 @@ def main() -> int:
     parser.add_argument("--old-key-env", required=True, help="구키 값이 담긴 환경변수 이름")
     parser.add_argument("--new-key-env", required=True, help="신키 값이 담긴 환경변수 이름")
     parser.add_argument("--execute", action="store_true", help="실제 재암호화 수행(미지정 시 dry-run)")
+    parser.add_argument(
+        "--allow-legacy-insecure-old-key",
+        action="store_true",
+        help=(
+            "구키가 공개 데모 기본값(예: CHANGE_ME_IN_PRODUCTION)이라도 진행을 허용한다 - "
+            "안전하지 않은 기존 키에서 벗어나는 일회성 마이그레이션 전용 옵션이며, "
+            "신키(new key)는 이 옵션과 무관하게 항상 기존 운영 안전 기준을 그대로 통과해야 한다."
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -154,7 +186,13 @@ def main() -> int:
     db = SessionLocal()
     try:
         try:
-            result = rotate_credentials(db, old_secret, new_secret, execute=args.execute)
+            result = rotate_credentials(
+                db,
+                old_secret,
+                new_secret,
+                execute=args.execute,
+                allow_legacy_insecure_old_key=args.allow_legacy_insecure_old_key,
+            )
         except (RotationAborted, InsecureSecretError) as e:
             db.rollback()
             print(f"[중단] {e}")

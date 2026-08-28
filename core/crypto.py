@@ -73,12 +73,19 @@ def build_fernet(secret: str) -> Fernet:
     return Fernet(key)
 
 
-def validate_production_secret(name: str, value: str) -> None:
+def validate_production_secret(name: str, value: str, *, allow_demo_default: bool = False) -> None:
     """운영 기동 시 호출하는 순수 값 검증. name은 오류 메시지에만 쓰이고,
-    value(실제 Secret)는 예외 메시지에 절대 포함하지 않는다."""
+    value(실제 Secret)는 예외 메시지에 절대 포함하지 않는다.
+
+    allow_demo_default는 기본 False(기존과 동일하게 항상 거부)다. 이 저장소의
+    모든 앱 기동 경로(api/main.py lifespan, scheduler/scheduler.py)는 이
+    인자를 넘기지 않으므로 동작이 전혀 바뀌지 않는다. True는 오직
+    scripts/rotate_credential_key.py가 안전하지 않은 기존(레거시) 구키에서
+    벗어나는 일회성 마이그레이션을 허용하기 위해 구키에 한해서만 사용한다 -
+    신키 검증에는 절대 쓰지 않는다."""
     if not value:
         raise InsecureSecretError(f"{name}이(가) 설정되지 않았습니다.")
-    if value in _KNOWN_DEMO_SECRETS:
+    if not allow_demo_default and value in _KNOWN_DEMO_SECRETS:
         raise InsecureSecretError(f"{name}이(가) 공개된 데모 기본값입니다. 운영 값으로 교체하세요.")
     if len(value) < _MIN_SECRET_LENGTH:
         raise InsecureSecretError(f"{name}이(가) 너무 짧습니다(최소 {_MIN_SECRET_LENGTH}자 이상 필요).")
