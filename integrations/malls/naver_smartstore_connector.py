@@ -43,7 +43,7 @@ from typing import Any, Optional
 import bcrypt
 import httpx
 
-from integrations.malls.base_mall_connector import BaseMallConnector
+from integrations.malls.base_mall_connector import BaseMallConnector, ShipmentSubmitResult
 from integrations.malls.errors import (
     MarketplaceCapabilityUnsupportedError,
     MarketplaceCredentialMissingError,
@@ -85,6 +85,15 @@ _LIVE_STATUS_TO_STD = {
 NAVER_API_BASE = "https://api.commerce.naver.com"
 TOKEN_PATH = "/external/v1/oauth2/token"
 ORDER_LIST_PATH = "/external/v1/pay-order/seller/product-orders"
+# 발송처리(송장 전송) API - 공식 문서 근거는 커넥터 클래스 docstring 및
+# scripts 없이도 참조 가능한 CHANGELOG 대신 아래 submit_shipment()의 주석에 남긴다.
+# 요청: {"dispatchProductOrders": [{"productOrderId","deliveryMethod","deliveryCompanyCode",
+# "trackingNumber","dispatchDate"}]}, 응답: {"data": {"successProductOrderIds": [...],
+# "failProductOrderInfos": [{"productOrderId","code","message"}]}}. 실 계정으로
+# 아직 검증하지 못했다 - deliveryMethod="DELIVERY"(택배) 값과 응답 스키마는
+# 공식 저장소(commerce-api-naver/commerce-api) 문의글 기준이며, 실 연동 전
+# 재확인이 필요하다(모듈 docstring "실제 운영 환경으로 검증하며 확인한 사항" 절 참고).
+DISPATCH_PATH = "/external/v1/pay-order/seller/product-orders/dispatch"
 # 네이버 커머스 API 공식 문서 기준으로 작성했으나, 주문 API와 달리 아직 실제 계정으로
 # 응답 스키마를 검증하지 못했다 - 실 연동 시 필드명/페이지네이션 방식이 다르면
 # _fetch_raw_products_live/_normalize_live_products만 수정하면 된다(서비스 계층은
@@ -100,6 +109,7 @@ RATE_LIMIT_BACKOFF_BASE_SECONDS = 1.0
 
 class NaverSmartstoreConnector(BaseMallConnector):
     platform_code = "naver_smartstore"
+    supports_shipment_submit = True
 
     def __init__(
         self, session: Any = None, platform_id: Optional[int] = None, http_client: Optional[httpx.Client] = None
@@ -124,9 +134,56 @@ class NaverSmartstoreConnector(BaseMallConnector):
         raise MarketplaceCapabilityUnsupportedError("naver", "order_detail")
 
     def update_shipment(self, platform_order_no: str, carrier: str, tracking_no: str) -> bool:
-        # 송장 전송(마켓 반영) 실 API 미구현 - True 성공 위장 없이 미지원 오류를 던진다.
-        # 오류에는 marketplace_code만 담고 주문번호/송장번호/개인정보는 담지 않는다.
+        # 레거시 인터페이스 - 신규 코드는 submit_shipment()를 사용한다(base 클래스 참고).
         raise MarketplaceCapabilityUnsupportedError("naver", "shipment_update")
+
+    def submit_shipment(
+        self,
+        platform_order_item_no: str,
+        carrier_code: str,
+        tracking_no: str,
+        dispatch_date: date,
+        platform_order_no: Optional[str] = None,
+        platform_shipment_box_id: Optional[str] = None,
+    ) -> ShipmentSubmitResult:
+        # 네이버는 productOrderId(platform_order_item_no) 하나로 충분하다 -
+        # platform_order_no/platform_shipment_box_id는 쓰지 않는다(쿠팡 전용).
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("naver")
+        client_id, client_secret, seller_id = credentials
+        access_token = self._fetch_access_token(client_id, client_secret, seller_id)
+        response = self._request_with_retry(
+            "POST",
+            DISPATCH_PATH,
+            headers={"Authorization": f"Bearer {access_token}"},
+            json={
+                "dispatchProductOrders": [
+                    {
+                        "productOrderId": platform_order_item_no,
+                        "deliveryMethod": "DELIVERY",
+                        "deliveryCompanyCode": carrier_code,
+                        "trackingNumber": tracking_no,
+                        "dispatchDate": self._to_naver_datetime(dispatch_date),
+                    }
+                ]
+            },
+        )
+        # 비200은 응답 본문(개인정보 가능) 노출 없이 안전한 외부 API 오류로 변환한다.
+        raise_for_status("naver", response.status_code)
+        with external_call("naver"):
+            data = response.json().get("data", {})
+            success_ids = data.get("successProductOrderIds", [])
+            fail_infos = data.get("failProductOrderInfos", [])
+        if platform_order_item_no in success_ids:
+            return ShipmentSubmitResult(accepted=True, platform_result_code="OK")
+        # 실패 사유 코드만 담고(개인정보 아님), message 원문은 담지 않는다 - 원본 응답에
+        # 상품/고객 관련 문구가 섞여 나올 수 있어 안전한 code만 사용한다.
+        fail_code = next(
+            (str(info.get("code")) for info in fail_infos if info.get("productOrderId") == platform_order_item_no),
+            "UNKNOWN",
+        )
+        return ShipmentSubmitResult(accepted=False, platform_result_code=fail_code)
 
     def fetch_settlements(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
         # 정산 연동 미구현 - 더미로 위장하지 않고 미지원 오류를 던진다.

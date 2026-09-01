@@ -31,6 +31,7 @@ from api.routers import (
     favorites,
     inventory,
     notifications,
+    order_conflicts,
     orders,
     platforms,
     products,
@@ -164,6 +165,7 @@ app.include_router(tasks.router)
 app.include_router(notifications.router)
 app.include_router(alert_rules.router)
 app.include_router(settings_router.router)
+app.include_router(order_conflicts.router)
 
 
 @app.exception_handler(IntegrityError)

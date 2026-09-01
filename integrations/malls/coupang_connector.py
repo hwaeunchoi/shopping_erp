@@ -39,7 +39,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from integrations.malls.base_mall_connector import BaseMallConnector
+from integrations.malls.base_mall_connector import BaseMallConnector, ShipmentSubmitResult
 from integrations.malls.errors import (
     MarketplaceCapabilityUnsupportedError,
     MarketplaceCredentialMissingError,
@@ -76,6 +76,9 @@ ORDERSHEET_MAX_RANGE_DAYS = 31
 # 상태가 갈리면 normalize 단계에서 orderId로 묶는다). 취소는 발주서에 나오지 않아
 # 여기 포함하지 않는다(쿠팡의 별도 취소 API 소관).
 ORDERSHEET_STATUSES = ["ACCEPT", "INSTRUCT", "DEPARTURE", "DELIVERING", "FINAL_DELIVERY"]
+# 송장업로드 처리 API(공식 문서: developers.coupang.com/ko/api/shipments/uploading-waybills,
+# 2026-09 조회) - 요청 바디 최상위 키는 vendorId + orderSheetInvoiceApplyDtos(배열).
+INVOICE_PATH_TMPL = "/v2/providers/openapi/apis/api/v4/vendors/{vendor_id}/orders/invoices"
 
 # HTTP 429(Rate Limit) 재시도 정책: 1s -> 2s -> 4s -> 8s -> 16s 지수 백오프.
 RATE_LIMIT_MAX_RETRIES = 5
@@ -84,6 +87,7 @@ RATE_LIMIT_BACKOFF_BASE_SECONDS = 1.0
 
 class CoupangConnector(BaseMallConnector):
     platform_code = "coupang"
+    supports_shipment_submit = True
 
     def __init__(
         self, session: Any = None, platform_id: Optional[int] = None, http_client: Optional[httpx.Client] = None
@@ -105,9 +109,64 @@ class CoupangConnector(BaseMallConnector):
         raise MarketplaceCapabilityUnsupportedError("coupang", "order_detail")
 
     def update_shipment(self, platform_order_no: str, carrier: str, tracking_no: str) -> bool:
-        # 송장 전송(마켓 반영) 실 API 미구현 - True 성공 위장 없이 미지원 오류를 던진다.
-        # 오류에는 marketplace_code만 담고 주문번호/송장번호/개인정보는 담지 않는다.
+        # 레거시 인터페이스 - 신규 코드는 submit_shipment()를 사용한다(base 클래스 참고).
         raise MarketplaceCapabilityUnsupportedError("coupang", "shipment_update")
+
+    def submit_shipment(
+        self,
+        platform_order_item_no: str,
+        carrier_code: str,
+        tracking_no: str,
+        dispatch_date: date,
+        platform_order_no: Optional[str] = None,
+        platform_shipment_box_id: Optional[str] = None,
+    ) -> ShipmentSubmitResult:
+        """송장업로드 처리(공식 문서: developers.coupang.com/ko/api/shipments/
+        uploading-waybills, 2026-09 조회). 쿠팡은 shipmentBoxId+orderId+vendorItemId
+        세 값이 모두 필요하다 - platform_order_no(orderId)/platform_shipment_box_id가
+        없으면(과거 데이터 등) 안전하게 CapabilityUnsupported로 거부한다(추측 금지)."""
+        if platform_order_no is None or platform_shipment_box_id is None:
+            raise MarketplaceCapabilityUnsupportedError("coupang", "shipment_submit_missing_box_id")
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("coupang")
+        access_key, secret_key, vendor_id = credentials
+
+        path = INVOICE_PATH_TMPL.format(vendor_id=vendor_id)
+        url = f"{COUPANG_API_BASE}{path}"
+        headers = {
+            "Authorization": self._authorization(access_key, secret_key, "POST", path, ""),
+            "Content-Type": "application/json;charset=UTF-8",
+        }
+        body = {
+            "vendorId": vendor_id,
+            "orderSheetInvoiceApplyDtos": [
+                {
+                    "shipmentBoxId": int(platform_shipment_box_id),
+                    "orderId": int(platform_order_no),
+                    "vendorItemId": int(platform_order_item_no),
+                    "deliveryCompanyCode": carrier_code,
+                    "invoiceNumber": tracking_no,
+                    "splitShipping": False,
+                    "preSplitShipped": False,
+                    "estimatedShippingDate": "",
+                }
+            ],
+        }
+        response = self._request_with_retry("POST", url, headers=headers, json_body=body)
+        raise_for_status("coupang", response.status_code)
+        with external_call("coupang"):
+            payload = response.json()
+            response_list = payload.get("responseList", []) or payload.get("data", [])
+        # 개별 결과가 없으면(스키마 차이) 최상위 responseCode만으로 판단한다 -
+        # 실 계정 검증 전까지는 응답 스키마를 100% 확정할 수 없다(모듈 docstring 참고).
+        if response_list:
+            first = response_list[0]
+            succeed = bool(first.get("succeed", False))
+            result_code = str(first.get("resultCode", "UNKNOWN"))
+            return ShipmentSubmitResult(accepted=succeed, platform_result_code=result_code)
+        succeed = payload.get("responseCode") == 0
+        return ShipmentSubmitResult(accepted=succeed, platform_result_code=str(payload.get("responseCode")))
 
     def fetch_settlements(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
         # 정산 연동 미구현 - 더미로 위장하지 않고 미지원 오류를 던진다.
@@ -153,16 +212,20 @@ class CoupangConnector(BaseMallConnector):
             f"CEA algorithm=HmacSHA256, access-key={access_key}, " f"signed-date={signed_date}, signature={signature}"
         )
 
-    def _request_with_retry(self, method: str, url: str, headers: dict[str, str]) -> httpx.Response:
+    def _request_with_retry(
+        self, method: str, url: str, headers: dict[str, str], json_body: Optional[dict[str, Any]] = None
+    ) -> httpx.Response:
         """HTTP 429(Rate Limit)에 대해 지수 백오프(1s -> 2s -> 4s -> 8s -> 16s)로
         최대 RATE_LIMIT_MAX_RETRIES회 재시도한다. 재시도 소진 시 RATE_LIMITED 오류를
         던진다. 네트워크/연결 오류는 external_call이 안전한 오류로 변환한다.
 
-        로그에는 요청 URL(경로에 vendorId 포함)을 남기지 않는다 - 안전한 메타데이터만."""
+        로그에는 요청 URL(경로에 vendorId 포함)을 남기지 않는다 - 안전한 메타데이터만.
+        json_body가 있으면 그대로 요청 본문에 실린다(HMAC 서명 대상에는 포함되지
+        않는다 - _authorization()의 서명 메시지는 method+path+query뿐이다)."""
         attempt = 0
         while True:
             with external_call("coupang"):
-                response = self._http().request(method, url, headers=headers)
+                response = self._http().request(method, url, headers=headers, json=json_body)
             if response.status_code != 429:
                 return response
             attempt += 1
@@ -267,6 +330,11 @@ class CoupangConnector(BaseMallConnector):
                             "platform_option_id": (
                                 str(oi["vendorItemId"]) if oi.get("vendorItemId") is not None else None
                             ),
+                            # 라인(상품주문) 단위 식별자 - 쿠팡은 별도 상품주문번호를 주지 않아
+                            # vendorItemId를 대용한다(송장 전송 시 이 값을 그대로 사용, 1단계 참고).
+                            "platform_order_item_no": (
+                                str(oi["vendorItemId"]) if oi.get("vendorItemId") is not None else None
+                            ),
                             "quantity": quantity,
                             "unit_price": unit_price,
                             # 자동매칭 참고 정보(주문 API에서는 새 상품을 만들지 않는다).
@@ -297,6 +365,10 @@ class CoupangConnector(BaseMallConnector):
                     "customer_phone": orderer.get("safeNumber"),
                     "total_amount": round(total_amount, 2),
                     "discount_amount": round(discount_amount, 2),
+                    # 첫 배송묶음 ID를 대표값으로 사용한다(분할배송 전 최초 수집 시점 기준).
+                    "platform_shipment_box_id": (
+                        str(first_box["shipmentBoxId"]) if first_box.get("shipmentBoxId") is not None else None
+                    ),
                     "receiver_name": receiver.get("name"),
                     "receiver_phone": receiver.get("safeNumber") or receiver.get("receiverNumber"),
                     "receiver_zipcode": receiver.get("postCode"),

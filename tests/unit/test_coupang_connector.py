@@ -170,9 +170,11 @@ class TestLiveIntegration:
                 "receiver_zipcode": "06236",
                 "receiver_address": "서울시 강남구 테헤란로 1",
                 "delivery_message": "부재시 경비실",
+                "platform_shipment_box_id": "1",
                 "items": [
                     {
                         "platform_option_id": "700001",
+                        "platform_order_item_no": "700001",
                         "quantity": 2,
                         "unit_price": 10000.0,
                         "platform_product_id": "500001",
@@ -295,3 +297,110 @@ class TestLiveIntegration:
         assert ei.value.reason_code == "AUTH_FAILED"
         assert ei.value.retryable is False
         assert "Unauthorized" not in str(ei.value)
+
+
+class TestSubmitShipment:
+    """송장업로드 처리(공식 문서: developers.coupang.com/ko/api/shipments/
+    uploading-waybills, 2026-09 조회) - shipmentBoxId/orderId/vendorItemId
+    세 값이 모두 필요하다는 것과 응답 구조를 MockTransport로 검증한다."""
+
+    def test_supports_shipment_submit_flag_is_true(self):
+        assert CoupangConnector.supports_shipment_submit is True
+
+    def test_missing_shipment_box_id_is_capability_unsupported_not_guessed(self, db_session, platform):
+        _register_credentials(db_session, platform)
+        connector = CoupangConnector(session=db_session, platform_id=platform.id)
+
+        with pytest.raises(MarketplaceCapabilityUnsupportedError):
+            connector.submit_shipment(
+                "700001", "CJGLS", "TRACK-1", date(2026, 1, 2), platform_order_no="30001", platform_shipment_box_id=None
+            )
+
+    def test_success_sends_correct_body_and_returns_accepted(self, db_session, platform):
+        _register_credentials(db_session, platform)
+        captured = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(
+                200, json={"responseCode": 0, "responseList": [{"succeed": True, "resultCode": "OK"}]}
+            )
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url=COUPANG_API_BASE)
+        connector = CoupangConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        result = connector.submit_shipment(
+            "700001", "CJGLS", "TRACK-1", date(2026, 1, 2), platform_order_no="30001", platform_shipment_box_id="1"
+        )
+
+        assert result.accepted is True
+        assert result.platform_result_code == "OK"
+        req = captured[0]
+        assert f"/vendors/{VENDOR_ID}/orders/invoices" in req.url.path
+        import json
+
+        body = json.loads(req.content)
+        assert body["vendorId"] == VENDOR_ID
+        line = body["orderSheetInvoiceApplyDtos"][0]
+        assert line["shipmentBoxId"] == 1
+        assert line["orderId"] == 30001
+        assert line["vendorItemId"] == 700001
+        assert line["deliveryCompanyCode"] == "CJGLS"
+        assert line["invoiceNumber"] == "TRACK-1"
+
+    def test_platform_rejection_is_not_reported_as_accepted(self, db_session, platform):
+        _register_credentials(db_session, platform)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "responseCode": 1,
+                    "responseList": [{"succeed": False, "resultCode": "DUPLICATE_INVOICE_NUMBER"}],
+                },
+            )
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url=COUPANG_API_BASE)
+        connector = CoupangConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        result = connector.submit_shipment(
+            "700001", "CJGLS", "TRACK-1", date(2026, 1, 2), platform_order_no="30001", platform_shipment_box_id="1"
+        )
+
+        assert result.accepted is False
+        assert result.platform_result_code == "DUPLICATE_INVOICE_NUMBER"
+
+    def test_no_credentials_raises_credential_missing_without_http(self, db_session, platform):
+        captured = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(200, json={})
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url=COUPANG_API_BASE)
+        connector = CoupangConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        with pytest.raises(MarketplaceCredentialMissingError):
+            connector.submit_shipment(
+                "700001",
+                "CJGLS",
+                "TRACK-SECRET",
+                date(2026, 1, 2),
+                platform_order_no="30001",
+                platform_shipment_box_id="1",
+            )
+        assert captured == []
+
+    def test_no_secret_or_tracking_in_exception_message(self, db_session, platform):
+        connector = CoupangConnector(session=db_session, platform_id=platform.id)
+
+        with pytest.raises(MarketplaceCredentialMissingError) as ei:
+            connector.submit_shipment(
+                "700001",
+                "CJGLS",
+                "TRACKNO-SECRET-999",
+                date(2026, 1, 2),
+                platform_order_no="30001",
+                platform_shipment_box_id="1",
+            )
+        assert "TRACKNO-SECRET-999" not in str(ei.value)

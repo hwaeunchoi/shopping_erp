@@ -165,6 +165,11 @@ class OrderSyncService:
             order.receiver_address = _clip(raw.get("receiver_address"), 500)
         if order.delivery_message is None and raw.get("delivery_message"):
             order.delivery_message = _clip(raw.get("delivery_message"), 500)
+        # 쿠팡 배송묶음 ID(shipmentBoxId) - 송장 전송(1단계) 시 필요하다. 분할배송으로
+        # 바뀌면 실제로는 새 shipmentBoxId가 생기지만, 이번 단계는 최초 수집값만
+        # 보존한다(전체 분할배송 추적은 후속 단계 범위 - roadmap 참고).
+        if order.platform_shipment_box_id is None and raw.get("platform_shipment_box_id"):
+            order.platform_shipment_box_id = _clip(raw.get("platform_shipment_box_id"), 50)
 
     def _create_order(self, platform_id: int, warehouse_id: int, raw: dict[str, Any]) -> tuple[Order, int, int]:
         customer = self._get_or_create_customer(platform_id, raw)
@@ -185,6 +190,7 @@ class OrderSyncService:
             receiver_zipcode=_clip(raw.get("receiver_zipcode"), 10),
             receiver_address=_clip(raw.get("receiver_address"), 500),
             delivery_message=_clip(raw.get("delivery_message"), 500),
+            platform_shipment_box_id=_clip(raw.get("platform_shipment_box_id"), 50),
         )
         self.session.add(order)
         self.session.flush()

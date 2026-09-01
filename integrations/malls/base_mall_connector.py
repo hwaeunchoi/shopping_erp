@@ -41,6 +41,7 @@ fetch_settlements() 반환 항목:
 
 import random
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -49,6 +50,14 @@ from integrations.malls.errors import MarketplaceCapabilityUnsupportedError
 ORDER_STATUSES = ["NEW", "PREPARING", "SHIPPING", "DELIVERED", "CANCELED"]
 DUMMY_CUSTOMER_NAMES = ["김민준", "이서연", "박도윤", "최지우", "정하은", "강시우", "조수아"]
 DUMMY_PRODUCT_PRICES = [12900.0, 15900.0, 19900.0, 24900.0, 29900.0, 39900.0, 59900.0]
+
+
+@dataclass
+class ShipmentSubmitResult:
+    """submit_shipment()의 안전한 결과 요약 - 원본 응답 전문은 담지 않는다."""
+
+    accepted: bool
+    platform_result_code: Optional[str] = None  # 예: "OK" / 실패 사유 코드(짧은 문자열)
 
 
 class BaseMallConnector(ABC):
@@ -62,6 +71,10 @@ class BaseMallConnector(ABC):
     supports_cancellation_sync: bool = False
     supports_return_sync: bool = False
     supports_exchange_sync: bool = False
+    # 송장(발송처리) 실 전송 지원 여부. 공식 API로 실구현이 있는 커넥터만 True로
+    # 오버라이드한다 - services.shipment_dispatch_service가 이 플래그로 채널을
+    # 건너뛸지(CapabilityUnsupported) 판단한다.
+    supports_shipment_submit: bool = False
 
     def _marketplace_code(self) -> str:
         """오류 메시지용 안전한 채널 식별자(Secret/PII 아님). platform_code가 없으면 클래스명."""
@@ -88,8 +101,34 @@ class BaseMallConnector(ABC):
 
     @abstractmethod
     def update_shipment(self, platform_order_no: str, carrier: str, tracking_no: str) -> bool:
-        """송장 등록/배송 상태를 플랫폼에 반영한다. 성공 여부를 반환한다."""
+        """(레거시) 송장 등록/배송 상태를 플랫폼에 반영한다. 성공 여부를 반환한다.
+
+        상용 ERP 확장(1단계) 이후 신규 코드는 submit_shipment()를 사용한다 -
+        이 메서드는 주문 단위(platform_order_no)만 받아 라인아이템 단위 부분출고를
+        표현할 수 없다. 기존 abstract 계약이라 시그니처는 유지한다."""
         raise NotImplementedError
+
+    def submit_shipment(
+        self,
+        platform_order_item_no: str,
+        carrier_code: str,
+        tracking_no: str,
+        dispatch_date: date,
+        platform_order_no: Optional[str] = None,
+        platform_shipment_box_id: Optional[str] = None,
+    ) -> ShipmentSubmitResult:
+        """상품주문(라인아이템) 단위로 송장 정보를 채널에 전송한다(부분출고/분할배송 지원).
+
+        기본 구현은 미지원 오류를 던진다(성공 위장 없음). supports_shipment_submit=True인
+        커넥터만 오버라이드한다. carrier_code는 이미 채널별 코드로 정규화된 값이어야
+        한다(integrations.malls.carrier_codes.normalize_carrier_code 참고) - 이 메서드는
+        내부 코드를 다시 변환하지 않는다.
+
+        platform_order_no/platform_shipment_box_id는 채널마다 필요 여부가 다르다
+        (네이버는 productOrderId 하나로 충분하지만, 쿠팡은 orderId+shipmentBoxId+
+        vendorItemId 세 값이 모두 필요하다 - CoupangConnector.submit_shipment 참고).
+        필요 없는 채널은 무시한다."""
+        raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "shipment_submit")
 
     @abstractmethod
     def fetch_settlements(self, start_date: date, end_date: date) -> list[dict[str, Any]]:

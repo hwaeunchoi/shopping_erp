@@ -527,7 +527,6 @@ class TestNoPiiInLogs:
         덤프했다. 이 회귀 테스트로 재발을 막는다.
         """
         import logging
-        import os
 
         svc = ApiCredentialService(db_session)
         svc.upsert_credential("PLATFORM", platform.id, "client_id", "cid")
@@ -577,4 +576,134 @@ class TestNoPiiInLogs:
         assert "네이버 주문 조회 완료" in caplog.text
         # 응답을 파일로 저장하지 않아야 한다.
         assert not any("naver_order_response" in p for p in opened_paths)
-        assert not os.path.exists("/app/logs/naver_order_response.json") or True  # 경로 존재 여부와 무관하게 미기록
+
+
+class TestSubmitShipment:
+    """송장 전송(발송처리) - 공식 저장소(commerce-api-naver/commerce-api) 문의글 기준
+    요청/응답 스키마(모듈 상단 DISPATCH_PATH 주석 참고)를 MockTransport로 검증한다."""
+
+    def test_supports_shipment_submit_flag_is_true(self):
+        assert NaverSmartstoreConnector.supports_shipment_submit is True
+
+    def test_success_sends_dispatch_request_and_returns_accepted(self, db_session, platform):
+        svc = ApiCredentialService(db_session)
+        svc.upsert_credential("PLATFORM", platform.id, "client_id", "cid")
+        svc.upsert_credential("PLATFORM", platform.id, "client_secret", "$2b$12$Cq/28lyv3wDDjELmomd4Me")
+        db_session.flush()
+
+        captured = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            if request.url.path.endswith("/oauth2/token"):
+                return httpx.Response(200, json={"access_token": "fake-token", "expires_in": 3600})
+            return httpx.Response(
+                200, json={"data": {"successProductOrderIds": ["PO-SHIP-1"], "failProductOrderInfos": []}}
+            )
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.commerce.naver.com")
+        connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        result = connector.submit_shipment("PO-SHIP-1", "CJGLS", "TRACK-1", date(2026, 1, 2))
+
+        assert result.accepted is True
+        assert result.platform_result_code == "OK"
+        dispatch_req = captured[1]
+        assert dispatch_req.url.path == "/external/v1/pay-order/seller/product-orders/dispatch"
+        import json
+
+        body = json.loads(dispatch_req.content)
+        sent = body["dispatchProductOrders"][0]
+        assert sent["productOrderId"] == "PO-SHIP-1"
+        assert sent["deliveryCompanyCode"] == "CJGLS"
+        assert sent["trackingNumber"] == "TRACK-1"
+
+    def test_platform_rejection_is_not_reported_as_accepted(self, db_session, platform):
+        svc = ApiCredentialService(db_session)
+        svc.upsert_credential("PLATFORM", platform.id, "client_id", "cid")
+        svc.upsert_credential("PLATFORM", platform.id, "client_secret", "$2b$12$Cq/28lyv3wDDjELmomd4Me")
+        db_session.flush()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/oauth2/token"):
+                return httpx.Response(200, json={"access_token": "fake-token", "expires_in": 3600})
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "successProductOrderIds": [],
+                        "failProductOrderInfos": [{"productOrderId": "PO-SHIP-1", "code": "104135"}],
+                    }
+                },
+            )
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.commerce.naver.com")
+        connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        result = connector.submit_shipment("PO-SHIP-1", "CJGLS", "TRACK-1", date(2026, 1, 2))
+
+        assert result.accepted is False
+        assert result.platform_result_code == "104135"
+
+    def test_no_credentials_raises_credential_missing_without_http(self, db_session, platform):
+        captured = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(200, json={})
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.commerce.naver.com")
+        connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        with pytest.raises(MarketplaceCredentialMissingError):
+            connector.submit_shipment("PO-SECRET", "CJGLS", "TRACK-SECRET", date(2026, 1, 2))
+        assert captured == []
+
+    def test_401_raises_auth_failed(self, db_session, platform):
+        svc = ApiCredentialService(db_session)
+        svc.upsert_credential("PLATFORM", platform.id, "client_id", "cid")
+        svc.upsert_credential("PLATFORM", platform.id, "client_secret", "$2b$12$Cq/28lyv3wDDjELmomd4Me")
+        db_session.flush()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/oauth2/token"):
+                return httpx.Response(200, json={"access_token": "fake-token", "expires_in": 3600})
+            return httpx.Response(401, json={"message": "denied"})
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.commerce.naver.com")
+        connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        with pytest.raises(MarketplaceExternalAPIError) as ei:
+            connector.submit_shipment("PO-1", "CJGLS", "TRACK-1", date(2026, 1, 2))
+        assert ei.value.reason_code == "AUTH_FAILED"
+        assert ei.value.retryable is False
+
+    def test_response_parse_failure_is_safe_error(self, db_session, platform):
+        svc = ApiCredentialService(db_session)
+        svc.upsert_credential("PLATFORM", platform.id, "client_id", "cid")
+        svc.upsert_credential("PLATFORM", platform.id, "client_secret", "$2b$12$Cq/28lyv3wDDjELmomd4Me")
+        db_session.flush()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/oauth2/token"):
+                return httpx.Response(200, json={"access_token": "fake-token", "expires_in": 3600})
+            return httpx.Response(200, content=b"not-json")
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.commerce.naver.com")
+        connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        with pytest.raises(MarketplaceExternalAPIError) as ei:
+            connector.submit_shipment("PO-1", "CJGLS", "TRACK-1", date(2026, 1, 2))
+        assert ei.value.reason_code == "PARSE_FAILED"
+
+    def test_no_secret_or_order_no_in_exception_message(self, db_session, platform):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={})
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.commerce.naver.com")
+        connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        with pytest.raises(MarketplaceCredentialMissingError) as ei:
+            connector.submit_shipment("PO-SECRET-999", "CJGLS", "TRACKNO-SECRET-999", date(2026, 1, 2))
+        assert "PO-SECRET-999" not in str(ei.value)
+        assert "TRACKNO-SECRET-999" not in str(ei.value)

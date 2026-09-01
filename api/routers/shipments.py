@@ -17,8 +17,20 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 from api.deps import get_db, require_permission
+from integrations.malls.carrier_codes import UnknownCarrierError
+from integrations.malls.errors import (
+    MarketplaceCapabilityUnsupportedError,
+    MarketplaceCredentialMissingError,
+    MarketplaceError,
+)
 from models.order import Shipment
 from repositories.order_repository import OrderRepository, ShipmentRepository
+from services.shipment_dispatch_service import (
+    ShipmentAlreadyRunningError,
+    ShipmentDispatchService,
+    ShipmentNotReadyError,
+    ShipmentPlatformMismatchError,
+)
 from services.shipment_service import InvalidShipmentStatusError, ShipmentAlreadyExistsError, ShipmentService
 
 router = APIRouter(
@@ -207,3 +219,52 @@ def change_shipment_status(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
     db.commit()
     return _to_shipment_out(updated, repo)
+
+
+class ShipmentSubmitOut(BaseModel):
+    command_id: int
+    status: str
+    already_processed: bool
+    error_code: Optional[str] = None
+
+
+@router.post(
+    "/{shipment_id}/submit",
+    response_model=ShipmentSubmitOut,
+    summary="채널로 송장 전송",
+    description="READY 상태의 배송을 실제 쇼핑몰(네이버/쿠팡)에 발송처리로 전송한다. "
+    "같은 송장번호로 재요청해도 idempotency로 중복 API 호출을 만들지 않는다. "
+    "미지원 채널/자격증명 없음/전송 거부는 각각 안전한 오류로 응답한다.",
+    responses={
+        404: {"description": "배송 정보를 찾을 수 없습니다."},
+        400: {"description": "배송이 READY 상태가 아니거나 필수 정보가 없습니다."},
+        409: {"description": "이미 처리 중인 전송 요청입니다."},
+        501: {"description": "채널이 아직 송장 전송을 지원하지 않습니다."},
+        502: {"description": "채널 연동 오류(인증정보 없음/거부/외부 API 오류)."},
+    },
+)
+def submit_shipment(shipment_id: int, db: Session = Depends(get_db)) -> ShipmentSubmitOut:
+    service = ShipmentDispatchService(db)
+    try:
+        outcome = service.submit(shipment_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except (ShipmentNotReadyError, ShipmentPlatformMismatchError, UnknownCarrierError) as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    except ShipmentAlreadyRunningError as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except MarketplaceCapabilityUnsupportedError as e:
+        db.commit()  # command가 FAILED로 이미 기록됨 - 그 기록은 보존한다.
+        raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(e)) from e
+    except (MarketplaceCredentialMissingError, MarketplaceError) as e:
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
+    db.commit()
+    return ShipmentSubmitOut(
+        command_id=outcome.command.id,
+        status=outcome.command.status,
+        already_processed=outcome.already_processed,
+        error_code=outcome.command.error_code,
+    )

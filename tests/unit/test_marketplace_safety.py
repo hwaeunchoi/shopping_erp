@@ -23,7 +23,10 @@ import scheduler.jobs.settlement_sync_job as settlement_job
 from integrations.malls import SUPPORTED_CONNECTORS, get_mall_connector
 from integrations.malls.base_mall_connector import BaseMallConnector
 from integrations.malls.coupang_connector import COUPANG_API_BASE, CoupangConnector
+from integrations.malls.elevenst_connector import ElevenstConnector
 from integrations.malls.errors import MarketplaceCapabilityUnsupportedError, MarketplaceCredentialMissingError
+from integrations.malls.esm_connector import EsmConnector
+from integrations.malls.kakao_shopping_connector import KakaoShoppingConnector
 from integrations.malls.naver_smartstore_connector import NaverSmartstoreConnector
 
 
@@ -69,6 +72,22 @@ class TestCapabilityUnsupported:
     def test_coupang_products_unsupported(self):
         with pytest.raises(MarketplaceCapabilityUnsupportedError):
             CoupangConnector().fetch_products()
+
+
+class TestShipmentSubmitCapabilityNeverFakesSuccess:
+    """상용 ERP 확장(1단계) - submit_shipment()는 supports_shipment_submit=True인
+    채널(네이버/쿠팡)만 오버라이드하며, 나머지는 base 기본 구현(미지원 오류)을
+    그대로 물려받아 절대 accepted=True를 반환하지 않는다."""
+
+    def test_naver_and_coupang_declare_support(self):
+        assert NaverSmartstoreConnector.supports_shipment_submit is True
+        assert CoupangConnector.supports_shipment_submit is True
+
+    @pytest.mark.parametrize("connector_cls", [EsmConnector, ElevenstConnector, KakaoShoppingConnector])
+    def test_unverified_channels_default_to_unsupported_not_true(self, connector_cls):
+        assert connector_cls.supports_shipment_submit is False
+        with pytest.raises(MarketplaceCapabilityUnsupportedError):
+            connector_cls().submit_shipment("PO-1", "CJGLS", "TRACK-1", date(2026, 1, 2))
 
 
 class TestEmptyRealResultIsSuccess:

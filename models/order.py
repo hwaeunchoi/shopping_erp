@@ -65,6 +65,9 @@ class Order(Base, TimestampMixin, SoftDeleteMixin):
     receiver_address: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     # 배송 요청 메세지(예: "문 앞에 놓아주세요") - 채널 주문 수집 시 배송지 정보와 함께 저장.
     delivery_message: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    # 쿠팡 배송묶음 ID(shipmentBoxId) - 송장 전송 API에 orderId/vendorItemId와 함께 필요하다
+    # (네이버 등 다른 채널은 사용하지 않음, NULL). 상용 ERP 확장(1단계) 참고.
+    platform_shipment_box_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
     items: Mapped[list["OrderItem"]] = relationship(back_populates="order", cascade="all, delete-orphan")
     status_history: Mapped[list["OrderStatusHistory"]] = relationship(
