@@ -26,20 +26,41 @@
 
 ## 단계별 로드맵
 
-### 1단계 - 송장/상태 양방향 동기화 (구현 완료)
+### 1단계 - 송장/상태 양방향 동기화 (구현 완료, 완결 검토 반영)
 
 - **범위**: 네이버 스마트스토어/쿠팡에 대해 (a) 발송 처리 시 채널로 송장(운송사+
   송장번호) 전송, (b) 채널 주문상태를 수집해 내부 주문상태와 비교 후 허용된 전이면
   반영, 아니면 충돌 기록.
 - **완료 기준**:
-  - `ShipmentDispatchService.submit()`이 outbox 경유로 멱등하게 송장을 전송하고,
-    실패/거부 시 성공으로 위장하지 않는다. (충족)
-  - `OrderChannelSyncService.sync_channel_status()`가 허용되지 않는 전이를
-    `OrderStatusConflict`로 남기고, 운영자가 `POST /api/order-conflicts/{id}/resolve`로
-    해소할 수 있다. (충족 - API/화면 모두 구현)
+  - 분할배송/부분출고를 정확히 표현한다: 쿠팡 배송묶음(shipmentBoxId)은 주문
+    단위가 아니라 라인(`OrderItem`) 단위로 저장하고(`OrderItem.platform_shipment_box_id`),
+    `ShipmentDispatchService._dispatch_all_lines()`는 `shipment_items.order_item_id`를
+    거쳐 그 배송에 실제로 연결된 라인만 전송한다(합포장/분할배송/부분출고 모두
+    모델 변경 없이 이미 지원되던 `Shipment`↔`Order`/`OrderItem` N:M 구조를 그대로
+    사용). (충족 - 최초 구현에서 주문 전체 대표값 1개로 잘못 설계했던 것을
+    완결 검토에서 발견/수정.)
+  - 채널로 나가는 쓰기는 outbox(`ExternalCommand`)를 실제로 실행하는 별도 경로가
+    있다: API(`POST /api/shipments/{id}/submit`)는 `enqueue()`만 호출해 PENDING
+    명령을 만들고 202를 즉시 반환하며, 실제 채널 호출은
+    `scheduler.jobs.outbox_dispatch_job`이 주기적으로 `execute_command()`를 호출해
+    수행한다. 재시도 가능한 실패는 RETRY_WAIT(+ 백오프)로, 재시도 불가능하거나
+    소진된 실패는 FAILED로 확정한다(무한 재시도 방지, `MAX_ATTEMPTS`). RUNNING으로
+    너무 오래 머무는 명령(worker 크래시 추정)은 `recover_stale_running()`이 회수한다.
+    (충족 - 최초 구현은 API 요청 스레드에서 동기 실행했던 것을 완결 검토에서
+    비동기 outbox 실행으로 재설계.)
+  - `OrderChannelSyncService.sync_channel_status()`가 실제 실행 경로를 갖는다:
+    (a) 송장 전송 성공 직후 연결된 주문에 "SHIPPING"을 반영(허용된 전이만), (b)
+    `scheduler.jobs.channel_status_sync_job`이 주기적으로 채널 상태를 읽기전용
+    재조회해 반영한다(운영 중인 `order_collect_job`은 변경하지 않는다). 허용되지
+    않는 전이는 `OrderStatusConflict`로 남기며, 같은 채널상태로 반복 감지돼도
+    미해소 충돌 행을 중복 생성하지 않는다. 운영자는
+    `POST /api/order-conflicts/{id}/resolve`로 해소한다. (충족 - 최초 구현은
+    서비스만 만들고 아무 경로도 호출하지 않는 dead code였던 것을 완결 검토에서
+    실행 경로 2개로 연결.)
   - MockTransport 기반 계약 테스트로 요청 스키마/실패 처리/PII 비기록을 검증한다.
     (충족 - `test_naver_smartstore_connector.py`/`test_coupang_connector.py`의
-    `TestSubmitShipment`)
+    `TestSubmitShipment`, `test_shipment_dispatch_service.py`의 분할배송/재시도/
+    stale RUNNING 회수 테스트)
   - 실계정 검증은 별도 단계(아래 "실계정 검증 전 필요 조건" 참고, 아직 미충족).
 
 ### 2단계 - 취소/반품/교환/정산 채널 연동
@@ -56,8 +77,11 @@
 
 ### 3단계 - 상품/재고 동기화
 
-- **범위**: 내부 상품/옵션/재고를 채널별 상품 등록/수정/재고 동기화 API와 연동.
-  품절/가격 변경 시 다채널 반영, 채널 상품코드-내부 SKU 매칭 규칙 정비.
+- **범위**: 네이버 상품 "수집"(`fetch_products`/`product_sync_job`)은 이미 운영 중이나
+  (capability matrix 참고, 1단계에서 변경 없음), 내부→채널 방향 "쓰기"(재고/가격/
+  품절 반영)와 나머지 채널의 상품 연동은 아직 없다. 이 단계에서 내부 상품/옵션/
+  재고를 채널별 상품 등록/수정/재고 동기화 API와 연동하고, 품절/가격 변경 시
+  다채널 반영, 채널 상품코드-내부 SKU 매칭 규칙을 정비한다.
 - **의존성**: `models/product.py`의 기존 `ProductOption`/`platform_option_id` 매칭
   구조를 확장. 재고 동기화는 다건 배치 처리가 필요하므로 1단계의
   `session.begin_nested()` 부분성공/격리 패턴을 재사용.
@@ -90,17 +114,26 @@
   집계하는 것이 핵심이므로, 1~5단계에서 쌓인 데이터가 있어야 의미 있는
   대시보드가 된다.
 - **완료 기준**: 실패/재시도 대기 건수 대시보드, 대량 재처리(`submit_many`류) UI.
+- **알려진 한계(완결 검토에서 발견, 6단계에서 반드시 재검토)**:
+  `ShipmentDispatchService.submit_many()`는 건별로 SAVEPOINT(`session.begin_nested()`)로
+  격리하는데, 실패한 건은 `savepoint.rollback()`으로 그 건의 `ExternalCommand` 행
+  자체(INSERT 포함)까지 되돌아간다 - 즉 대량 처리에서 실패한 건은 outbox에 이력이
+  남지 않는다(반대로 API 엔드포인트가 쓰는 `enqueue()`+`outbox_dispatch_job` 경로는
+  건별로 독립 커밋하므로 이 문제가 없다). 대량처리 API를 만들 때는 SAVEPOINT
+  방식 대신 건별 독립 커밋(또는 실패해도 outbox 행은 보존하고 도메인 변경만
+  롤백하는 방식)으로 재설계해야 한다.
 
 ## Capability Matrix (1단계 기준 현황)
 
 | 캐패빌리티 | 네이버 스마트스토어 | 쿠팡 | ESM | 11번가 | 카카오쇼핑 |
 |---|---|---|---|---|---|
 | 주문 수집 (`fetch_orders`) | O (기존 구현) | O (기존 구현) | X (`CapabilityUnsupported`) | X (`CapabilityUnsupported`) | X (`CapabilityUnsupported`) |
-| 송장 전송 (`submit_shipment`, 1단계 신규) | O | O | X | X | X |
-| 채널 상태 동기화 (`OrderChannelSyncService` 경유) | O (전송 성공 후 상태값 흐름은 후속 폴링 작업 필요) | O | X | X | X |
+| 송장 전송 (`submit_shipment`, 1단계 신규, outbox 비동기 실행) | O | O | X | X | X |
+| 채널 상태 동기화 (전송성공 반영 + 주기적 읽기전용 재조회) | O | O | X | X | X |
 | 취소/반품 동기화 (2단계 예정) | X | X | X | X | X |
 | 정산 조회 (`fetch_settlements`) | O (기존 구현, 1단계에서 변경 없음) | O (기존 구현, 1단계에서 변경 없음) | X | X | X |
-| 상품/재고 동기화 (3단계 예정) | X | X | X | X | X |
+| 상품 동기화 (`fetch_products`) | **O (기존 구현, 1단계 이전부터 운영 중 - `product_sync_job` 20분 주기, 1단계에서 변경 없음)** | X | X | X | X |
+| 재고 동기화 (3단계 예정) | X | X | X | X | X |
 
 - O = 실제 구현 + MockTransport 계약 테스트로 검증됨 (실계정 검증은 별도).
 - X = 미구현. 호출 시 `MarketplaceCapabilityUnsupportedError`를 명시적으로 발생시키며,
@@ -110,6 +143,12 @@
 
 - 네이버/쿠팡 실 판매자 계정의 유효한 API 자격증명 (client_id/secret, vendor_id 등).
 - 실 주문 데이터에 대한 발송 처리 승인(테스트 발송이 실제 구매자에게 알림/문자로
-  나갈 수 있음 - 운영 담당자 승인 필요).
-- 쿠팡의 경우 `shipmentBoxId`가 분할배송 시 여러 개일 수 있는데, 현재는 최초 수집된
-  박스ID 하나만 저장한다 - 분할배송 계정으로 검증 시 이 제약을 먼저 확인해야 한다.
+  나갈 수 있음 - 운영 담당자 승인 필요, 특히 outbox worker가 자동으로 실행하므로
+  실계정 자격증명을 등록하는 순간부터 대기 중인 PENDING 명령이 있으면 곧바로
+  실제 발송 요청이 나간다는 점을 운영 담당자가 인지해야 한다).
+- `scheduler.jobs.outbox_dispatch_job`/`channel_status_sync_job` 자체를 실 계정으로
+  실행해 본 적은 없다(MockTransport로만 검증) - 실 배포 전 스테이징 환경에서
+  스케줄러 프로세스를 먼저 띄워 두 잡이 정상 동작하는지 확인이 필요하다.
+- outbox의 "동일 (shipment_id, tracking_no) 재실행은 안전하다"는 가정(stale RUNNING
+  회수 시 근거)은 채널이 같은 송장번호 재제출을 upsert로 처리한다는 전제다 - 실
+  계정으로 중복 제출 시 채널이 오류를 내는지 확인이 필요하다.
