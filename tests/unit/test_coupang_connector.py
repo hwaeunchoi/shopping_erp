@@ -170,11 +170,11 @@ class TestLiveIntegration:
                 "receiver_zipcode": "06236",
                 "receiver_address": "서울시 강남구 테헤란로 1",
                 "delivery_message": "부재시 경비실",
-                "platform_shipment_box_id": "1",
                 "items": [
                     {
                         "platform_option_id": "700001",
                         "platform_order_item_no": "700001",
+                        "platform_shipment_box_id": "1",
                         "quantity": 2,
                         "unit_price": 10000.0,
                         "platform_product_id": "500001",
@@ -217,6 +217,10 @@ class TestLiveIntegration:
         assert parts["signature"] == expected
 
     def test_groups_multiple_boxes_under_same_order_id(self, db_session, platform):
+        """한 주문(orderId)이 서로 다른 배송묶음(box) 2개로 나뉘어 내려오면(분할배송),
+        각 라인은 자신이 실제로 속한 box id를 가져야 한다 - 주문 전체 대표값 하나로
+        뭉개면 두 번째 배송묶음 라인에 첫 배송묶음의 box id가 잘못 붙는다(1단계
+        완결 검토에서 발견/수정)."""
         _register_credentials(db_session, platform)
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -255,6 +259,8 @@ class TestLiveIntegration:
         assert orders[0]["platform_order_no"] == "ORDER-MULTI"
         assert len(orders[0]["items"]) == 2
         assert orders[0]["total_amount"] == 15000.0
+        box_id_by_item_no = {i["platform_order_item_no"]: i["platform_shipment_box_id"] for i in orders[0]["items"]}
+        assert box_id_by_item_no == {"1": "1", "2": "2"}  # 각 라인이 자신의 배송묶음 ID를 갖는다.
 
     def test_pagination_follows_next_token(self, db_session, platform):
         _register_credentials(db_session, platform)

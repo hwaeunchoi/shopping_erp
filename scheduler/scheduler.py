@@ -33,8 +33,10 @@ from scheduler.jobs import (  # noqa: E402
     ad_collect_job,
     alert_evaluation_job,
     backup_job,
+    channel_status_sync_job,
     customer_stats_job,
     order_collect_job,
+    outbox_dispatch_job,
     product_sync_job,
     profit_calculation_job,
     report_generate_job,
@@ -104,6 +106,14 @@ def run_alert_evaluation() -> None:
     _run_job("alert_evaluation", alert_evaluation_job.run, task_type="ALERT_EVALUATE")
 
 
+def run_outbox_dispatch() -> None:
+    _run_job("outbox_dispatch", outbox_dispatch_job.run, task_type="FULL_SYNC")
+
+
+def run_channel_status_sync() -> None:
+    _run_job("channel_status_sync", channel_status_sync_job.run, task_type="MALL_SYNC")
+
+
 def build_scheduler() -> BlockingScheduler:
     scheduler = BlockingScheduler(timezone="UTC")
     # 상품 동기화는 주문 수집보다 먼저 실행되도록 더 짧은 주기(10분보다 여유를 둔 20분)로
@@ -117,6 +127,12 @@ def build_scheduler() -> BlockingScheduler:
     scheduler.add_job(run_backup, CronTrigger(hour=3, minute=0), id="backup", max_instances=1)
     scheduler.add_job(run_report_generate, CronTrigger(hour=2, minute=0), id="report_generate", max_instances=1)
     scheduler.add_job(run_alert_evaluation, IntervalTrigger(minutes=30), id="alert_evaluation", max_instances=1)
+    # outbox(ExternalCommand) 실행 - API는 enqueue()만 하고 실제 채널 호출은 이 잡이 한다.
+    # order_collect(10분)보다 짧게 둬서 송장 전송 요청이 오래 PENDING으로 방치되지 않게 한다.
+    scheduler.add_job(run_outbox_dispatch, IntervalTrigger(minutes=2), id="outbox_dispatch", max_instances=1)
+    # 채널 상태 읽기 전용 재조회 - order_collect_job과 조회 범위가 겹치므로 주기를 다르게
+    # 둬 과도한 중복 채널 호출을 피한다(order_collect_job.py는 그대로 둔다).
+    scheduler.add_job(run_channel_status_sync, IntervalTrigger(minutes=15), id="channel_status_sync", max_instances=1)
     return scheduler
 
 

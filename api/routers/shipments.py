@@ -17,16 +17,10 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 from api.deps import get_db, require_permission
-from integrations.malls.carrier_codes import UnknownCarrierError
-from integrations.malls.errors import (
-    MarketplaceCapabilityUnsupportedError,
-    MarketplaceCredentialMissingError,
-    MarketplaceError,
-)
 from models.order import Shipment
+from repositories.integration_sync_repository import ExternalCommandRepository
 from repositories.order_repository import OrderRepository, ShipmentRepository
 from services.shipment_dispatch_service import (
-    ShipmentAlreadyRunningError,
     ShipmentDispatchService,
     ShipmentNotReadyError,
     ShipmentPlatformMismatchError,
@@ -231,36 +225,28 @@ class ShipmentSubmitOut(BaseModel):
 @router.post(
     "/{shipment_id}/submit",
     response_model=ShipmentSubmitOut,
-    summary="채널로 송장 전송",
-    description="READY 상태의 배송을 실제 쇼핑몰(네이버/쿠팡)에 발송처리로 전송한다. "
-    "같은 송장번호로 재요청해도 idempotency로 중복 API 호출을 만들지 않는다. "
-    "미지원 채널/자격증명 없음/전송 거부는 각각 안전한 오류로 응답한다.",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="채널로 송장 전송 요청(비동기)",
+    description="READY 상태의 배송을 채널(네이버/쿠팡)에 전송할 명령을 생성한다. "
+    "이 API는 실제 채널 호출을 하지 않고 명령만 접수한다(202) - 실제 전송은 스케줄러의 "
+    "outbox_dispatch_job이 비동기로 수행하며, 처리 결과는 GET /api/shipments/commands/"
+    "{command_id}로 폴링해 확인해야 한다(PENDING -> RUNNING -> SUCCESS/FAILED/RETRY_WAIT). "
+    "같은 배송에 이미 생성된 명령이 있으면(같은 송장번호로 재요청/버튼 연타 포함) 새로 "
+    "만들지 않고 기존 명령을 그대로 반환한다(idempotent).",
     responses={
         404: {"description": "배송 정보를 찾을 수 없습니다."},
         400: {"description": "배송이 READY 상태가 아니거나 필수 정보가 없습니다."},
-        409: {"description": "이미 처리 중인 전송 요청입니다."},
-        501: {"description": "채널이 아직 송장 전송을 지원하지 않습니다."},
-        502: {"description": "채널 연동 오류(인증정보 없음/거부/외부 API 오류)."},
     },
 )
 def submit_shipment(shipment_id: int, db: Session = Depends(get_db)) -> ShipmentSubmitOut:
     service = ShipmentDispatchService(db)
     try:
-        outcome = service.submit(shipment_id)
+        outcome = service.enqueue(shipment_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
-    except (ShipmentNotReadyError, ShipmentPlatformMismatchError, UnknownCarrierError) as e:
+    except (ShipmentNotReadyError, ShipmentPlatformMismatchError) as e:
         db.rollback()
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
-    except ShipmentAlreadyRunningError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
-    except MarketplaceCapabilityUnsupportedError as e:
-        db.commit()  # command가 FAILED로 이미 기록됨 - 그 기록은 보존한다.
-        raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(e)) from e
-    except (MarketplaceCredentialMissingError, MarketplaceError) as e:
-        db.commit()
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
     db.commit()
     return ShipmentSubmitOut(
         command_id=outcome.command.id,
@@ -268,3 +254,31 @@ def submit_shipment(shipment_id: int, db: Session = Depends(get_db)) -> Shipment
         already_processed=outcome.already_processed,
         error_code=outcome.command.error_code,
     )
+
+
+class ExternalCommandOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    status: str
+    attempt_count: int
+    retryable: bool
+    error_code: Optional[str]
+    next_retry_at: Optional[datetime]
+    completed_at: Optional[datetime]
+
+
+@router.get(
+    "/commands/{command_id}",
+    response_model=ExternalCommandOut,
+    summary="채널 전송 명령 상태 조회",
+    description="POST /{shipment_id}/submit이 반환한 command_id로 처리 상태를 폴링한다. "
+    "화면은 status가 SUCCESS로 확인된 뒤에만 성공으로 표시해야 한다(PENDING/RUNNING은 "
+    "진행 중, RETRY_WAIT은 재시도 대기, FAILED는 확정 실패).",
+    responses={404: {"description": "명령을 찾을 수 없습니다."}},
+)
+def get_shipment_submit_command(command_id: int, db: Session = Depends(get_db)) -> ExternalCommandOut:
+    command = ExternalCommandRepository(db).get_by_id(command_id)
+    if command is None or command.target_type != "SHIPMENT":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="명령을 찾을 수 없습니다.")
+    return ExternalCommandOut.model_validate(command, from_attributes=True)

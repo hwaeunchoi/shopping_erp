@@ -21,7 +21,8 @@ fetch_orders()/fetch_order_detail() 반환 항목:
         "total_amount": float,
         "discount_amount": float,
         "items": [
-            {"platform_option_id": str, "quantity": int, "unit_price": float},
+            {"platform_option_id": str, "quantity": int, "unit_price": float,
+             "platform_shipment_box_id": Optional[str]},  # 쿠팡 배송묶음 ID(라인 단위). 없는 채널은 생략/None.
             ...
         ],
     }

@@ -65,9 +65,6 @@ class Order(Base, TimestampMixin, SoftDeleteMixin):
     receiver_address: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     # 배송 요청 메세지(예: "문 앞에 놓아주세요") - 채널 주문 수집 시 배송지 정보와 함께 저장.
     delivery_message: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
-    # 쿠팡 배송묶음 ID(shipmentBoxId) - 송장 전송 API에 orderId/vendorItemId와 함께 필요하다
-    # (네이버 등 다른 채널은 사용하지 않음, NULL). 상용 ERP 확장(1단계) 참고.
-    platform_shipment_box_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
     items: Mapped[list["OrderItem"]] = relationship(back_populates="order", cascade="all, delete-orphan")
     status_history: Mapped[list["OrderStatusHistory"]] = relationship(
@@ -107,6 +104,13 @@ class OrderItem(Base):
     # 채널에서 주문된 세트 개수(구성수량 × set_quantity = quantity)
     set_quantity: Mapped[Optional[int]] = mapped_column(nullable=True)
     currency: Mapped[str] = mapped_column(String(3), default="KRW", nullable=False)
+    # 쿠팡 배송묶음 ID(shipmentBoxId) - 송장 전송 API에 orderId/vendorItemId와 함께 필요하다.
+    # Order가 아니라 OrderItem(라인)에 둔 이유: 쿠팡은 배송묶음(box) 단위로 응답을 주고
+    # (한 주문이 여러 배송묶음으로 나뉠 수 있음 - CoupangConnector 모듈 docstring 참고),
+    # 각 라인아이템(vendorItemId)은 그 라인이 속한 배송묶음 하나에만 속한다. 주문 전체에
+    # 대표값 하나만 저장하면 분할배송 주문의 두 번째 이후 배송묶음 라인은 잘못된(첫 배송묶음의)
+    # box id로 송장이 전송되는 오류가 생긴다. 네이버 등 배송묶음 개념이 없는 채널은 NULL.
+    platform_shipment_box_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
     order: Mapped["Order"] = relationship(back_populates="items")
 

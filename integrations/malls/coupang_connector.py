@@ -318,7 +318,11 @@ class CoupangConnector(BaseMallConnector):
             items = []
             total_amount = 0.0
             discount_amount = 0.0
+            # 배송묶음(box) ID는 라인(vendorItemId) 단위로 저장한다 - 한 주문이 여러
+            # 배송묶음으로 나뉠 수 있어(docstring 3번 참고) 주문 전체 대표값 하나로는
+            # 분할배송의 두 번째 이후 배송묶음 라인에 잘못된 box id가 붙게 된다.
             for box in order_boxes:
+                box_id = str(box["shipmentBoxId"]) if box.get("shipmentBoxId") is not None else None
                 for oi in box.get("orderItems", []) or []:
                     quantity = int(oi.get("shippingCount", 0) or 0)
                     unit_price = float(oi.get("salesPrice", 0) or 0)
@@ -335,6 +339,8 @@ class CoupangConnector(BaseMallConnector):
                             "platform_order_item_no": (
                                 str(oi["vendorItemId"]) if oi.get("vendorItemId") is not None else None
                             ),
+                            # 이 라인이 실제로 속한 배송묶음 ID(주문 전체 대표값이 아니라 라인별 실값).
+                            "platform_shipment_box_id": box_id,
                             "quantity": quantity,
                             "unit_price": unit_price,
                             # 자동매칭 참고 정보(주문 API에서는 새 상품을 만들지 않는다).
@@ -365,10 +371,6 @@ class CoupangConnector(BaseMallConnector):
                     "customer_phone": orderer.get("safeNumber"),
                     "total_amount": round(total_amount, 2),
                     "discount_amount": round(discount_amount, 2),
-                    # 첫 배송묶음 ID를 대표값으로 사용한다(분할배송 전 최초 수집 시점 기준).
-                    "platform_shipment_box_id": (
-                        str(first_box["shipmentBoxId"]) if first_box.get("shipmentBoxId") is not None else None
-                    ),
                     "receiver_name": receiver.get("name"),
                     "receiver_phone": receiver.get("safeNumber") or receiver.get("receiverNumber"),
                     "receiver_zipcode": receiver.get("postCode"),

@@ -65,6 +65,31 @@ class TestDisallowedChannelTransitionIsAConflict:
         assert conflicts[0].internal_status == "DELIVERED"
         assert conflicts[0].channel_status == "NEW"
 
+    def test_repeated_detection_of_same_conflict_does_not_duplicate(self, db_session, platform):
+        """같은 채널상태 불일치가 반복 감지돼도(스케줄 재조회 등) 미해소 충돌 행이
+        중복 생성되지 않는다."""
+        order = _make_order(db_session, platform, status="DELIVERED")
+        service = OrderChannelSyncService(db_session)
+
+        service.sync_channel_status(order, "NEW")
+        service.sync_channel_status(order, "NEW")
+        service.sync_channel_status(order, "NEW")
+
+        conflicts = OrderStatusConflictRepository(db_session).list_unresolved(order_id=order.id)
+        assert len(conflicts) == 1
+
+    def test_different_channel_status_creates_a_second_conflict(self, db_session, platform):
+        """중복 방지는 같은 channel_status끼리만 적용된다 - 서로 다른 채널상태 불일치는
+        별개 충돌로 남아야 운영자가 둘 다 확인할 수 있다."""
+        order = _make_order(db_session, platform, status="DELIVERED")
+        service = OrderChannelSyncService(db_session)
+
+        service.sync_channel_status(order, "NEW")
+        service.sync_channel_status(order, "PREPARING")
+
+        conflicts = OrderStatusConflictRepository(db_session).list_unresolved(order_id=order.id)
+        assert len(conflicts) == 2
+
 
 class TestResolveConflict:
     def test_accept_channel_applies_channel_status(self, db_session, platform):

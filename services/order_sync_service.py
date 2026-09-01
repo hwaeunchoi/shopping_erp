@@ -165,11 +165,6 @@ class OrderSyncService:
             order.receiver_address = _clip(raw.get("receiver_address"), 500)
         if order.delivery_message is None and raw.get("delivery_message"):
             order.delivery_message = _clip(raw.get("delivery_message"), 500)
-        # 쿠팡 배송묶음 ID(shipmentBoxId) - 송장 전송(1단계) 시 필요하다. 분할배송으로
-        # 바뀌면 실제로는 새 shipmentBoxId가 생기지만, 이번 단계는 최초 수집값만
-        # 보존한다(전체 분할배송 추적은 후속 단계 범위 - roadmap 참고).
-        if order.platform_shipment_box_id is None and raw.get("platform_shipment_box_id"):
-            order.platform_shipment_box_id = _clip(raw.get("platform_shipment_box_id"), 50)
 
     def _create_order(self, platform_id: int, warehouse_id: int, raw: dict[str, Any]) -> tuple[Order, int, int]:
         customer = self._get_or_create_customer(platform_id, raw)
@@ -190,7 +185,6 @@ class OrderSyncService:
             receiver_zipcode=_clip(raw.get("receiver_zipcode"), 10),
             receiver_address=_clip(raw.get("receiver_address"), 500),
             delivery_message=_clip(raw.get("delivery_message"), 500),
-            platform_shipment_box_id=_clip(raw.get("platform_shipment_box_id"), 50),
         )
         self.session.add(order)
         self.session.flush()
@@ -261,7 +255,13 @@ class OrderSyncService:
                     continue
                 seen_poin_in_batch.add(poin)
                 if poin in existing_by_poin:
-                    continue  # 이미 수집된 상품주문 라인 - 재사용(중복 생성/덮어쓰기 안 함)
+                    # 이미 수집된 상품주문 라인 - 재사용(중복 생성/덮어쓰기 안 함). 다만 배송묶음
+                    # ID(쿠팡)는 최초 수집 시 비어 있었을 수 있으므로(과거 버그로 대표값만
+                    # 저장하던 시절 데이터 등) 값이 없을 때만 보수적으로 채운다.
+                    existing_item = existing_by_poin[poin]
+                    if existing_item.platform_shipment_box_id is None and item.get("platform_shipment_box_id"):
+                        existing_item.platform_shipment_box_id = _clip(item.get("platform_shipment_box_id"), 50)
+                    continue
                 # 새 상품주문번호 -> 별도 라인 생성(같은 SKU라도 상품주문번호가 다르면 별개 라인)
             else:
                 # 상품주문번호 미제공(다른 채널/과거 데이터) -> 기존 SKU 기반 호환 dedup
@@ -280,6 +280,7 @@ class OrderSyncService:
                 order_id=order.id,
                 product_option_id=mapping.product_option_id,
                 platform_order_item_no=poin,
+                platform_shipment_box_id=_clip(item.get("platform_shipment_box_id"), 50),
                 quantity=item["quantity"],
                 unit_price=item["unit_price"],
                 cost_price_snapshot=cost_record.cost_price if cost_record else None,

@@ -7,9 +7,14 @@ services/order_channel_sync_service.py
 (예: 내부는 DELIVERED인데 채널이 NEW라고 하는 경우) 자동으로 어느 한쪽을
 정답으로 덮어쓰지 않고 OrderStatusConflict로 남겨 운영자가 확인하게 한다.
 
-기존 scheduler.order_collect_job은 이 서비스를 아직 사용하지 않는다(운영
-중인 흐름을 이번 1단계에서 변경하지 않기 위한 의도적 범위 제한 - 신규 API
-경로에서만 사용). docs/COMMERCIAL_ERP_ROADMAP.md 참고.
+기존 scheduler.order_collect_job(운영 중인 주문 수집 흐름)은 이 서비스를 사용하지
+않는다(변경하지 않기 위한 의도적 범위 제한). 대신 이 서비스는 다음 두 경로에서
+호출된다(둘 다 additive, order_collect_job과 독립):
+1. scheduler.jobs.channel_status_sync_job - 최근 주문의 채널 상태를 읽기 전용으로
+   재조회해 반영/충돌기록한다.
+2. services.shipment_dispatch_service.ShipmentDispatchService.execute_command -
+   송장 전송이 채널에 성공적으로 접수된 직후, 그 사실 자체를 "SHIPPING" 상태로 반영한다.
+docs/COMMERCIAL_ERP_ROADMAP.md 참고.
 """
 
 from dataclasses import dataclass
@@ -64,14 +69,17 @@ class OrderChannelSyncService:
             self.session.flush()
             return ChannelSyncResult(applied=True, conflict=False, from_status=from_status, to_status=channel_status)
 
-        self.conflict_repo.add(
-            OrderStatusConflict(
-                order_id=order.id,
-                internal_status=from_status,
-                channel_status=channel_status,
-                detected_at=datetime.now(timezone.utc),
+        # 같은 채널상태로 이미 미해소 충돌이 있으면(반복 재조회로 인한 재감지) 중복 행을
+        # 만들지 않는다 - 운영자가 아직 해소하지 않은 동일 충돌은 기존 기록 하나로 충분하다.
+        if self.conflict_repo.get_unresolved_for_status(order.id, channel_status) is None:
+            self.conflict_repo.add(
+                OrderStatusConflict(
+                    order_id=order.id,
+                    internal_status=from_status,
+                    channel_status=channel_status,
+                    detected_at=datetime.now(timezone.utc),
+                )
             )
-        )
         return ChannelSyncResult(applied=False, conflict=True, from_status=from_status, to_status=channel_status)
 
     def resolve_conflict(
