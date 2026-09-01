@@ -624,6 +624,17 @@ export interface ShipmentInfoUpdate {
 
 export const SHIPMENT_STATUSES = ['READY', 'SHIPPING', 'DELIVERED'] as const
 
+// 상용 ERP 확장(1단계) - 채널 상태와 내부 상태가 허용되지 않은 전이로 어긋난 경우의 충돌 기록.
+export interface OrderStatusConflict {
+  id: number
+  order_id: number
+  internal_status: string
+  channel_status: string
+  detected_at: string
+  resolved_at: string | null
+  resolution: string | null
+}
+
 export interface Exchange {
   id: number
   order_id: number

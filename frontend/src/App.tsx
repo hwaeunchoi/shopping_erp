@@ -7,6 +7,7 @@ import { DashboardPage } from './pages/DashboardPage'
 import { OrdersPage } from './pages/OrdersPage'
 import { OrderDetailPage } from './pages/OrderDetailPage'
 import { ShipmentsPage } from './pages/ShipmentsPage'
+import { OrderConflictsPage } from './pages/OrderConflictsPage'
 import { ExchangesPage } from './pages/ExchangesPage'
 import { ReturnsPage } from './pages/ReturnsPage'
 import { CancellationsPage } from './pages/CancellationsPage'
@@ -43,6 +44,7 @@ function App() {
         <Route path="/orders" element={<Protected><OrdersPage /></Protected>} />
         <Route path="/orders/:orderId" element={<Protected><OrderDetailPage /></Protected>} />
         <Route path="/shipments" element={<Protected><ShipmentsPage /></Protected>} />
+        <Route path="/order-conflicts" element={<Protected><OrderConflictsPage /></Protected>} />
         <Route path="/exchanges" element={<Protected><ExchangesPage /></Protected>} />
         <Route path="/returns" element={<Protected><ReturnsPage /></Protected>} />
         <Route path="/cancellations" element={<Protected><CancellationsPage /></Protected>} />

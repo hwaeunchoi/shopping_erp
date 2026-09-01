@@ -32,6 +32,33 @@ export function ShipmentsPage() {
   const [statusDrafts, setStatusDrafts] = useState<Record<number, { status: string; warehouseId: string }>>({})
   const [statusError, setStatusError] = useState<string | null>(null)
 
+  // 상용 ERP 확장(1단계) - 채널(네이버/쿠팡)로 송장 전송. 결과는 shipment.id별로만 보관한다.
+  const [submitResults, setSubmitResults] = useState<Record<number, string>>({})
+  const [submittingId, setSubmittingId] = useState<number | null>(null)
+
+  const handleSubmitToChannel = async (shipmentId: number) => {
+    setSubmittingId(shipmentId)
+    setSubmitResults((prev) => ({ ...prev, [shipmentId]: '' }))
+    try {
+      const result = await api.post<{ command_id: number; status: string; already_processed: boolean }>(
+        `/api/shipments/${shipmentId}/submit`,
+        {},
+      )
+      setSubmitResults((prev) => ({
+        ...prev,
+        [shipmentId]: result.already_processed ? '이미 전송됨(SUCCESS)' : `전송 완료(${result.status})`,
+      }))
+      reload()
+    } catch (err) {
+      setSubmitResults((prev) => ({
+        ...prev,
+        [shipmentId]: err instanceof ApiError ? `실패: ${err.message}` : '전송 중 오류가 발생했습니다.',
+      }))
+    } finally {
+      setSubmittingId(null)
+    }
+  }
+
   const handleCreate = async (e: FormEvent) => {
     e.preventDefault()
     if (!orderId) {
@@ -133,6 +160,7 @@ export function ShipmentsPage() {
                 <th>발송일시</th>
                 <th>배송완료일시</th>
                 <th>상태 변경</th>
+                <th>채널 전송</th>
               </tr>
             </thead>
             <tbody>
@@ -173,11 +201,22 @@ export function ShipmentsPage() {
                         <button type="button" onClick={() => handleStatusChange(s.id)}>변경</button>
                       </div>
                     </td>
+                    <td>
+                      <button
+                        type="button"
+                        disabled={s.status !== 'READY' || submittingId === s.id}
+                        onClick={() => handleSubmitToChannel(s.id)}
+                        title={s.status !== 'READY' ? 'READY 상태의 배송만 전송할 수 있습니다.' : undefined}
+                      >
+                        {submittingId === s.id ? '전송 중...' : '전송'}
+                      </button>
+                      {submitResults[s.id] && <div className="form-hint">{submitResults[s.id]}</div>}
+                    </td>
                   </tr>
                 )
               })}
               {data.items.length === 0 && (
-                <tr><td colSpan={8}>등록된 배송이 없습니다.</td></tr>
+                <tr><td colSpan={9}>등록된 배송이 없습니다.</td></tr>
               )}
             </tbody>
           </table>
