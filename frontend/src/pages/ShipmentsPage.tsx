@@ -32,27 +32,68 @@ export function ShipmentsPage() {
   const [statusDrafts, setStatusDrafts] = useState<Record<number, { status: string; warehouseId: string }>>({})
   const [statusError, setStatusError] = useState<string | null>(null)
 
-  // 상용 ERP 확장(1단계) - 채널(네이버/쿠팡)로 송장 전송. 결과는 shipment.id별로만 보관한다.
+  // 상용 ERP 확장(1단계) - 채널(네이버/쿠팡)로 송장 전송.
+  // POST /submit은 명령만 접수(202)하고 실제 채널 호출은 백그라운드(outbox worker)에서
+  // 일어난다 - 화면은 command 상태를 폴링해 SUCCESS를 직접 확인한 뒤에만 성공으로 표시한다.
+  // submittingId가 설정돼 있는 동안 버튼이 비활성화되어(아래 disabled 참고) 폴링 중
+  // 버튼 연타로 중복 요청이 나가지 않는다(서버도 idempotency_key로 별도 방지).
   const [submitResults, setSubmitResults] = useState<Record<number, string>>({})
   const [submittingId, setSubmittingId] = useState<number | null>(null)
 
+  const POLL_INTERVAL_MS = 2000
+  const POLL_MAX_ATTEMPTS = 30
+
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  const pollCommandStatus = async (shipmentId: number, commandId: number) => {
+    for (let attempt = 0; attempt < POLL_MAX_ATTEMPTS; attempt++) {
+      await sleep(POLL_INTERVAL_MS)
+      try {
+        const command = await api.get<{ status: string; error_code: string | null }>(
+          `/api/shipments/commands/${commandId}`,
+        )
+        if (command.status === 'SUCCESS') {
+          setSubmitResults((prev) => ({ ...prev, [shipmentId]: '전송 완료(SUCCESS)' }))
+          reload()
+          return
+        }
+        if (command.status === 'FAILED') {
+          setSubmitResults((prev) => ({
+            ...prev,
+            [shipmentId]: `전송 실패(${command.error_code ?? 'FAILED'})`,
+          }))
+          return
+        }
+        setSubmitResults((prev) => ({
+          ...prev,
+          [shipmentId]: command.status === 'RETRY_WAIT' ? '재시도 대기 중...' : '전송 처리 중...',
+        }))
+      } catch {
+        // 폴링 중 일시적 오류(네트워크 등)는 무시하고 다음 주기에 다시 확인한다.
+      }
+    }
+    setSubmitResults((prev) => ({ ...prev, [shipmentId]: '처리 확인 시간 초과 - 잠시 후 다시 확인해주세요.' }))
+  }
+
   const handleSubmitToChannel = async (shipmentId: number) => {
     setSubmittingId(shipmentId)
-    setSubmitResults((prev) => ({ ...prev, [shipmentId]: '' }))
+    setSubmitResults((prev) => ({ ...prev, [shipmentId]: '전송 요청 중...' }))
     try {
       const result = await api.post<{ command_id: number; status: string; already_processed: boolean }>(
         `/api/shipments/${shipmentId}/submit`,
         {},
       )
-      setSubmitResults((prev) => ({
-        ...prev,
-        [shipmentId]: result.already_processed ? '이미 전송됨(SUCCESS)' : `전송 완료(${result.status})`,
-      }))
-      reload()
+      if (result.already_processed) {
+        setSubmitResults((prev) => ({ ...prev, [shipmentId]: '이미 전송됨(SUCCESS)' }))
+        reload()
+      } else {
+        setSubmitResults((prev) => ({ ...prev, [shipmentId]: '전송 처리 중...' }))
+        await pollCommandStatus(shipmentId, result.command_id)
+      }
     } catch (err) {
       setSubmitResults((prev) => ({
         ...prev,
-        [shipmentId]: err instanceof ApiError ? `실패: ${err.message}` : '전송 중 오류가 발생했습니다.',
+        [shipmentId]: err instanceof ApiError ? `실패: ${err.message}` : '전송 요청 중 오류가 발생했습니다.',
       }))
     } finally {
       setSubmittingId(null)
