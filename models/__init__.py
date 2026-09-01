@@ -63,7 +63,7 @@ from models.ad import AdCampaign, AdPerformanceDaily  # noqa: F401
 from models.analytics import ProfitLossSummary, ProductPerformanceSummary, KpiTarget  # noqa: F401
 
 # 채널 연동 공통 기반(outbox/충돌) - 상용 ERP 확장(commercial ERP roadmap) 1단계
-from models.integration_sync import ExternalCommand, OrderStatusConflict  # noqa: F401
+from models.integration_sync import ExternalCommand, ExternalCommandLineResult, OrderStatusConflict  # noqa: F401
 
 # 부가기능
 from models.extra import (  # noqa: F401
@@ -137,5 +137,6 @@ __all__ = [
     "AuditLog",
     "AiAnalysisResult",
     "ExternalCommand",
+    "ExternalCommandLineResult",
     "OrderStatusConflict",
 ]

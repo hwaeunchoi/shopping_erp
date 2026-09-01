@@ -16,11 +16,13 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
-from api.deps import get_db, require_permission
+from api.deps import get_current_user, get_db, require_permission
 from models.order import Shipment
+from models.user import User
 from repositories.integration_sync_repository import ExternalCommandRepository
 from repositories.order_repository import OrderRepository, ShipmentRepository
 from services.shipment_dispatch_service import (
+    ShipmentChannelSubmitDisabledError,
     ShipmentDispatchService,
     ShipmentNotReadyError,
     ShipmentPlatformMismatchError,
@@ -236,12 +238,15 @@ class ShipmentSubmitOut(BaseModel):
     responses={
         404: {"description": "배송 정보를 찾을 수 없습니다."},
         400: {"description": "배송이 READY 상태가 아니거나 필수 정보가 없습니다."},
+        503: {"description": "채널 전송 기능이 비활성화(OFF) 상태입니다(실계정 검증 승인 전)."},
     },
 )
 def submit_shipment(shipment_id: int, db: Session = Depends(get_db)) -> ShipmentSubmitOut:
     service = ShipmentDispatchService(db)
     try:
         outcome = service.enqueue(shipment_id)
+    except ShipmentChannelSubmitDisabledError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
     except (ShipmentNotReadyError, ShipmentPlatformMismatchError) as e:
@@ -282,3 +287,41 @@ def get_shipment_submit_command(command_id: int, db: Session = Depends(get_db)) 
     if command is None or command.target_type != "SHIPMENT":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="명령을 찾을 수 없습니다.")
     return ExternalCommandOut.model_validate(command, from_attributes=True)
+
+
+class ResolveUnknownCommandRequest(BaseModel):
+    resolution: Literal["CONFIRMED_NOT_SENT", "CONFIRMED_SUCCESS", "CONFIRMED_FAILED"]
+
+
+@router.post(
+    "/commands/{command_id}/resolve",
+    response_model=ExternalCommandOut,
+    summary="결과 확인 필요(UNKNOWN) 명령 수동 해소",
+    description="채널이 실제로 처리했는지 알 수 없는(UNKNOWN) 명령을, 운영자가 채널을 직접 "
+    "확인한 뒤 해소한다. CONFIRMED_NOT_SENT는 재시도 대상(PENDING)으로 되돌리고, "
+    "CONFIRMED_SUCCESS는 SUCCESS로 확정(중복 전송 없이 성공 후 처리 실행), "
+    "CONFIRMED_FAILED는 FAILED로 확정한다. 해소 이력은 감사로그에 남는다.",
+    responses={
+        404: {"description": "명령을 찾을 수 없습니다."},
+        400: {"description": "UNKNOWN 상태가 아니거나 알 수 없는 해소 방식입니다."},
+    },
+)
+def resolve_unknown_command(
+    command_id: int,
+    payload: ResolveUnknownCommandRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ExternalCommandOut:
+    existing = ExternalCommandRepository(db).get_by_id(command_id)
+    if existing is None or existing.target_type != "SHIPMENT":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="명령을 찾을 수 없습니다.")
+    try:
+        resolved = ShipmentDispatchService(db).resolve_unknown_command(
+            command_id, payload.resolution, resolved_by=current_user.id
+        )
+    except ValueError as e:
+        db.rollback()
+        code = status.HTTP_404_NOT_FOUND if "찾을 수 없습니다" in str(e) else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(status_code=code, detail=str(e)) from e
+    db.commit()
+    return ExternalCommandOut.model_validate(resolved, from_attributes=True)

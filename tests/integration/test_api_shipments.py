@@ -2,11 +2,23 @@
 tests/integration/test_api_shipments.py
 ----------------------------------------------
 api/routers/shipments.py 통합 테스트: CRUD, 상태변경, 필터/페이지네이션, RBAC.
+
+settings.shipment_channel_submit_enabled는 기본 False(실전송 기본 차단)이므로,
+이 파일의 나머지 테스트(채널 전송과 무관한 CRUD/RBAC)에 영향 없이 전체 모듈에서
+켜 둔다 - TestSubmitDisabledByDefault만 자체적으로 다시 꺼서 기본 차단을 검증한다.
 """
 
 from datetime import datetime, timezone
 
+import pytest
+
+from config.settings import settings
 from models.order import Order
+
+
+@pytest.fixture(autouse=True)
+def _enable_channel_submit(monkeypatch):
+    monkeypatch.setattr(settings, "shipment_channel_submit_enabled", True)
 
 
 def _create_order(api_session_factory, seed_data, order_no: str) -> int:
@@ -251,6 +263,91 @@ class TestSubmitCommandStatus:
     def test_requires_authentication(self, client, seed_data):
         resp = client.get("/api/shipments/commands/1")
         assert resp.status_code == 401
+
+
+class TestResolveUnknownCommand:
+    """POST /commands/{command_id}/resolve - UNKNOWN(결과 확인 필요) 명령의 수동 해소.
+
+    UNKNOWN 상태 자체는 서비스 레벨(MockTransport)에서 이미 검증했다 - 여기서는
+    API 계약(200/404/400/RBAC)만 확인하며, UNKNOWN 상태는 enqueue로 만든 PENDING
+    명령을 직접 DB에서 뒤집어 재현한다(이 통합 테스트는 실제 채널 호출을 하지 않는다)."""
+
+    @staticmethod
+    def _make_unknown_command(api_session_factory, command_id: int) -> None:
+        from models.integration_sync import ExternalCommand
+
+        db = api_session_factory()
+        try:
+            command = db.get(ExternalCommand, command_id)
+            command.status = "UNKNOWN"
+            db.commit()
+        finally:
+            db.close()
+
+    def test_confirmed_not_sent_requeues_as_pending(self, client, auth_headers, api_session_factory, seed_data):
+        order_id = _create_order(api_session_factory, seed_data, "SHIP-RESOLVE-1")
+        created = client.post(
+            "/api/shipments",
+            json={"order_id": order_id, "carrier": "CJ_LOGISTICS", "tracking_no": "TRK-RESOLVE-1"},
+            headers=auth_headers,
+        ).json()
+        command_id = client.post(f"/api/shipments/{created['id']}/submit", headers=auth_headers).json()["command_id"]
+        self._make_unknown_command(api_session_factory, command_id)
+
+        resp = client.post(
+            f"/api/shipments/commands/{command_id}/resolve",
+            json={"resolution": "CONFIRMED_NOT_SENT"},
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "PENDING"
+
+    def test_resolving_non_unknown_command_returns_400(self, client, auth_headers, api_session_factory, seed_data):
+        order_id = _create_order(api_session_factory, seed_data, "SHIP-RESOLVE-2")
+        created = client.post(
+            "/api/shipments",
+            json={"order_id": order_id, "carrier": "CJ_LOGISTICS", "tracking_no": "TRK-RESOLVE-2"},
+            headers=auth_headers,
+        ).json()
+        command_id = client.post(f"/api/shipments/{created['id']}/submit", headers=auth_headers).json()["command_id"]
+        # PENDING 그대로 둔다(UNKNOWN 아님).
+
+        resp = client.post(
+            f"/api/shipments/commands/{command_id}/resolve",
+            json={"resolution": "CONFIRMED_SUCCESS"},
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 400
+
+    def test_missing_command_returns_404(self, client, auth_headers):
+        resp = client.post(
+            "/api/shipments/commands/999999/resolve", json={"resolution": "CONFIRMED_SUCCESS"}, headers=auth_headers
+        )
+        assert resp.status_code == 404
+
+    def test_requires_authentication(self, client, seed_data):
+        resp = client.post("/api/shipments/commands/1/resolve", json={"resolution": "CONFIRMED_SUCCESS"})
+        assert resp.status_code == 401
+
+
+class TestSubmitDisabledByDefault:
+    """실전송 기본 차단: 이 클래스는 모듈 autouse 픽스처가 켠 플래그를 다시 꺼서
+    실제 기본값(False) 상태에서 API가 안전하게 차단되는지 확인한다."""
+
+    def test_submit_returns_503_when_disabled(self, client, auth_headers, api_session_factory, seed_data, monkeypatch):
+        monkeypatch.setattr(settings, "shipment_channel_submit_enabled", False)
+        order_id = _create_order(api_session_factory, seed_data, "SHIP-DISABLED-1")
+        created = client.post(
+            "/api/shipments",
+            json={"order_id": order_id, "carrier": "CJ_LOGISTICS", "tracking_no": "TRK-DISABLED-1"},
+            headers=auth_headers,
+        ).json()
+
+        resp = client.post(f"/api/shipments/{created['id']}/submit", headers=auth_headers)
+
+        assert resp.status_code == 503
 
 
 class TestRBAC:

@@ -47,6 +47,17 @@ class Settings(BaseSettings):
     # 휴면 고객 판정 기준(일) - v1.2 고객분석
     dormant_customer_days: int = 90
 
+    # 상용 ERP 확장(1단계) - 실 채널 쓰기(송장 전송)/상태 재조회 기본 차단.
+    # 실계정 검증 승인 전에는 반드시 False로 유지한다(기본값 자체가 False) - 이 값이
+    # False면 ShipmentDispatchService.enqueue()/POST /api/shipments/{id}/submit/
+    # outbox_dispatch_job/channel_status_sync_job이 모두 실제 채널 호출 없이 안전하게
+    # 차단된다. 기존 주문수집(order_collect_job)/네이버 상품동기화(product_sync_job)는
+    # 이 플래그와 무관하게 항상 그대로 동작한다(이번 병합으로 자동 활성화되지 않는다).
+    shipment_channel_submit_enabled: bool = False
+    # 채널 상태 읽기전용 재조회 잡(channel_status_sync_job)의 별도 활성화 스위치 -
+    # 이 잡도 실 채널 API(fetch_orders)를 호출하므로 위 플래그와 별개로 기본 차단한다.
+    channel_status_sync_enabled: bool = False
+
     model_config = SettingsConfigDict(env_file=str(BASE_DIR / ".env"), env_file_encoding="utf-8", extra="ignore")
 
 

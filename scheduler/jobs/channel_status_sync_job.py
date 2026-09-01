@@ -15,12 +15,18 @@ docstring 참고), 이 잡은 완전히 별도로 동작한다:
 order_collect_job과 조회 범위가 겹쳐 채널 호출이 다소 중복되지만(운영 중인
 잡을 건드리지 않기 위한 의도적 트레이드오프), 두 잡의 실행 주기를 다르게 두어
 과도한 중복 호출은 피한다(scheduler.py 참고).
+
+기본 차단: settings.channel_status_sync_enabled가 False(기본값)이면 이 잡은 아무
+것도 하지 않고 즉시 반환한다(세션도 열지 않고 커넥터도 만들지 않는다 - 외부 HTTP
+요청이 0건임을 보장한다). shipment_channel_submit_enabled와는 별개의 스위치다 -
+실계정 검증 승인 후 운영자가 명시적으로 켜야 한다.
 """
 
 import logging
 import uuid
 from datetime import date, timedelta
 
+from config.settings import settings
 from core.database import session_scope
 from integrations.malls import get_mall_connector
 from integrations.malls.errors import (
@@ -49,6 +55,10 @@ def _safe_error_summary(exc: Exception) -> str:
 
 
 def run() -> dict[str, dict]:
+    if not settings.channel_status_sync_enabled:
+        logger.debug("채널 상태 재조회 기능이 비활성화(OFF) 상태라 channel_status_sync_job을 건너뜁니다.")
+        return {"skipped_disabled": {"skipped": "disabled"}}
+
     results: dict[str, dict] = {}
     with session_scope() as db:
         end_date = date.today()

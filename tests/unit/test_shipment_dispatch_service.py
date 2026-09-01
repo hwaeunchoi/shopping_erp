@@ -3,32 +3,58 @@ tests/unit/test_shipment_dispatch_service.py
 --------------------------------------------------
 ShipmentDispatchService: 채널 전송의 idempotency/상태검증/부분성공-실패
 격리/실패시 성공위장 금지/비동기 outbox 실행(enqueue/execute_command 분리)/
-재시도 상태전이/분할배송(부분출고)/배송묶음 ID 라인단위 전달을 가짜(Fake)
-커넥터로 검증한다(네트워크 없음).
+결과 불명(UNKNOWN) 분류/동시실행 방지(claim/lease)/분할배송(부분출고)/배송묶음
+ID 라인단위 전달/기능 기본 OFF를 가짜(Fake) 커넥터로 검증한다(네트워크 없음).
 
 실제 Naver/Coupang 커넥터의 submit_shipment() 자체(HTTP 요청 구성)는
 tests/unit/test_naver_smartstore_connector.py / test_coupang_connector.py의
-MockTransport 테스트에서 별도로 검증한다 - 이 파일은 서비스 계층(outbox/
-idempotency/트랜잭션 격리/재시도/분할배송)만 검증한다.
+MockTransport 테스트에서 별도로 검증한다 - 이 파일은 서비스 계층만 검증한다.
 """
 
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
+from config.settings import settings
 from integrations.malls.base_mall_connector import BaseMallConnector, ShipmentSubmitResult
-from integrations.malls.errors import MarketplaceCapabilityUnsupportedError, MarketplaceExternalAPIError
+from integrations.malls.errors import (
+    MarketplaceCapabilityUnsupportedError,
+    MarketplaceCredentialMissingError,
+    MarketplaceExternalAPIError,
+)
+from models.extra import AuditLog
 from models.order import Order, OrderItem, Shipment, ShipmentItem
 from models.product import Product, ProductOption
 from repositories.integration_sync_repository import ExternalCommandRepository, OrderStatusConflictRepository
 from services.shipment_dispatch_service import (
     MAX_ATTEMPTS,
     ShipmentAlreadyRunningError,
+    ShipmentBoxQuantityAmbiguousError,
+    ShipmentChannelSubmitDisabledError,
     ShipmentDispatchService,
     ShipmentNotReadyError,
     ShipmentPlatformMismatchError,
     ShipmentSubmitRejectedError,
+    _classify_write_outcome,
 )
+
+
+@pytest.fixture(autouse=True)
+def _enable_channel_submit(monkeypatch):
+    """이 파일은 디스패치 로직 자체를 검증하는 것이 목적이므로 기본적으로 기능을 켠다.
+
+    TestFeatureFlagDefaultOff는 자체적으로 다시 False로 덮어써 기본 차단을 검증한다."""
+    monkeypatch.setattr(settings, "shipment_channel_submit_enabled", True)
+
+
+_ERROR_OUTCOMES = {
+    # outcome 이름 -> (reason_code, retryable) - MarketplaceExternalAPIError 재현용.
+    "rate_limited": ("RATE_LIMITED", True),  # SAFE_RETRY: 채널이 명시적으로 "아직 처리 안 함" 응답.
+    "connect_failed": ("CONNECT_FAILED", True),  # SAFE_RETRY: 연결 자체가 성립되지 않음(미전송 확실).
+    "auth_failed": ("AUTH_FAILED", False),  # CONFIRMED_FAILED: 인증 단계에서 확실히 거부.
+    "timeout": ("TIMEOUT", True),  # UNKNOWN: 전송됐는지 알 수 없음.
+    "server_error": ("SERVER_ERROR", True),  # UNKNOWN: 처리 후 응답 실패했을 수 있음.
+}
 
 
 class _FakeConnector(BaseMallConnector):
@@ -66,8 +92,9 @@ class _FakeConnector(BaseMallConnector):
             return ShipmentSubmitResult(accepted=True, platform_result_code="OK")
         if self.outcome == "reject":
             return ShipmentSubmitResult(accepted=False, platform_result_code="FAIL_CODE")
-        if self.outcome == "external_error":
-            raise MarketplaceExternalAPIError("naver_smartstore", "SERVER_ERROR", True, http_status=500)
+        if self.outcome in _ERROR_OUTCOMES:
+            reason, retryable = _ERROR_OUTCOMES[self.outcome]
+            raise MarketplaceExternalAPIError("naver_smartstore", reason, retryable, http_status=500)
         raise AssertionError(f"unknown outcome: {self.outcome}")
 
 
@@ -126,7 +153,7 @@ def _seed_shippable_order(
 
 
 def _seed_multi_item_order(db_session, platform, order_no="MULTI-1", box_ids=(None, None)):
-    """라인 2개짜리 주문 1건 - 분할배송/부분출고 테스트용(라인별 다른 배송묶음 ID 부여 가능)."""
+    """라인 N개짜리 주문 1건 - 분할배송/부분출고 테스트용(라인별 다른 배송묶음 ID 부여 가능)."""
     product = Product(name="테스트 상품", category="테스트", base_price=10000, status="ACTIVE")
     db_session.add(product)
     db_session.flush()
@@ -300,12 +327,60 @@ class TestRejectionIsNotShownAsSuccess:
         assert command.retryable is False
 
 
+class TestClassifyWriteOutcome:
+    """예외 -> {SAFE_RETRY, CONFIRMED_FAILED, UNKNOWN} 분류 자체를 직접 검증한다 -
+    이 매트릭스가 "결과 불명 요청을 자동 재전송하지 않는다"는 원칙의 핵심이다."""
+
+    def test_connect_failed_is_safe_retry(self):
+        assert _classify_write_outcome(MarketplaceExternalAPIError("naver", "CONNECT_FAILED", True)) == "SAFE_RETRY"
+
+    def test_rate_limited_is_safe_retry(self):
+        assert _classify_write_outcome(MarketplaceExternalAPIError("naver", "RATE_LIMITED", True)) == "SAFE_RETRY"
+
+    def test_auth_failed_is_confirmed_failed(self):
+        result = _classify_write_outcome(MarketplaceExternalAPIError("naver", "AUTH_FAILED", False))
+        assert result == "CONFIRMED_FAILED"
+
+    def test_timeout_is_unknown_not_retryable(self):
+        """타임아웃은 채널이 실제로 처리했을 가능성을 배제할 수 없다 - RETRY_WAIT이 아니다."""
+        assert _classify_write_outcome(MarketplaceExternalAPIError("naver", "TIMEOUT", True)) == "UNKNOWN"
+
+    def test_server_error_is_unknown_not_retryable(self):
+        assert _classify_write_outcome(MarketplaceExternalAPIError("naver", "SERVER_ERROR", True)) == "UNKNOWN"
+
+    def test_transport_error_is_unknown(self):
+        assert _classify_write_outcome(MarketplaceExternalAPIError("naver", "TRANSPORT_ERROR", True)) == "UNKNOWN"
+
+    def test_parse_failed_is_unknown_not_failed(self):
+        """응답 파싱 실패는 200 응답을 받은 뒤(외부 성공 후 로컬 확인 실패) 발생한다 -
+        FAILED로 확정하면 안 된다(실제로는 채널이 이미 처리했을 수 있다)."""
+        assert _classify_write_outcome(MarketplaceExternalAPIError("naver", "PARSE_FAILED", False)) == "UNKNOWN"
+
+    def test_bad_response_is_unknown(self):
+        assert _classify_write_outcome(MarketplaceExternalAPIError("naver", "BAD_RESPONSE", False)) == "UNKNOWN"
+
+    def test_explicit_rejection_is_confirmed_failed(self):
+        assert _classify_write_outcome(ShipmentSubmitRejectedError("naver", "DUPLICATE")) == "CONFIRMED_FAILED"
+
+    def test_credential_missing_is_confirmed_failed(self):
+        assert _classify_write_outcome(MarketplaceCredentialMissingError("naver")) == "CONFIRMED_FAILED"
+
+    def test_capability_unsupported_is_confirmed_failed(self):
+        assert _classify_write_outcome(MarketplaceCapabilityUnsupportedError("naver", "shipment_submit")) == (
+            "CONFIRMED_FAILED"
+        )
+
+    def test_unexpected_exception_defaults_to_unknown(self):
+        """분류표에 없는 예상 밖 예외는 안전한 기본값(UNKNOWN)으로 떨어진다."""
+        assert _classify_write_outcome(RuntimeError("boom")) == "UNKNOWN"
+
+
 class TestRetryPolicy:
-    def test_retryable_external_error_goes_to_retry_wait_not_failed(self, db_session, platform):
-        """재시도 가능한 실패는 즉시 FAILED로 확정하지 않고 RETRY_WAIT + next_retry_at을
-        채워 다음 주기의 outbox worker가 다시 시도하게 한다."""
+    def test_safe_retry_error_goes_to_retry_wait_not_failed(self, db_session, platform):
+        """채널이 요청 자체를 받지 못했음이 확실한 실패(SAFE_RETRY)만 자동 재시도(RETRY_WAIT)
+        대상이 된다."""
         _, _, shipment = _seed_shippable_order(db_session, platform)
-        service = ShipmentDispatchService(db_session, connector_factory=_make_factory("external_error"))
+        service = ShipmentDispatchService(db_session, connector_factory=_make_factory("connect_failed"))
 
         before = datetime.now(timezone.utc).replace(tzinfo=None)  # SQLite DateTime은 naive로 왕복된다.
         with pytest.raises(MarketplaceExternalAPIError):
@@ -319,11 +394,38 @@ class TestRetryPolicy:
         assert command.next_retry_at is not None
         assert command.next_retry_at > before
 
+    def test_ambiguous_error_goes_to_unknown_not_retry_wait_or_failed(self, db_session, platform):
+        """timeout처럼 채널이 처리했는지 알 수 없는 실패는 RETRY_WAIT(자동 재전송)도
+        FAILED(확정 실패로 오인)도 아닌 UNKNOWN이어야 한다 - 중복 전송 위험 방지."""
+        _, _, shipment = _seed_shippable_order(db_session, platform)
+        service = ShipmentDispatchService(db_session, connector_factory=_make_factory("timeout"))
+
+        with pytest.raises(MarketplaceExternalAPIError):
+            service.submit(shipment.id)
+
+        command = ExternalCommandRepository(db_session).get_by_idempotency_key(f"SHIPMENT_SUBMIT:{shipment.id}:TRACK-1")
+        assert command is not None
+        assert command.status == "UNKNOWN"
+        assert command.retryable is False
+        assert command.next_retry_at is None  # 자동 재시도 스케줄이 없다.
+
+    def test_unknown_command_is_excluded_from_due_for_execution(self, db_session, platform):
+        """UNKNOWN 명령은 outbox worker의 실행 대상 목록에서 자동으로 빠진다(자동
+        재전송 금지가 실제로 지켜지는지 outbox 조회 레벨에서도 확인)."""
+        _, _, shipment = _seed_shippable_order(db_session, platform)
+        service = ShipmentDispatchService(db_session, connector_factory=_make_factory("timeout"))
+        with pytest.raises(MarketplaceExternalAPIError):
+            service.submit(shipment.id)
+
+        due = ExternalCommandRepository(db_session).list_due_for_execution("SHIPMENT_SUBMIT")
+
+        assert due == []
+
     def test_retries_exhausted_after_max_attempts_marks_failed(self, db_session, platform):
-        """MAX_ATTEMPTS번 연속 재시도 가능한 실패를 거치면 더 이상 재시도하지 않고
+        """SAFE_RETRY 실패를 MAX_ATTEMPTS번 연속 거치면 더 이상 재시도하지 않고
         FAILED로 확정한다(무한 재시도 방지)."""
         _, _, shipment = _seed_shippable_order(db_session, platform)
-        service = ShipmentDispatchService(db_session, connector_factory=_make_factory("external_error"))
+        service = ShipmentDispatchService(db_session, connector_factory=_make_factory("rate_limited"))
         command_id = service.enqueue(shipment.id).command.id
 
         for _ in range(MAX_ATTEMPTS):
@@ -335,38 +437,157 @@ class TestRetryPolicy:
         assert command.attempt_count == MAX_ATTEMPTS
         assert command.status == "FAILED"
 
-    def test_stale_running_is_recovered_to_pending(self, db_session, platform):
-        """RUNNING으로 STALE_RUNNING_TIMEOUT_MINUTES 이상 머물러 있으면(worker가 실행
-        도중 죽었다고 추정) recover_stale_running()이 PENDING으로 되돌려 다음 실행에서
-        다시 시도되게 한다."""
+    def test_stale_running_is_recovered_to_unknown_not_pending(self, db_session, platform):
+        """RUNNING으로 STALE_RUNNING_TIMEOUT_MINUTES 이상 머물러 있으면(worker 프로세스가
+        실행 도중 죽었다고 추정) recover_stale_running()이 PENDING이 아니라 UNKNOWN으로
+        회수한다 - 채널에 실제로 도달했는지 알 수 없는 채로 자동 재전송하면 안 된다."""
         _, _, shipment = _seed_shippable_order(db_session, platform)
         service = ShipmentDispatchService(db_session, connector_factory=_make_factory("accept"))
         command_id = service.enqueue(shipment.id).command.id
-        command = ExternalCommandRepository(db_session).get_by_id(command_id)
+        repo = ExternalCommandRepository(db_session)
+        assert repo.claim(command_id, "dead-worker-lease") is True
+        command = repo.get_by_id(command_id)
         assert command is not None
-        command.status = "RUNNING"
-        db_session.flush()
         command.updated_at = datetime.now(timezone.utc) - timedelta(minutes=30)
         db_session.flush()
 
         recovered = service.recover_stale_running("SHIPMENT_SUBMIT")
 
         assert recovered == 1
-        assert command.status == "PENDING"
+        assert command.status == "UNKNOWN"
+        assert command.lease_token is None
 
     def test_fresh_running_is_not_recovered(self, db_session, platform):
         _, _, shipment = _seed_shippable_order(db_session, platform)
         service = ShipmentDispatchService(db_session, connector_factory=_make_factory("accept"))
         command_id = service.enqueue(shipment.id).command.id
-        command = ExternalCommandRepository(db_session).get_by_id(command_id)
+        repo = ExternalCommandRepository(db_session)
+        assert repo.claim(command_id, "fresh-lease") is True
+        command = repo.get_by_id(command_id)
         assert command is not None
-        command.status = "RUNNING"
-        db_session.flush()
 
         recovered = service.recover_stale_running("SHIPMENT_SUBMIT")
 
         assert recovered == 0
         assert command.status == "RUNNING"
+
+    def test_dead_worker_late_finalize_does_not_clobber_recovered_state(self, db_session, platform):
+        """외부 전송 중 프로세스가 종료되는 경우: RUNNING을 UNKNOWN으로 회수한 뒤,
+        원래 "죽었다"고 판단됐던 worker가 사실 아직 살아있어 뒤늦게 자신의 예전
+        lease_token으로 결과를 쓰려 해도 무시돼야 한다(소유권 검증)."""
+        _, _, shipment = _seed_shippable_order(db_session, platform)
+        service = ShipmentDispatchService(db_session, connector_factory=_make_factory("accept"))
+        command_id = service.enqueue(shipment.id).command.id
+        repo = ExternalCommandRepository(db_session)
+        repo.claim(command_id, "dead-worker-lease")
+        command = repo.get_by_id(command_id)
+        assert command is not None
+        command.updated_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+        db_session.flush()
+        service.recover_stale_running("SHIPMENT_SUBMIT")
+        assert command.status == "UNKNOWN"
+
+        ok = repo.try_transition(command_id, "dead-worker-lease", status="SUCCESS")
+
+        assert ok is False
+        assert command.status == "UNKNOWN"  # 덮어써지지 않았다.
+
+
+class TestConcurrentWorkerClaim:
+    """worker 두 개가 같은 명령을 동시에 실행하지 못하도록 하는 원자적 claim을 검증한다."""
+
+    def test_only_one_of_two_claims_succeeds(self, db_session, platform):
+        _, _, shipment = _seed_shippable_order(db_session, platform)
+        service = ShipmentDispatchService(db_session, connector_factory=_make_factory("accept"))
+        command_id = service.enqueue(shipment.id).command.id
+        repo = ExternalCommandRepository(db_session)
+
+        claimed_by_worker_a = repo.claim(command_id, "lease-A")
+        claimed_by_worker_b = repo.claim(command_id, "lease-B")
+
+        assert claimed_by_worker_a is True
+        assert claimed_by_worker_b is False
+        command = repo.get_by_id(command_id)
+        assert command is not None
+        assert command.status == "RUNNING"
+        assert command.lease_token == "lease-A"  # 두 번째 worker가 덮어쓰지 못했다.
+
+    def test_execute_command_raises_when_another_worker_already_claimed(self, db_session, platform):
+        """이미 다른 worker가 claim한(RUNNING) 명령에 대해 execute_command()를 호출하면
+        겹쳐 실행하지 않고 즉시 거부해야 한다 - 커넥터는 호출되지 않는다."""
+        _, _, shipment = _seed_shippable_order(db_session, platform)
+        factory = _make_factory("accept")
+        service = ShipmentDispatchService(db_session, connector_factory=factory)
+        command_id = service.enqueue(shipment.id).command.id
+        ExternalCommandRepository(db_session).claim(command_id, "other-worker-lease")
+
+        with pytest.raises(ShipmentAlreadyRunningError):
+            service.execute_command(command_id)
+
+        assert factory.connector.calls == []
+
+
+class TestResolveUnknownCommand:
+    def _make_unknown_command(self, db_session, platform):
+        _, _, shipment = _seed_shippable_order(db_session, platform)
+        service = ShipmentDispatchService(db_session, connector_factory=_make_factory("timeout"))
+        command_id = service.enqueue(shipment.id).command.id
+        with pytest.raises(MarketplaceExternalAPIError):
+            service.execute_command(command_id)
+        command = ExternalCommandRepository(db_session).get_by_id(command_id)
+        assert command is not None
+        assert command.status == "UNKNOWN"
+        return service, command_id
+
+    def test_confirmed_not_sent_requeues_as_pending(self, db_session, platform):
+        service, command_id = self._make_unknown_command(db_session, platform)
+
+        resolved = service.resolve_unknown_command(command_id, "CONFIRMED_NOT_SENT")
+
+        assert resolved.status == "PENDING"
+        assert resolved.next_retry_at is None
+
+    def test_confirmed_success_marks_success_without_resending(self, db_session, platform):
+        service, command_id = self._make_unknown_command(db_session, platform)
+        factory = service.connector_factory
+        calls_before = len(factory.connector.calls)
+
+        resolved = service.resolve_unknown_command(command_id, "CONFIRMED_SUCCESS")
+
+        assert resolved.status == "SUCCESS"
+        assert resolved.completed_at is not None
+        assert len(factory.connector.calls) == calls_before  # 채널을 다시 호출하지 않았다.
+
+    def test_confirmed_failed_marks_failed(self, db_session, platform):
+        service, command_id = self._make_unknown_command(db_session, platform)
+
+        resolved = service.resolve_unknown_command(command_id, "CONFIRMED_FAILED")
+
+        assert resolved.status == "FAILED"
+        assert resolved.retryable is False
+
+    def test_cannot_resolve_non_unknown_command(self, db_session, platform):
+        _, _, shipment = _seed_shippable_order(db_session, platform)
+        service = ShipmentDispatchService(db_session, connector_factory=_make_factory("accept"))
+        command_id = service.enqueue(shipment.id).command.id  # PENDING, UNKNOWN 아님.
+
+        with pytest.raises(ValueError):
+            service.resolve_unknown_command(command_id, "CONFIRMED_SUCCESS")
+
+    def test_unknown_resolution_value_rejected(self, db_session, platform):
+        service, command_id = self._make_unknown_command(db_session, platform)
+
+        with pytest.raises(ValueError):
+            service.resolve_unknown_command(command_id, "SOMETHING_ELSE")
+
+    def test_records_audit_log(self, db_session, platform):
+        service, command_id = self._make_unknown_command(db_session, platform)
+
+        service.resolve_unknown_command(command_id, "CONFIRMED_FAILED", resolved_by=None)
+
+        logs = db_session.query(AuditLog).filter_by(entity_type="EXTERNAL_COMMAND", entity_id=command_id).all()
+        assert len(logs) == 1
+        assert logs[0].command == "shipment_command.resolve_unknown"
 
 
 class TestUnsupportedCapabilityNeverReturnsSuccess:
@@ -551,6 +772,123 @@ class TestSplitShipmentAndPartialFulfillment:
         sent_ids = {c[0] for c in factory.connector.calls}
         assert sent_ids == {"WHOLE-1-LINE1", "WHOLE-1-LINE2"}
 
+    def test_partial_success_skips_already_succeeded_line_on_retry(self, db_session, naver_platform):
+        """여러 라인을 전송하다 일부만 성공하면(라인1 성공, 라인2 거부) 성공한 라인은
+        기록되고, 이후 재시도(운영자가 명령을 PENDING으로 되돌려 재실행)에서 라인1은
+        다시 전송하지 않는다(중복 전송 방지)."""
+        order, (item1, item2) = _seed_multi_item_order(db_session, naver_platform, order_no="PARTIAL-1")
+        shipment = Shipment(carrier="CJ_LOGISTICS", tracking_no="TRACK-PARTIAL-1", status="READY")
+        db_session.add(shipment)
+        db_session.flush()
+        db_session.add(ShipmentItem(shipment_id=shipment.id, order_id=order.id, order_item_id=None))
+        db_session.flush()
+
+        class _FirstLineOkSecondRejectedThenAccepted(_FakeConnector):
+            def __init__(self):
+                super().__init__()
+                self.line2_attempts = 0
+
+            def submit_shipment(self, platform_order_item_no, *a, **k):
+                self.calls.append((platform_order_item_no, None, None, None))
+                if platform_order_item_no == "PARTIAL-1-LINE2":
+                    self.line2_attempts += 1
+                    if self.line2_attempts == 1:
+                        return ShipmentSubmitResult(accepted=False, platform_result_code="FAIL_CODE")
+                return ShipmentSubmitResult(accepted=True, platform_result_code="OK")
+
+        conn = _FirstLineOkSecondRejectedThenAccepted()
+
+        def factory(connector_class, session, platform_id):
+            return conn
+
+        service = ShipmentDispatchService(db_session, connector_factory=factory)
+        command_id = service.enqueue(shipment.id).command.id
+
+        with pytest.raises(ShipmentSubmitRejectedError):
+            service.execute_command(command_id)
+        assert [c[0] for c in conn.calls] == ["PARTIAL-1-LINE1", "PARTIAL-1-LINE2"]
+
+        # 운영자가 원인을 확인하고 다시 실행한다(같은 command_id) - 이미 성공한 라인1은
+        # 다시 전송되지 않고, 라인2만 재시도된다(이번에는 채널이 수락).
+        command = ExternalCommandRepository(db_session).get_by_id(command_id)
+        assert command is not None
+        command.status = "PENDING"
+        db_session.flush()
+
+        outcome = service.execute_command(command_id)
+
+        assert outcome.command.status == "SUCCESS"
+        assert [c[0] for c in conn.calls] == ["PARTIAL-1-LINE1", "PARTIAL-1-LINE2", "PARTIAL-1-LINE2"]
+
+
+class TestBoxQuantityAmbiguousIsBlocked:
+    def test_partial_quantity_on_box_tracked_item_is_blocked(self, db_session, platform):
+        """쿠팡처럼 배송묶음(box) ID로만 추적되는 라인은 부분 수량 발송을 표현할 수
+        없다 - 추측 대신 명시적으로 차단해야 한다(전송 자체가 일어나지 않아야 함)."""
+        order, (item,) = _seed_multi_item_order(db_session, platform, order_no="PARTIAL-BOX", box_ids=("BOX-X",))
+        item.quantity = 5
+        db_session.flush()
+        shipment = Shipment(carrier="CJ_LOGISTICS", tracking_no="TRACK-PARTIAL-BOX", status="READY")
+        db_session.add(shipment)
+        db_session.flush()
+        db_session.add(ShipmentItem(shipment_id=shipment.id, order_id=order.id, order_item_id=item.id, quantity=2))
+        db_session.flush()
+        factory = _make_factory("accept")
+        service = ShipmentDispatchService(db_session, connector_factory=factory)
+
+        with pytest.raises(ShipmentBoxQuantityAmbiguousError):
+            service.submit(shipment.id)
+
+        assert factory.connector.calls == []  # 채널에 전송 자체가 나가지 않았다.
+        command = ExternalCommandRepository(db_session).get_by_idempotency_key(
+            f"SHIPMENT_SUBMIT:{shipment.id}:TRACK-PARTIAL-BOX"
+        )
+        assert command is not None
+        assert command.status == "FAILED"  # 데이터 모델 한계로 명시적 차단 - 확실히 미전송.
+
+    def test_partial_quantity_without_box_id_is_allowed(self, db_session, naver_platform):
+        """배송묶음 개념이 없는 채널(네이버)은 부분 수량이어도 문제없이 전송된다."""
+        order, (item,) = _seed_multi_item_order(db_session, naver_platform, order_no="PARTIAL-NOBOX", box_ids=(None,))
+        item.quantity = 5
+        db_session.flush()
+        shipment = Shipment(carrier="CJ_LOGISTICS", tracking_no="TRACK-PARTIAL-NOBOX", status="READY")
+        db_session.add(shipment)
+        db_session.flush()
+        db_session.add(ShipmentItem(shipment_id=shipment.id, order_id=order.id, order_item_id=item.id, quantity=2))
+        db_session.flush()
+        factory = _make_factory("accept")
+        service = ShipmentDispatchService(db_session, connector_factory=factory)
+
+        outcome = service.submit(shipment.id)
+
+        assert outcome.command.status == "SUCCESS"
+        assert len(factory.connector.calls) == 1
+
+
+class TestOrderFullyDispatchedAggregate:
+    def test_order_stays_not_shipping_until_all_split_quantity_confirmed(self, db_session, naver_platform):
+        """같은 OrderItem 수량이 여러 Shipment로 나뉘는 경우 - 일부 수량만 발송됐으면
+        주문 전체를 SHIPPING으로 전환하지 않고, 전체 수량이 이행돼야 전환한다."""
+        order, (item,) = _seed_multi_item_order(db_session, naver_platform, order_no="QTY-SPLIT", box_ids=(None,))
+        item.quantity = 5
+        db_session.flush()
+        shipment1 = Shipment(carrier="CJ_LOGISTICS", tracking_no="TRACK-QTY-1", status="READY")
+        shipment2 = Shipment(carrier="CJ_LOGISTICS", tracking_no="TRACK-QTY-2", status="READY")
+        db_session.add_all([shipment1, shipment2])
+        db_session.flush()
+        db_session.add(ShipmentItem(shipment_id=shipment1.id, order_id=order.id, order_item_id=item.id, quantity=2))
+        db_session.add(ShipmentItem(shipment_id=shipment2.id, order_id=order.id, order_item_id=item.id, quantity=3))
+        db_session.flush()
+
+        factory = _make_factory("accept")
+        service = ShipmentDispatchService(db_session, connector_factory=factory)
+
+        service.submit(shipment1.id)
+        assert order.status != "SHIPPING"  # 2/5만 발송됨 - 아직 전체 이행 아님(부분출고 상태 유지).
+
+        service.submit(shipment2.id)
+        assert order.status == "SHIPPING"  # 2+3=5, 전체 이행 완료.
+
 
 class TestChannelStatusSyncAfterSuccess:
     def test_successful_submit_applies_shipping_status_via_state_machine(self, db_session, platform):
@@ -589,3 +927,32 @@ class TestChannelStatusSyncAfterSuccess:
         repo = OrderStatusConflictRepository(db_session)
         all_unresolved = repo.list_unresolved(order_id=order.id)
         assert len(all_unresolved) == 1
+
+
+class TestFeatureFlagDefaultOff:
+    """실전송 기본 차단: settings.shipment_channel_submit_enabled가 False이면 enqueue()
+    자체가 즉시 차단되고, PENDING 명령도 만들어지지 않으며, 커넥터는 전혀 호출되지 않는다."""
+
+    def test_enqueue_blocked_when_disabled(self, db_session, platform, monkeypatch):
+        monkeypatch.setattr(settings, "shipment_channel_submit_enabled", False)
+        _, _, shipment = _seed_shippable_order(db_session, platform)
+        factory = _make_factory("accept")
+        service = ShipmentDispatchService(db_session, connector_factory=factory)
+
+        with pytest.raises(ShipmentChannelSubmitDisabledError):
+            service.enqueue(shipment.id)
+
+        assert factory.connector.calls == []
+        command = ExternalCommandRepository(db_session).get_by_idempotency_key(f"SHIPMENT_SUBMIT:{shipment.id}:TRACK-1")
+        assert command is None  # PENDING 명령 자체가 생성되지 않는다.
+
+    def test_submit_convenience_also_blocked(self, db_session, platform, monkeypatch):
+        monkeypatch.setattr(settings, "shipment_channel_submit_enabled", False)
+        _, _, shipment = _seed_shippable_order(db_session, platform)
+        factory = _make_factory("accept")
+        service = ShipmentDispatchService(db_session, connector_factory=factory)
+
+        with pytest.raises(ShipmentChannelSubmitDisabledError):
+            service.submit(shipment.id)
+
+        assert factory.connector.calls == []

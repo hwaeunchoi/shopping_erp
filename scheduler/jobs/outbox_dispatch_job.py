@@ -8,14 +8,22 @@ API(POST /api/shipments/{id}/submit)는 더 이상 채널 HTTP 호출을 API 요
 202를 반환한다(외부 API 지연이 API 응답시간에 전가되지 않도록). 실제 채널
 호출은 이 잡이 주기적으로 수행한다.
 
+기본 차단: settings.shipment_channel_submit_enabled가 False(기본값)이면 이 잡은
+아무 것도 하지 않고 즉시 반환한다(stale RUNNING 회수도, due 명령 조회도, 커넥터
+생성도 하지 않는다 - 외부 HTTP 요청이 0건임을 보장한다). 실계정 검증 승인 후
+운영자가 명시적으로 켜야 한다.
+
 순서:
-1. recover_stale_running() - RUNNING으로 너무 오래 머물러 있는(worker가
-   실행 도중 죽었다고 추정되는) 명령을 먼저 PENDING으로 회수한다.
+1. recover_stale_running() - RUNNING으로 너무 오래 머물러 있는(worker가 실행 도중
+   죽었다고 추정되는) 명령을 UNKNOWN으로 회수한다(PENDING이 아니다 - 채널에 실제로
+   도달했는지 알 수 없는 채로 자동 재전송하면 안 된다. services.shipment_dispatch_service
+   모듈 docstring 참고).
 2. PENDING + (RETRY_WAIT이고 next_retry_at이 지난) 명령을 모아 하나씩
-   execute_command()로 실행한다.
+   execute_command()로 실행한다(claim()으로 원자적으로 선점 - 두 worker 인스턴스가
+   동시에 이 잡을 실행해도 같은 명령을 중복 실행하지 않는다).
 
 한 명령의 실패가 다른 명령 처리를 막지 않도록 명령별로 커밋한다 - 실패해도
-execute_command() 내부에서 이미 FAILED/RETRY_WAIT으로 세션에 반영해 두므로,
+execute_command() 내부에서 이미 FAILED/RETRY_WAIT/UNKNOWN으로 세션에 반영해 두므로,
 그 상태 변화까지 그대로 커밋한다(롤백하면 outbox 이력 자체가 사라져 "저장만
 되고 방치" 상태를 재현하게 된다).
 
@@ -26,6 +34,7 @@ Naver/Coupang 커넥터)를 통해 나간다 - 테스트는 MockTransport로만 
 
 import logging
 
+from config.settings import settings
 from core.database import session_scope
 from repositories.integration_sync_repository import ExternalCommandRepository
 from services.shipment_dispatch_service import ShipmentAlreadyRunningError, ShipmentDispatchService
@@ -36,8 +45,12 @@ COMMAND_TYPE = "SHIPMENT_SUBMIT"
 
 
 def run() -> dict[str, int]:
+    if not settings.shipment_channel_submit_enabled:
+        logger.debug("채널 전송 기능이 비활성화(OFF) 상태라 outbox_dispatch_job을 건너뜁니다.")
+        return {"skipped_disabled": 1}
+
     recovered = 0
-    executed = succeeded = retry_wait = failed = 0
+    executed = succeeded = retry_wait = failed = unknown = 0
     due_ids: list[int] = []
 
     with session_scope() as db:
@@ -55,12 +68,12 @@ def run() -> dict[str, int]:
                     succeeded += 1
                 db.commit()
             except ShipmentAlreadyRunningError:
-                # 다른 worker가 동시에 처리 중 - 이 회차에서는 건너뛴다(다음 주기에 재확인).
+                # 다른 worker가 동시에 처리 중(claim 실패) - 이 회차에서는 건너뛴다.
                 db.rollback()
                 continue
             except Exception as e:  # noqa: BLE001 - 한 명령의 실패가 다른 명령을 막지 않는다.
-                # execute_command()가 이미 FAILED/RETRY_WAIT을 세션에 반영해 두었다 -
-                # 그 상태 변화를 그대로 커밋한다(위 docstring 참고).
+                # execute_command()가 이미 FAILED/RETRY_WAIT/UNKNOWN을 세션에 반영해
+                # 두었다 - 그 상태 변화를 그대로 커밋한다(위 docstring 참고).
                 executed += 1
                 db.commit()
                 command = ExternalCommandRepository(db).get_by_id(command_id)
@@ -69,6 +82,8 @@ def run() -> dict[str, int]:
                         retry_wait += 1
                     elif command.status == "FAILED":
                         failed += 1
+                    elif command.status == "UNKNOWN":
+                        unknown += 1
                 logger.info("outbox 명령 실행 실패(안전 기록됨): command_id=%s, %s", command_id, type(e).__name__)
 
     return {
@@ -78,4 +93,5 @@ def run() -> dict[str, int]:
         "succeeded": succeeded,
         "retry_wait": retry_wait,
         "failed": failed,
+        "unknown": unknown,
     }

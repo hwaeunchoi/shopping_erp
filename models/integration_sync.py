@@ -12,23 +12,43 @@ ExternalCommand는 "네이버에 송장을 보낸다"처럼 실패할 수 있고
 idempotency_key는 호출부가 결정론적으로 만든다(예: f"SHIPMENT_SUBMIT:{shipment_id}:
 {tracking_no}") - 같은 키로 다시 요청이 들어오면 새 외부 호출을 만들지 않고
 기존 레코드를 재사용한다(동일 송장 재전송 시 중복 API 호출 방지).
+
+결과 불명(UNKNOWN) 처리(1단계 완결 검토 반영): timeout/연결 중 끊김/응답 파싱 실패처럼
+"채널이 실제로 처리했는지 알 수 없는" 실패는 RETRY_WAIT으로 자동 재시도하지 않고
+UNKNOWN으로 분리한다 - 채널의 공식 멱등성 보장이 확인되지 않은 상태에서 자동
+재전송하면 채널이 이미 처리한 요청을 중복 전송할 위험이 있다(services.
+shipment_dispatch_service._classify_write_outcome 참고). UNKNOWN은 운영자가 채널을
+직접 확인해 resolve_unknown_command()로 해소해야 벗어날 수 있다.
+
+동시 실행 방지(lease): lease_token은 워커가 이 명령을 RUNNING으로 원자적으로 선점
+(claim)할 때 발급하는 소유권 토큰이다 - claim/최종상태 반영 모두 "lease_token이
+아직 내 것일 때만" DB에서 원자적으로 UPDATE하도록 구현해(ExternalCommandRepository.
+claim/try_transition) 두 worker가 같은 명령을 동시에 실행하거나, 소유권을 잃은
+worker가 뒤늦게 다른 worker의 결과를 덮어쓰는 것을 막는다. 로컬 idempotency_key는
+"같은 요청을 두 번 만들지 않는다"는 보장일 뿐, 채널 쪽의 exactly-once 실행을
+보장하지 않는다(실계정 검증 전 필요 조건 참고).
 """
 
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from models.base import Base, TimestampMixin
 
 # PENDING: 생성됨, 아직 실행 안 함
-# RUNNING: 실행 중(짧게 유지 - 프로세스 크래시 시 복구 로직은 후속 단계)
+# RUNNING: 실행 중(RUNNING인 채 오래 멈춰있으면 UNKNOWN으로 회수 - PENDING으로 되돌리지
+#          않는다. 채널에 실제로 도달했는지 알 수 없는 채로 자동 재전송하면 안 되기 때문)
 # SUCCESS: 채널이 성공을 확인함
-# FAILED: 실패, retryable=False면 재시도 대상 아님
-# RETRY_WAIT: 실패했고 retryable=True, next_retry_at까지 대기
+# FAILED: 채널에 반영되지 않았음이 확실한 실패(자격증명 없음/미지원/채널의 명시적 거부/
+#         재시도 소진). retryable=False.
+# RETRY_WAIT: 채널이 아직 처리하지 않았음이 확실한 실패(예: 429/연결 자체 미성립)로
+#             재시도 대기 중(next_retry_at까지) - "확실히 미처리"인 경우만 여기로 온다.
+# UNKNOWN: 채널이 처리했는지 확인할 수 없는 실패(timeout/전송 중 오류/응답 파싱 실패/
+#          worker 크래시로 인한 RUNNING 회수) - 자동 재시도 금지, 운영자 확인 필요.
 # CANCELLED: 사용자가 취소함(재시도 포기)
-EXTERNAL_COMMAND_STATUSES = ("PENDING", "RUNNING", "SUCCESS", "FAILED", "RETRY_WAIT", "CANCELLED")
+EXTERNAL_COMMAND_STATUSES = ("PENDING", "RUNNING", "SUCCESS", "FAILED", "RETRY_WAIT", "UNKNOWN", "CANCELLED")
 
 
 class ExternalCommand(Base, TimestampMixin):
@@ -62,6 +82,34 @@ class ExternalCommand(Base, TimestampMixin):
     response_summary: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     trace_id: Mapped[str] = mapped_column(String(36), nullable=False)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # 소유권(lease) 토큰 - claim() 성공 시 발급, 최종상태 반영은 이 값이 일치할 때만
+    # 허용된다(모듈 docstring "동시 실행 방지" 참고). NULL이면 아무도 선점하지 않은 상태.
+    lease_token: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+
+
+class ExternalCommandLineResult(Base, TimestampMixin):
+    """ExternalCommand 하나가 여러 라인(OrderItem)을 전송할 때, 라인별 성공/실패를
+    기록한다 - 부분성공(일부 라인만 성공) 시 이미 성공한 라인은 재시도에서 제외하기
+    위한 근거 테이블이다(services.shipment_dispatch_service._dispatch_all_lines 참고).
+
+    quantity는 이 라인 결과가 커버하는 발송 수량이다(주문 전체 배송이면 OrderItem.
+    quantity 전체, 부분출고 배송이면 ShipmentItem.quantity) - 주문의 전체 이행 여부를
+    "라인 존재"가 아니라 "발송 수량 합계 >= 주문 수량"으로 집계하기 위해 필요하다
+    (같은 OrderItem이 여러 Shipment로 나뉘어 부분 발송되는 경우 대응).
+    """
+
+    __tablename__ = "external_command_line_results"
+    __table_args__ = (
+        UniqueConstraint("command_id", "order_item_id", name="uq_command_line_result"),
+        Index("idx_command_line_results_order_item", "order_item_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    command_id: Mapped[int] = mapped_column(ForeignKey("external_commands.id"), nullable=False)
+    order_item_id: Mapped[int] = mapped_column(ForeignKey("order_items.id"), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)  # SUCCESS / FAILED
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    result_code: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
 
 class OrderStatusConflict(Base, TimestampMixin):
