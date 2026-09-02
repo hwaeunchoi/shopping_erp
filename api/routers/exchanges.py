@@ -37,6 +37,11 @@ class ExchangeOut(BaseModel):
     status: str
     requested_at: datetime
     completed_at: Optional[datetime]
+    platform_claim_id: Optional[str] = None
+    raw_status: Optional[str] = None
+    fault_type: Optional[str] = None
+    quantity: Optional[int] = None
+    shipping_fee: Optional[float] = None
 
 
 class ExchangeListOut(BaseModel):

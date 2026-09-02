@@ -64,12 +64,26 @@ class TestBaseClaimMethodsFailClosed:
             _MinimalConnector().fetch_exchanges(date(2026, 1, 1), date(2026, 1, 2))
 
 
-class TestRealConnectorsClaimsDisabled:
-    def test_naver_and_coupang_claim_capabilities_all_false(self):
-        from integrations.malls.coupang_connector import CoupangConnector
+class TestRealConnectorsClaimCapabilitiesMatchConfirmedContract:
+    """상용 ERP 확장(2단계): 공식 문서로 확인된 API만 capability=True로 켠다.
+
+    - Naver: 클레임 일괄조회 API가 확인되지 않아 전부 False 유지.
+    - Coupang: returnRequests(v6)/exchangeRequests(v4)는 확인됨 -> True.
+      cancellations는 cancelType=CANCEL 조회 시 orderId가 필수가 되어(status
+      파라미터를 쓸 수 없음) 날짜range 일괄조회가 불가능함을 확인 -> False 유지
+      (integrations/malls/coupang_connector.py 상단 주석의 2026-09 조회 근거 참고).
+    """
+
+    def test_naver_claim_capabilities_all_false(self):
         from integrations.malls.naver_smartstore_connector import NaverSmartstoreConnector
 
-        for cls in (NaverSmartstoreConnector, CoupangConnector):
-            assert cls.supports_cancellation_sync is False
-            assert cls.supports_return_sync is False
-            assert cls.supports_exchange_sync is False
+        assert NaverSmartstoreConnector.supports_cancellation_sync is False
+        assert NaverSmartstoreConnector.supports_return_sync is False
+        assert NaverSmartstoreConnector.supports_exchange_sync is False
+
+    def test_coupang_claim_capabilities_per_confirmed_contract(self):
+        from integrations.malls.coupang_connector import CoupangConnector
+
+        assert CoupangConnector.supports_cancellation_sync is False
+        assert CoupangConnector.supports_return_sync is True
+        assert CoupangConnector.supports_exchange_sync is True

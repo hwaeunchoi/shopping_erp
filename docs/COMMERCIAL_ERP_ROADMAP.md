@@ -2,7 +2,17 @@
 
 이 문서는 `shopping_erp`를 다채널 상용 ERP 수준으로 확장하기 위한 6단계 로드맵과,
 각 단계의 완료 기준·채널별 지원 현황(Capability Matrix)을 정리한다.
-브랜치 `feature/commercial-erp-stage1-shipment-sync`에서 1단계를 구현했다.
+
+- **1단계**(`feature/commercial-erp-stage1-shipment-sync`): 구현·격리 검증
+  완료(pytest/Ruff/MyPy, 격리 PostgreSQL, 클린 워크트리 재검증). **운영 실전송은
+  비활성**(`shipment_channel_submit_enabled`/`channel_status_sync_enabled` 모두 기본
+  False) - 활성화 전 필요 조건은 "실전송 활성화 체크리스트" 참고.
+- **2단계**(`feature/commercial-erp-stage2-claims-settlements`, 1단계 완료 커밋
+  `d25ea73`에서 분기): 취소/반품/교환/정산 "수집·상태 갱신·금액 대사·조회 UI"
+  구현·격리 검증 완료. **승인/거부/환불실행/반품완료처리/교환재발송 등 채널
+  상태를 실제로 바꾸는 조치는 이번 단계에 없음** - 아래 "2-B단계"로 분리.
+  운영 자동/수동 수집 모두 신규 플래그 `claims_settlement_sync_enabled`(기본
+  False)로 차단.
 
 ## 공통 원칙 (모든 단계에 적용)
 
@@ -63,17 +73,44 @@
     stale RUNNING 회수 테스트)
   - 실계정 검증은 별도 단계(아래 "실계정 검증 전 필요 조건" 참고, 아직 미충족).
 
-### 2단계 - 취소/반품/교환/정산 채널 연동
+### 2단계 - 취소/반품/교환/정산 채널 연동 (구현·격리 검증 완료)
 
-- **범위**: 이미 존재하는 내부 취소/반품/교환/정산 모델을, 각 채널의 공식
-  취소/반품/교환/정산 API(조회 및 승인/거부 처리)와 연동. 채널에서 발생한
-  취소/반품 요청을 수집해 내부 워크플로우로 유입시키는 것을 포함.
-- **의존성**: 1단계의 outbox/상태전이/충돌 처리 패턴을 그대로 재사용.
-  `BaseMallConnector`에 `supports_cancellation_sync`류 캐패빌리티 플래그를
-  이미 정의해 둔 것을 채운다.
-- **완료 기준**: 채널별 취소/반품/교환 API 스펙을 공식 문서로 확인 후 MockTransport
-  계약 테스트 통과, 상태 충돌 시 자동 덮어쓰기 금지, 정산 데이터는 기존
-  `fetch_settlements()` 캐패빌리티를 실제 스케줄 작업으로 연결.
+- **범위**: 이미 존재하는 내부 취소/반품/교환/정산 모델을 각 채널의 공식
+  조회 API와 연동해 **수집·상태 갱신·금액 대사·조회 UI**만 구현한다. 승인/거부/
+  환불실행/반품완료처리/교환재발송 등 채널 상태를 실제로 바꾸는 조치는 범위
+  밖이며 "2-B단계"로 분리한다(아래 참고).
+- **의존성**: 1단계의 outbox/상태전이/SAVEPOINT 격리 패턴을 재사용. 기존
+  `ClaimSyncService`/`services/exchange_return_service.py`를 확장(중복 모델
+  생성 없음).
+- **완료 기준(충족)**:
+  - 채널별 실제 지원 캐패빌리티는 공식 문서로 확인한 것만 True로 켠다(아래
+    Capability Matrix 참고) - 미확인 API는 구현을 지어내지 않고 capability만
+    False로 유지.
+  - 채널 claim ID 기준 dedup + 재수집 시 상태 갱신(과거 상태로 되돌리지 않음),
+    claim ID가 없는 경우의 보수적 폴백, 아직 수집되지 않은 주문에 걸린 클레임은
+    `ClaimUnmatched`에 보관 후 주문 수집 시 자동 승격.
+  - 정산 회차/상세는 전부 `Decimal`로 계산하고, 회차-상세 매칭 실패/금액 불일치는
+    `SettlementDiscrepancy`로 분리 기록(자동 추정으로 덮어쓰지 않음), 재수집 시
+    중복 생성 방지.
+  - 자동/수동 수집 모두 `claims_settlement_sync_enabled`(기본 False)로 차단 -
+    OFF일 때 외부 호출 0건(세션도 열지 않음).
+  - MockTransport 기반 단위/통합 테스트, 격리 PostgreSQL 마이그레이션 검증,
+    클린 워크트리 재검증 완료(아래 "2단계 완료 요약" 참고).
+  - 실계정 검증은 별도 승인 필요(아직 미실시).
+
+#### 2-B단계 - 클레임/정산 상태 변경(승인/환불/처리) 액션 (미구현, 향후 분리 진행)
+
+2단계에서 명시적으로 **구현하지 않은** 항목들 - 채널에 실제 쓰기 요청을 보내
+상태를 바꾸는 조치이므로, 1단계의 outbox(멱등키+atomic lease+UNKNOWN 처리)
+패턴과 동일한 안전장치를 갖춘 뒤 별도 단계로 진행해야 한다.
+
+- 취소 승인/거부(채널로 실제 승인·거부 요청 전송)
+- 반품 환불 실행(채널/PG 환불 API 호출)
+- 반품 완료 처리(수거확인 등 채널 상태 갱신 쓰기)
+- 교환 재발송 처리(교환 상품 재출고 확정 채널 쓰기)
+- 위 각 항목은 1단계에서 확립한 "결과 불명(timeout/connection-drop/parse
+  실패/외부성공-로컬커밋실패)은 절대 자동 재시도하지 않고 UNKNOWN/RECONCILIATION_REQUIRED로
+  전환" 원칙과 DB-atomic claim/lease 동시성 제어를 그대로 적용해야 한다.
 
 ### 3단계 - 상품/재고 동기화
 
@@ -123,21 +160,29 @@
   방식 대신 건별 독립 커밋(또는 실패해도 outbox 행은 보존하고 도메인 변경만
   롤백하는 방식)으로 재설계해야 한다.
 
-## Capability Matrix (1단계 기준 현황)
+## Capability Matrix (2단계 기준 현황)
 
 | 캐패빌리티 | 네이버 스마트스토어 | 쿠팡 | ESM | 11번가 | 카카오쇼핑 |
 |---|---|---|---|---|---|
 | 주문 수집 (`fetch_orders`) | O (기존 구현) | O (기존 구현) | X (`CapabilityUnsupported`) | X (`CapabilityUnsupported`) | X (`CapabilityUnsupported`) |
-| 송장 전송 (`submit_shipment`, 1단계 신규, outbox 비동기 실행) | O | O | X | X | X |
+| 송장 전송 (`submit_shipment`, 1단계, outbox 비동기 실행) | O | O | X | X | X |
 | 채널 상태 동기화 (전송성공 반영 + 주기적 읽기전용 재조회) | O | O | X | X | X |
-| 취소/반품 동기화 (2단계 예정) | X | X | X | X | X |
-| 정산 조회 (`fetch_settlements`) | O (기존 구현, 1단계에서 변경 없음) | O (기존 구현, 1단계에서 변경 없음) | X | X | X |
+| 취소 수집 (`fetch_cancellations`, 2단계) | X (일괄조회 API 미확인) | X (`cancelType=CANCEL` 조회 시 `orderId` 필수가 되어 날짜range 일괄조회 불가 - 공식 문서로 확인된 구조적 한계) | X | X | X |
+| 반품 수집 (`fetch_returns`, 2단계) | X (일괄조회 API 미확인) | **O (returnRequests v6, 상태코드 4종 순회로 전체 수집)** | X | X | X |
+| 교환 수집 (`fetch_exchanges`, 2단계) | X (일괄조회 API 미확인) | **O (exchangeRequests v4, 최대 7일 range)** | X | X | X |
+| 정산 회차 수집 (`fetch_settlements`) | X (공식 API 미확인) | **O (settlement-histories v1, 2단계에서 실구현으로 교체)** | X | X | X |
+| 정산 상세 수집 (`fetch_settlement_details`, 2단계 신규) | X | **O (revenue-history v1, 주문/라인 단위)** | X | X | X |
+| 클레임 승인/거부/환불실행/처리(2-B단계) | X | X | X | X | X |
 | 상품 동기화 (`fetch_products`) | **O (기존 구현, 1단계 이전부터 운영 중 - `product_sync_job` 20분 주기, 1단계에서 변경 없음)** | X | X | X | X |
 | 재고 동기화 (3단계 예정) | X | X | X | X | X |
 
 - O = 실제 구현 + MockTransport 계약 테스트로 검증됨 (실계정 검증은 별도).
-- X = 미구현. 호출 시 `MarketplaceCapabilityUnsupportedError`를 명시적으로 발생시키며,
-  성공을 가장하지 않는다 (`tests/unit/test_marketplace_safety.py::TestShipmentSubmitCapabilityNeverFakesSuccess`로 회귀 검증).
+- X = 미구현/미확인. 호출 시 `MarketplaceCapabilityUnsupportedError`를 명시적으로
+  발생시키며, 성공을 가장하지 않는다
+  (`tests/unit/test_marketplace_safety.py::TestShipmentSubmitCapabilityNeverFakesSuccess`,
+  `tests/unit/test_base_mall_connector.py::TestRealConnectorsClaimCapabilitiesMatchConfirmedContract`로 회귀 검증).
+- 쿠팡 반품/교환/정산 API 확인 근거: `integrations/malls/coupang_connector.py` 상단 및
+  각 fetch 메서드 주석의 "2026-09 조회" 표기(개발자센터 공식 문서, 응답 예시 포함).
 
 ## 실계정 검증 전 필요 조건 (1단계)
 
@@ -152,3 +197,42 @@
 - outbox의 "동일 (shipment_id, tracking_no) 재실행은 안전하다"는 가정(stale RUNNING
   회수 시 근거)은 채널이 같은 송장번호 재제출을 upsert로 처리한다는 전제다 - 실
   계정으로 중복 제출 시 채널이 오류를 내는지 확인이 필요하다.
+
+## 실전송 활성화 체크리스트 (1·2단계 공통 - 아직 미충족, 재검토 없이 그대로 유지)
+
+두 기능 플래그(`shipment_channel_submit_enabled`/`channel_status_sync_enabled`,
+`claims_settlement_sync_enabled`)를 운영에서 켜기 전 반드시 확인해야 하는 항목.
+1단계 완결 검토에서 식별된 뒤 2단계에서도 재검증하지 않고 그대로 이월했다.
+
+- **재시도 분류 근거 검증**: `ShipmentDispatchService._classify_write_outcome()`의
+  SAFE_RETRY/CONFIRMED_FAILED/UNKNOWN 판정 기준(어떤 HTTP상태/예외를 어느
+  범주로 분류하는지)이 실제 네이버/쿠팡 API의 실패 응답 패턴과 일치하는지
+  실계정으로 확인 필요 - MockTransport로는 "우리가 가정한 실패 패턴"만 검증됨.
+- **UNKNOWN 해소 권한**: `POST /api/shipments/commands/{id}/resolve`로 UNKNOWN
+  상태를 사람이 수동 해소하는 절차 - 실제로 이 권한을 누가 갖고 어떤 확인
+  절차(채널 관리자센터에서 실제 접수 여부 확인 등)를 거쳐 해소할지 운영 프로세스
+  합의 필요(코드는 상태 전이만 제공, 운영 절차는 별도 승인 대상).
+- 위 두 항목 모두 아직 실계정 검증이 이뤄지지 않았으므로, 이번(2단계) 작업에서도
+  다시 조사/변경하지 않고 이 체크리스트로만 유지한다.
+- 2단계 신규: `claims_settlement_sync_enabled` 활성화 전에도 위와 동일하게, 쿠팡
+  returnRequests/exchangeRequests/settlement-histories/revenue-history 각 API의
+  실제 실패 응답(레이트리밋/일시 오류) 패턴을 실계정으로 먼저 확인해야 한다.
+
+## 2단계 완료 요약 (구현·격리 검증, 운영 실전송 비활성)
+
+- **브랜치/커밋**: `feature/commercial-erp-stage2-claims-settlements`
+  (1단계 완료 커밋 `d25ea73`에서 분기 확인).
+- **테스트**: 신규/확장 단위 테스트(클레임 dedup·미매칭 보존, 쿠팡 반품/교환/정산
+  정규화, 정산 동기화 서비스, 클레임/정산 스케줄러 잡) + 통합 테스트
+  (`test_api_orders.py`, 신규 `test_api_settlements.py`) 전부 통과, 전체 회귀
+  867 passed. Ruff/MyPy 전체 통과.
+- **마이그레이션**: 격리 SQLite 스크래치 DB에서 autogenerate 후 2단계 스키마
+  변경만 남도록 무관한 드리프트(orders.assignee_id/confirmed_by,
+  order_items.channel_product_id 미명명 FK, product_options 등 컬럼 길이 차이 -
+  전부 2단계 이전부터 있던 기존 드리프트)를 수동으로 제외. SQLite는 제약 추가에
+  batch mode가 필요해 `cancellations.order_item_id` FK만 `batch_alter_table`로
+  처리. upgrade/downgrade 모두 격리 환경에서 확인.
+- **기본 차단**: `claims_settlement_sync_enabled` 기본 False 확인
+  (`tests/unit/test_claim_sync_job.py`, `tests/unit/test_settlement_sync_job.py`,
+  `tests/integration/test_api_orders.py::TestSyncClaimsDisabledByDefault`,
+  `tests/integration/test_api_settlements.py::TestSyncDisabledByDefault`).

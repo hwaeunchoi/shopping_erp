@@ -1,9 +1,13 @@
 """
-scheduler/jobs/settlement_sync_job.py
-------------------------------------------
-쇼핑몰 커넥터의 fetch_settlements()/fetch_settlement_details()로 정산 회차 요약과
-주문단위 상세를 수집하고 대사한다(services.settlement_sync_service.SettlementSyncService
-참고 - capability 인지 + 기능별 SAVEPOINT 격리).
+scheduler/jobs/claim_sync_job.py
+---------------------------------------
+전체 활성 쇼핑몰 플랫폼의 취소/반품/교환(클레임)을 자동으로 수집한다
+(services.claim_sync_service.ClaimSyncService 참고 - capability 인지 + 기능별
+SAVEPOINT 격리 + 클레임 ID 기반 재수집/미매칭 보존). 상용 ERP 확장(2단계).
+
+수동 수집은 기존 POST /api/orders/sync-claims가 담당한다 - 이 잡은 그 자동(주기)
+버전이다. 둘 다 같은 ClaimSyncService를 호출하므로 동작(중복방지/상태갱신/미매칭
+보존)이 동일하다.
 
 기본 차단: settings.claims_settlement_sync_enabled가 False(기본값)이면 이 잡은
 아무 것도 하지 않고 즉시 반환한다(세션도 열지 않고 커넥터도 만들지 않는다 - 외부
@@ -23,11 +27,11 @@ from integrations.malls.errors import (
     MarketplaceExternalAPIError,
 )
 from repositories.platform_repository import PlatformRepository
-from services.settlement_sync_service import SettlementSyncService
+from services.claim_sync_service import ClaimSyncService
 
 logger = logging.getLogger(__name__)
 
-CHECK_WINDOW_DAYS = 60
+COLLECT_WINDOW_DAYS = 3
 
 
 def _safe_error_summary(exc: Exception) -> str:
@@ -43,34 +47,29 @@ def _safe_error_summary(exc: Exception) -> str:
 
 def run() -> dict[str, dict]:
     if not settings.claims_settlement_sync_enabled:
-        logger.debug("클레임/정산 수집 기능이 비활성화(OFF) 상태라 settlement_sync_job을 건너뜁니다.")
+        logger.debug("클레임/정산 수집 기능이 비활성화(OFF) 상태라 claim_sync_job을 건너뜁니다.")
         return {"skipped_disabled": {"skipped": "disabled"}}
 
     results: dict[str, dict] = {}
     with session_scope() as db:
         end_date = date.today()
-        start_date = end_date - timedelta(days=CHECK_WINDOW_DAYS)
-        sync_service = SettlementSyncService(db)
+        start_date = end_date - timedelta(days=COLLECT_WINDOW_DAYS)
+        sync_service = ClaimSyncService(db)
 
         for platform in PlatformRepository(db).list_active():
             try:
                 connector = get_mall_connector(platform.connector_class, session=db, platform_id=platform.id)
-                settlements = sync_service.sync_settlements(connector, platform.id, start_date, end_date)
-                details = sync_service.sync_settlement_details(connector, platform.id, start_date, end_date)
-                results[platform.code] = {"settlements": settlements, "settlement_details": details}
+                results[platform.code] = sync_service.sync_claims(connector, platform.id, start_date, end_date)
                 db.commit()
             except MarketplaceCapabilityUnsupportedError:
-                # get_mall_connector() 자체가 미검증 커넥터 클래스를 거부한 경우 -
-                # SettlementSyncService 내부의 UNSUPPORTED 결과와 달리 커넥터 생성
-                # 단계라 별도로 잡는다(product_sync_job/order_collect_job과 동일 패턴).
                 db.rollback()
                 results[platform.code] = {"skipped": "unsupported"}
-                logger.debug("정산 동기화 스킵(미지원 채널): platform=%s", platform.code)
+                logger.debug("클레임 수집 스킵(미지원 채널): platform=%s", platform.code)
                 continue
             except Exception as e:  # noqa: BLE001 - 채널별 격리(예상 밖 예외도 다음 채널 진행)
                 db.rollback()
                 summary = _safe_error_summary(e)
                 results[platform.code] = {"error": summary}
-                logger.warning("정산 동기화 실패: platform=%s, reason=%s", platform.code, summary)
+                logger.warning("클레임 수집 실패: platform=%s, reason=%s", platform.code, summary)
                 continue
     return results

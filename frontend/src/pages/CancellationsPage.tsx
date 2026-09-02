@@ -153,6 +153,9 @@ export function CancellationsPage() {
                 <th>사유</th>
                 <th>환불금액</th>
                 <th>상태</th>
+                <th>채널 클레임ID</th>
+                <th>채널 원본상태</th>
+                <th>귀책</th>
                 <th>신청일시</th>
                 <th>상태 변경</th>
               </tr>
@@ -167,6 +170,9 @@ export function CancellationsPage() {
                     <td>{c.reason ?? '-'}</td>
                     <td>{c.refund_amount != null ? c.refund_amount.toLocaleString() : '-'}</td>
                     <td><span className="status-badge">{c.status}</span></td>
+                    <td>{c.platform_claim_id ?? '-'}</td>
+                    <td>{c.raw_status ?? '-'}</td>
+                    <td>{c.fault_type ?? '-'}</td>
                     <td>{new Date(c.requested_at).toLocaleString()}</td>
                     <td>
                       <div className="inline-form" style={{ margin: 0 }}>
@@ -198,7 +204,7 @@ export function CancellationsPage() {
                 )
               })}
               {data.items.length === 0 && (
-                <tr><td colSpan={7}>등록된 취소 신청이 없습니다.</td></tr>
+                <tr><td colSpan={10}>등록된 취소 신청이 없습니다.</td></tr>
               )}
             </tbody>
           </table>

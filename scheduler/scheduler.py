@@ -34,6 +34,7 @@ from scheduler.jobs import (  # noqa: E402
     alert_evaluation_job,
     backup_job,
     channel_status_sync_job,
+    claim_sync_job,
     customer_stats_job,
     order_collect_job,
     outbox_dispatch_job,
@@ -114,6 +115,10 @@ def run_channel_status_sync() -> None:
     _run_job("channel_status_sync", channel_status_sync_job.run, task_type="MALL_SYNC")
 
 
+def run_claim_sync() -> None:
+    _run_job("claim_sync", claim_sync_job.run, task_type="FULL_SYNC")
+
+
 def build_scheduler() -> BlockingScheduler:
     scheduler = BlockingScheduler(timezone="UTC")
     # 상품 동기화는 주문 수집보다 먼저 실행되도록 더 짧은 주기(10분보다 여유를 둔 20분)로
@@ -133,6 +138,8 @@ def build_scheduler() -> BlockingScheduler:
     # 채널 상태 읽기 전용 재조회 - order_collect_job과 조회 범위가 겹치므로 주기를 다르게
     # 둬 과도한 중복 채널 호출을 피한다(order_collect_job.py는 그대로 둔다).
     scheduler.add_job(run_channel_status_sync, IntervalTrigger(minutes=15), id="channel_status_sync", max_instances=1)
+    # 취소/반품/교환 클레임 자동 수집 - 상용 ERP 확장(2단계, 기본 OFF: claims_settlement_sync_enabled).
+    scheduler.add_job(run_claim_sync, IntervalTrigger(minutes=20), id="claim_sync", max_instances=1)
     return scheduler
 
 

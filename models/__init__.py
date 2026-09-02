@@ -48,10 +48,11 @@ from models.order import (  # noqa: F401
     Exchange,
     Return,
     Cancellation,
+    ClaimUnmatched,
 )
 
 # 정산
-from models.settlement import Settlement, SettlementDetail  # noqa: F401
+from models.settlement import Settlement, SettlementDetail, SettlementDiscrepancy  # noqa: F401
 
 # 비용
 from models.cost import Cost  # noqa: F401
@@ -118,8 +119,10 @@ __all__ = [
     "Exchange",
     "Return",
     "Cancellation",
+    "ClaimUnmatched",
     "Settlement",
     "SettlementDetail",
+    "SettlementDiscrepancy",
     "Cost",
     "AdCampaign",
     "AdPerformanceDaily",

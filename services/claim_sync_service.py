@@ -1,7 +1,8 @@
 """
 services/claim_sync_service.py
 ------------------------------------
-교환/반품/취소(클레임) 수집 - capability 인지 + 기능별 격리.
+교환/반품/취소(클레임) 수집 - capability 인지 + 기능별 격리 + 클레임 ID 기반
+재수집(2단계 확장).
 
 커넥터의 supports_cancellation_sync/supports_return_sync/supports_exchange_sync가
 True인 기능만 fetch_*를 호출해, 이미 수집된 주문(platform_order_no로 매칭)에 연결해
@@ -13,15 +14,24 @@ ERP의 Cancellation/Return/Exchange 레코드로 미러링한다.
   - **기능별 격리**: 취소/반품/교환을 각각 SAVEPOINT(begin_nested) 안에서 처리하고
     기능 범위에서 flush()한다. 한 기능의 fetch 실패·DB 오류는 그 기능만 롤백하고
     앞서 성공한 기능 데이터는 유지한다. 다음 기능은 계속 진행한다.
+  - **클레임 ID 기반 중복방지/갱신(2단계)**: raw["platform_claim_id"]가 있으면 (order_id,
+    platform_claim_id) 단위로 식별한다 - 같은 주문에 같은 유형의 클레임이 여러 건이어도
+    (부분 클레임) 각각 별도 행으로 만들고, 재수집 시에는 새로 만들지 않고 기존 행을
+    갱신한다. 커넥터가 platform_claim_id를 주지 않는 채널(아직 계약을 확인하지 못한
+    경우)은 임의로 키를 지어내지 않고, 기존의 보수적 방식("주문+유형" 단위, 이미
+    있으면 skip)으로 폴백한다.
+  - **상태 후퇴 방지(2단계)**: 갱신 시 services.claim_state_machine.should_apply_claim_status()
+    로 오래된 응답이 이미 반영된 최신 상태를 되돌리지 못하게 막는다. 원본 상태가
+    알려진 매핑에 없으면(커넥터가 이미 raw_status를 "REVIEW"로 정규화해 보냄) 완료 등으로
+    추정하지 않는다.
+  - **미매칭 주문 보존(2단계)**: 아직 수집되지 않은 주문(platform_order_no 매칭 실패)의
+    클레임은 조용히 버리지 않고 ClaimUnmatched에 보존한다. 매 sync_claims() 호출 시작
+    시, 이전에 보존해 둔 미매칭 클레임 중 이제 주문이 수집된 것이 있으면 먼저 실제
+    클레임 행으로 승격한다(_resolve_pending_unmatched).
   - **수집(미러링) 전용**: 플랫폼 클레임 상태를 그대로 레코드로 만든다. 재고/주문상태
     변경 같은 부수효과는 일으키지 않는다.
   - **안전 로그**: Secret·개인정보·원본 응답·내부 예외 전문을 로그/응답에 남기지 않는다.
-
-⚠️ 현재 모델 한계(실제 채널 capability를 True로 켜기 전에 모델 확장 TODO 필요):
-  - 플랫폼 claim 고유 ID 미저장 → 중복방지는 "주문+유형" 단위(동일 주문의 동일 유형
-    복수 클레임 구분 불가, 재수집 시 상태 업데이트 불가 - 존재하면 skip).
-  - 원본 상태 코드·원본 응답·귀책 주체·배송비·수거정보 미저장.
-  현재 네이버·쿠팡은 세 capability 모두 False라 실 클레임이 이 구조로 자동 수집되지 않는다.
+    원본 응답 전체는 저장하지 않는다(보존정책 승인 전) - 필요한 필드만 모델 컬럼에 담는다.
 """
 
 import logging
@@ -37,8 +47,20 @@ from integrations.malls.errors import (
     MarketplaceCredentialMissingError,
     MarketplaceExternalAPIError,
 )
-from models.order import Cancellation, Exchange, Return
-from repositories.order_repository import CancellationRepository, ExchangeRepository, OrderRepository, ReturnRepository
+from models.order import Cancellation, ClaimUnmatched, Exchange, Return
+from repositories.order_repository import (
+    CancellationRepository,
+    ClaimUnmatchedRepository,
+    ExchangeRepository,
+    OrderRepository,
+    ReturnRepository,
+)
+from services.claim_state_machine import (
+    CANCELLATION_TRANSITIONS,
+    EXCHANGE_TRANSITIONS,
+    RETURN_TRANSITIONS,
+    should_apply_claim_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +75,7 @@ class ClaimSyncService:
         self.exchange_repo = ExchangeRepository(session)
         self.return_repo = ReturnRepository(session)
         self.cancellation_repo = CancellationRepository(session)
+        self.unmatched_repo = ClaimUnmatchedRepository(session)
 
     def sync_claims(self, connector: Any, platform_id: int, start_date: date, end_date: date) -> dict[str, Any]:
         """취소/반품/교환을 capability 기준으로 미러링하고 구조화된 기능별 결과를 반환한다.
@@ -60,32 +83,44 @@ class ClaimSyncService:
         반환:
             {"overall_status": str,
              "cancellations": {...}, "returns": {...}, "exchanges": {...},
-             "skipped_no_order": int}
+             "skipped_no_order": int, "resolved_unmatched": int}
         각 기능 결과: {"status", "count", "reason_code", "retryable"}.
         """
+        resolved_unmatched = self._resolve_pending_unmatched(platform_id)
         skipped = {"count": 0}
 
         cancellations = self._sync_feature(
             supported=getattr(connector, "supports_cancellation_sync", False),
             fetch=lambda: connector.fetch_cancellations(start_date, end_date),
-            persist=lambda raw: self._persist_cancellation(platform_id, raw, skipped),
+            persist=lambda raw: self._persist_claim(
+                "CANCELLATION", platform_id, raw, skipped, self.cancellation_repo, CANCELLATION_TRANSITIONS
+            ),
             feature="cancellations",
         )
         returns = self._sync_feature(
             supported=getattr(connector, "supports_return_sync", False),
             fetch=lambda: connector.fetch_returns(start_date, end_date),
-            persist=lambda raw: self._persist_return(platform_id, raw, skipped),
+            persist=lambda raw: self._persist_claim(
+                "RETURN", platform_id, raw, skipped, self.return_repo, RETURN_TRANSITIONS
+            ),
             feature="returns",
         )
         exchanges = self._sync_feature(
             supported=getattr(connector, "supports_exchange_sync", False),
             fetch=lambda: connector.fetch_exchanges(start_date, end_date),
-            persist=lambda raw: self._persist_exchange(platform_id, raw, skipped),
+            persist=lambda raw: self._persist_claim(
+                "EXCHANGE", platform_id, raw, skipped, self.exchange_repo, EXCHANGE_TRANSITIONS
+            ),
             feature="exchanges",
         )
 
         features = {"cancellations": cancellations, "returns": returns, "exchanges": exchanges}
-        return {"overall_status": self._overall_status(features), **features, "skipped_no_order": skipped["count"]}
+        return {
+            "overall_status": self._overall_status(features),
+            **features,
+            "skipped_no_order": skipped["count"],
+            "resolved_unmatched": resolved_unmatched,
+        }
 
     def _sync_feature(
         self, supported: bool, fetch: Callable[[], list], persist: Callable[[dict], bool], feature: str
@@ -124,78 +159,177 @@ class ClaimSyncService:
             logger.warning("클레임 처리 예상 밖 오류: feature=%s, trace=%s", feature, uuid.uuid4().hex[:8])
             return _feature_result("FAILED", 0, "INTERNAL_ERROR", False)
 
-    # --- 기능별 저장(중복방지 포함). 생성하면 True, skip이면 False ---
+    # --- 클레임 ID 기반 저장(생성/갱신) ---
 
-    def _persist_cancellation(self, platform_id: int, raw: dict, skipped: dict) -> bool:
-        order = self._find_order(platform_id, raw, skipped)
-        if order is None:
-            return False
-        if self.cancellation_repo.count_filtered(order_id=order.id) > 0:
-            return False  # 중복방지(주문+유형)
-        status = raw.get("status") or "REQUESTED"
-        requested_at = _as_dt(raw.get("requested_at"))
-        self.cancellation_repo.add(
-            Cancellation(
-                order_id=order.id,
-                reason=_clip(raw.get("reason"), 200),
-                refund_amount=raw.get("refund_amount"),
-                status=status,
-                requested_at=requested_at,
-                completed_at=requested_at if status in _TERMINAL_STATUSES else None,
-            )
-        )
-        return True
-
-    def _persist_return(self, platform_id: int, raw: dict, skipped: dict) -> bool:
-        order = self._find_order(platform_id, raw, skipped)
-        if order is None:
-            return False
-        if self.return_repo.count_filtered(order_id=order.id) > 0:
-            return False
-        status = raw.get("status") or "REQUESTED"
-        requested_at = _as_dt(raw.get("requested_at"))
-        self.return_repo.add(
-            Return(
-                order_id=order.id,
-                order_item_id=None,
-                reason=_clip(raw.get("reason"), 200),
-                refund_amount=raw.get("refund_amount"),
-                status=status,
-                requested_at=requested_at,
-                completed_at=requested_at if status in _TERMINAL_STATUSES else None,
-            )
-        )
-        return True
-
-    def _persist_exchange(self, platform_id: int, raw: dict, skipped: dict) -> bool:
-        order = self._find_order(platform_id, raw, skipped)
-        if order is None:
-            return False
-        if self.exchange_repo.count_filtered(order_id=order.id) > 0:
-            return False
-        status = raw.get("status") or "REQUESTED"
-        requested_at = _as_dt(raw.get("requested_at"))
-        self.exchange_repo.add(
-            Exchange(
-                order_id=order.id,
-                order_item_id=None,
-                reason=_clip(raw.get("reason"), 200),
-                status=status,
-                requested_at=requested_at,
-                completed_at=requested_at if status in _TERMINAL_STATUSES else None,
-            )
-        )
-        return True
-
-    def _find_order(self, platform_id: int, raw: dict[str, Any], skipped: dict):
+    def _persist_claim(
+        self,
+        claim_type: str,
+        platform_id: int,
+        raw: dict[str, Any],
+        skipped: dict,
+        repo: Any,
+        transitions: dict[str, frozenset[str]],
+    ) -> bool:
+        """생성/갱신했으면 True, 건너뛰었으면(주문 미매칭 - ClaimUnmatched에 보존,
+        또는 오래된 응답이라 무시) False."""
         order_no = raw.get("platform_order_no")
         if not order_no:
             skipped["count"] += 1
-            return None
+            return False
         order = self.order_repo.get_by_platform_order_no(platform_id, order_no)
         if order is None:
+            self._hold_unmatched(claim_type, platform_id, raw, order_no)
             skipped["count"] += 1
-        return order
+            return False
+
+        platform_claim_id = raw.get("platform_claim_id")
+        status = raw.get("status") or "REVIEW"
+        raw_status = raw.get("raw_status")
+        requested_at = _as_dt(raw.get("requested_at"))
+        order_item_id = self._resolve_order_item_id(order.id, raw.get("platform_order_item_no"))
+
+        existing = None
+        if platform_claim_id:
+            existing = repo.get_by_order_and_claim_id(order.id, platform_claim_id)
+        else:
+            # 공식 claim ID를 확인하지 못한 채널 - 임의 키를 지어내지 않고, "주문+유형"
+            # 단위의 보수적 중복방지로 폴백한다(이미 있으면 새로 만들지 않는다).
+            if repo.count_filtered(order_id=order.id) > 0:
+                return False
+
+        if existing is not None:
+            if not should_apply_claim_status(existing.status, status, transitions):
+                # 오래된 응답이거나 이미 같은 상태 - 무시한다(되돌리지 않음).
+                return False
+            existing.status = status
+            existing.raw_status = raw_status
+            if status in _TERMINAL_STATUSES and existing.completed_at is None:
+                existing.completed_at = requested_at
+            if raw.get("quantity") is not None:
+                existing.quantity = raw.get("quantity")
+            if raw.get("shipping_fee") is not None:
+                existing.shipping_fee = raw.get("shipping_fee")
+            if hasattr(existing, "fault_type") and raw.get("fault_type") is not None:
+                existing.fault_type = raw.get("fault_type")
+            if raw.get("refund_amount") is not None and hasattr(existing, "refund_amount"):
+                existing.refund_amount = raw.get("refund_amount")
+            if order_item_id is not None and existing.order_item_id is None:
+                existing.order_item_id = order_item_id
+            return True
+
+        kwargs: dict[str, Any] = {
+            "order_id": order.id,
+            "order_item_id": order_item_id,
+            "reason": _clip(raw.get("reason"), 200),
+            "status": status,
+            "requested_at": requested_at,
+            "completed_at": requested_at if status in _TERMINAL_STATUSES else None,
+            "platform_claim_id": platform_claim_id,
+            "raw_status": raw_status,
+            "quantity": raw.get("quantity"),
+            "shipping_fee": raw.get("shipping_fee"),
+            "fault_type": raw.get("fault_type"),
+        }
+        if claim_type in ("RETURN", "CANCELLATION"):
+            kwargs["refund_amount"] = raw.get("refund_amount")
+        model_cls = {"CANCELLATION": Cancellation, "RETURN": Return, "EXCHANGE": Exchange}[claim_type]
+        repo.add(model_cls(**kwargs))
+        return True
+
+    def _resolve_order_item_id(self, order_id: int, platform_order_item_no: Optional[str]) -> Optional[int]:
+        if not platform_order_item_no:
+            return None
+        item = self.order_repo.get_item_by_platform_order_item_no(order_id, platform_order_item_no)
+        return item.id if item is not None else None
+
+    def _hold_unmatched(self, claim_type: str, platform_id: int, raw: dict[str, Any], order_no: str) -> None:
+        """주문이 아직 수집되지 않은 클레임을 조용히 버리지 않고 보존한다."""
+        platform_claim_id = raw.get("platform_claim_id")
+        existing = self.unmatched_repo.get_by_key(platform_id, claim_type, platform_claim_id, order_no)
+        if existing is not None:
+            existing.raw_status = raw.get("raw_status")
+            return
+        self.unmatched_repo.add(
+            ClaimUnmatched(
+                platform_id=platform_id,
+                claim_type=claim_type,
+                platform_claim_id=platform_claim_id,
+                platform_order_no=order_no,
+                raw_status=raw.get("raw_status"),
+                reason=_clip(raw.get("reason"), 200),
+                detected_at=datetime.now(timezone.utc),
+            )
+        )
+
+    def _resolve_pending_unmatched(self, platform_id: int) -> int:
+        """이전에 보존해 둔 미매칭 클레임 중 이제 주문이 수집된 것을 실제 클레임
+        행으로 승격한다. 각 항목은 독립적으로 처리한다(하나가 실패해도 나머지는 계속)."""
+        resolved = 0
+        for pending in self.unmatched_repo.list_unresolved(platform_id):
+            order = self.order_repo.get_by_platform_order_no(platform_id, pending.platform_order_no)
+            if order is None:
+                continue
+            entity_id = self._promote_unmatched(pending, order.id)
+            if entity_id is None:
+                continue
+            pending.resolved_entity_id = entity_id
+            pending.resolved_at = datetime.now(timezone.utc)
+            resolved += 1
+        if resolved:
+            self.session.flush()
+        return resolved
+
+    def _promote_unmatched(self, pending: ClaimUnmatched, order_id: int) -> Optional[int]:
+        """보존 당시 저장해 둔 최소 필드만으로 승격한다(수량/환불액/배송비/라인 연결
+        등은 여기 없다 - 다음 정기 재수집에서 같은 platform_claim_id로 _persist_claim()
+        이 이 행을 정상적으로 갱신하며 채운다)."""
+        if pending.claim_type == "CANCELLATION":
+            existing_c = self.cancellation_repo.get_by_order_and_claim_id(order_id, pending.platform_claim_id or "")
+            if existing_c is not None:
+                return existing_c.id
+            created_c = self.cancellation_repo.add(
+                Cancellation(
+                    order_id=order_id,
+                    reason=pending.reason,
+                    status="REVIEW",
+                    requested_at=pending.detected_at,
+                    platform_claim_id=pending.platform_claim_id,
+                    raw_status=pending.raw_status,
+                )
+            )
+            return created_c.id
+        if pending.claim_type == "RETURN":
+            existing_r = self.return_repo.get_by_order_and_claim_id(order_id, pending.platform_claim_id or "")
+            if existing_r is not None:
+                return existing_r.id
+            created_r = self.return_repo.add(
+                Return(
+                    order_id=order_id,
+                    reason=pending.reason,
+                    status="REVIEW",
+                    requested_at=pending.detected_at,
+                    platform_claim_id=pending.platform_claim_id,
+                    raw_status=pending.raw_status,
+                )
+            )
+            return created_r.id
+        if pending.claim_type == "EXCHANGE":
+            existing_e = self.exchange_repo.get_by_order_and_claim_id(order_id, pending.platform_claim_id or "")
+            if existing_e is not None:
+                return existing_e.id
+            created_e = self.exchange_repo.add(
+                Exchange(
+                    order_id=order_id,
+                    reason=pending.reason,
+                    status="REVIEW",
+                    requested_at=pending.detected_at,
+                    platform_claim_id=pending.platform_claim_id,
+                    raw_status=pending.raw_status,
+                )
+            )
+            return created_e.id
+        logger.warning("알 수 없는 클레임 유형이라 미매칭 항목을 승격하지 못했습니다: %s", pending.claim_type)
+        return None
 
     @staticmethod
     def _overall_status(features: dict[str, dict]) -> str:

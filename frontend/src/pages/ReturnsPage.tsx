@@ -163,6 +163,9 @@ export function ReturnsPage() {
                 <th>사유</th>
                 <th>환불금액</th>
                 <th>상태</th>
+                <th>채널 클레임ID</th>
+                <th>채널 원본상태</th>
+                <th>귀책</th>
                 <th>신청일시</th>
                 <th>상태 변경</th>
               </tr>
@@ -177,6 +180,9 @@ export function ReturnsPage() {
                     <td>{r.reason ?? '-'}</td>
                     <td>{r.refund_amount != null ? r.refund_amount.toLocaleString() : '-'}</td>
                     <td><span className="status-badge">{r.status}</span></td>
+                    <td>{r.platform_claim_id ?? '-'}</td>
+                    <td>{r.raw_status ?? '-'}</td>
+                    <td>{r.fault_type ?? '-'}</td>
                     <td>{new Date(r.requested_at).toLocaleString()}</td>
                     <td>
                       <div className="inline-form" style={{ margin: 0 }}>
@@ -208,7 +214,7 @@ export function ReturnsPage() {
                 )
               })}
               {data.items.length === 0 && (
-                <tr><td colSpan={7}>등록된 반품 신청이 없습니다.</td></tr>
+                <tr><td colSpan={10}>등록된 반품 신청이 없습니다.</td></tr>
               )}
             </tbody>
           </table>

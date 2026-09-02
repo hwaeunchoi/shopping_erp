@@ -15,7 +15,9 @@ from datetime import date, datetime, timezone
 from sqlalchemy.exc import SQLAlchemyError
 
 from integrations.malls.errors import MarketplaceCredentialMissingError, MarketplaceExternalAPIError
-from models.order import Cancellation, Exchange, Order, Return
+from models.order import Cancellation, ClaimUnmatched, Exchange, Order, OrderItem, Return
+from models.product import Product, ProductOption
+from repositories.order_repository import ClaimUnmatchedRepository
 from services.claim_sync_service import ClaimSyncService
 
 SPAN = (date(2026, 1, 1), date(2026, 1, 31))
@@ -291,3 +293,192 @@ class TestOverallStatus:
             )
             == "FAILED"
         )
+
+
+class TestClaimIdBasedDedupAndUpdate:
+    """2단계 확장: platform_claim_id가 있으면 같은 유형의 클레임이 여러 건이어도
+    각각 별도 행으로 만들고, 재수집 시 새로 만들지 않고 기존 행을 갱신한다."""
+
+    def test_two_claims_same_order_same_type_both_created(self, db_session, platform):
+        """하나의 주문에 같은 유형(반품) 클레임 여러 건을 지원한다(부분 클레임)."""
+        order = _make_order(db_session, platform)
+        conn = StubClaimConnector(
+            returns=[
+                _claim(order.platform_order_no, platform_claim_id="R-1", reason="사이즈 불만"),
+                _claim(order.platform_order_no, platform_claim_id="R-2", reason="색상 불만"),
+            ],
+            supports=("return",),
+        )
+        result = ClaimSyncService(db_session).sync_claims(conn, platform.id, *SPAN)
+
+        assert result["returns"]["count"] == 2
+        assert db_session.query(Return).filter_by(order_id=order.id).count() == 2
+
+    def test_resync_updates_existing_claim_instead_of_duplicating(self, db_session, platform):
+        order = _make_order(db_session, platform)
+        conn = StubClaimConnector(
+            returns=[_claim(order.platform_order_no, platform_claim_id="R-1", status="REQUESTED")], supports=("return",)
+        )
+        svc = ClaimSyncService(db_session)
+        svc.sync_claims(conn, platform.id, *SPAN)
+
+        conn._data["returns"][0]["status"] = "APPROVED"  # 채널에서 승인 처리됨
+        result = svc.sync_claims(conn, platform.id, *SPAN)
+
+        assert db_session.query(Return).filter_by(order_id=order.id).count() == 1  # 새 행이 생기지 않는다.
+        updated = db_session.query(Return).filter_by(order_id=order.id).one()
+        assert updated.status == "APPROVED"
+        assert result["returns"]["count"] == 1  # 갱신도 "처리됨"으로 집계.
+
+    def test_stale_response_does_not_regress_status(self, db_session, platform):
+        """오래된 응답(이미 REFUNDED인데 REQUESTED가 다시 옴)이 최신 상태를 되돌리지 않는다."""
+        order = _make_order(db_session, platform)
+        conn = StubClaimConnector(
+            returns=[_claim(order.platform_order_no, platform_claim_id="R-1", status="REFUNDED")], supports=("return",)
+        )
+        svc = ClaimSyncService(db_session)
+        svc.sync_claims(conn, platform.id, *SPAN)
+
+        conn._data["returns"][0]["status"] = "REQUESTED"  # 오래된(지연 도착) 응답 재현
+        svc.sync_claims(conn, platform.id, *SPAN)
+
+        assert db_session.query(Return).filter_by(order_id=order.id).one().status == "REFUNDED"
+
+    def test_unknown_raw_status_preserved_as_review_not_completed(self, db_session, platform):
+        """알 수 없는 상태는 REVIEW로 보존하고 완료로 추정하지 않는다."""
+        order = _make_order(db_session, platform)
+        conn = StubClaimConnector(
+            returns=[
+                _claim(order.platform_order_no, platform_claim_id="R-1", status="REVIEW", raw_status="XYZ_UNKNOWN")
+            ],
+            supports=("return",),
+        )
+        result = ClaimSyncService(db_session).sync_claims(conn, platform.id, *SPAN)
+
+        ret = db_session.query(Return).filter_by(order_id=order.id).one()
+        assert ret.status == "REVIEW"
+        assert ret.raw_status == "XYZ_UNKNOWN"
+        assert ret.completed_at is None
+        assert result["returns"]["count"] == 1
+
+    def test_review_status_upgrades_to_recognized_status_later(self, db_session, platform):
+        order = _make_order(db_session, platform)
+        conn = StubClaimConnector(
+            returns=[_claim(order.platform_order_no, platform_claim_id="R-1", status="REVIEW", raw_status="XYZ")],
+            supports=("return",),
+        )
+        svc = ClaimSyncService(db_session)
+        svc.sync_claims(conn, platform.id, *SPAN)
+
+        conn._data["returns"][0]["status"] = "REQUESTED"
+        conn._data["returns"][0]["raw_status"] = "NOW_RECOGNIZED"
+        svc.sync_claims(conn, platform.id, *SPAN)
+
+        assert db_session.query(Return).filter_by(order_id=order.id).one().status == "REQUESTED"
+
+    def test_quantity_shipping_fee_fault_type_persisted(self, db_session, platform):
+        order = _make_order(db_session, platform)
+        conn = StubClaimConnector(
+            exchanges=[
+                _claim(
+                    order.platform_order_no,
+                    platform_claim_id="E-1",
+                    quantity=2,
+                    shipping_fee=3000,
+                    fault_type="CUSTOMER",
+                )
+            ],
+            supports=("exchange",),
+        )
+        ClaimSyncService(db_session).sync_claims(conn, platform.id, *SPAN)
+
+        exch = db_session.query(Exchange).filter_by(order_id=order.id).one()
+        assert exch.quantity == 2
+        assert exch.shipping_fee == 3000
+        assert exch.fault_type == "CUSTOMER"
+
+    def test_order_item_linked_by_platform_order_item_no(self, db_session, platform):
+        order = _make_order(db_session, platform)
+        product = Product(name="p", category="c", base_price=1000, status="ACTIVE")
+        db_session.add(product)
+        db_session.flush()
+        option = ProductOption(product_id=product.id, sku_code="SKU-1", is_active=True)
+        db_session.add(option)
+        db_session.flush()
+        item = OrderItem(
+            order_id=order.id,
+            product_option_id=option.id,
+            platform_order_item_no="LINE-1",
+            quantity=1,
+            unit_price=1000,
+            line_amount=1000,
+        )
+        db_session.add(item)
+        db_session.flush()
+
+        conn = StubClaimConnector(
+            returns=[_claim(order.platform_order_no, platform_claim_id="R-1", platform_order_item_no="LINE-1")],
+            supports=("return",),
+        )
+        ClaimSyncService(db_session).sync_claims(conn, platform.id, *SPAN)
+
+        ret = db_session.query(Return).filter_by(order_id=order.id).one()
+        assert ret.order_item_id == item.id
+
+
+class TestUnmatchedClaimPreservation:
+    """주문이 아직 없는 클레임은 조용히 버리지 않고 보존하며, 이후 주문이 수집되면
+    다음 재수집 시 실제 클레임 행으로 승격한다."""
+
+    def test_unmatched_claim_is_preserved_not_dropped(self, db_session, platform):
+        conn = StubClaimConnector(
+            returns=[_claim("NO-SUCH-ORDER", platform_claim_id="R-1", reason="반품사유")], supports=("return",)
+        )
+        ClaimSyncService(db_session).sync_claims(conn, platform.id, *SPAN)
+
+        held = db_session.query(ClaimUnmatched).all()
+        assert len(held) == 1
+        assert held[0].platform_order_no == "NO-SUCH-ORDER"
+        assert held[0].claim_type == "RETURN"
+        assert held[0].resolved_at is None
+
+    def test_resync_of_unmatched_does_not_duplicate_holding_row(self, db_session, platform):
+        conn = StubClaimConnector(returns=[_claim("NO-SUCH-ORDER", platform_claim_id="R-1")], supports=("return",))
+        svc = ClaimSyncService(db_session)
+        svc.sync_claims(conn, platform.id, *SPAN)
+        svc.sync_claims(conn, platform.id, *SPAN)
+
+        assert db_session.query(ClaimUnmatched).count() == 1
+
+    def test_order_collected_later_resolves_unmatched_on_next_sync(self, db_session, platform):
+        conn = StubClaimConnector(
+            returns=[_claim("LATE-ORDER", platform_claim_id="R-1", reason="반품사유")], supports=("return",)
+        )
+        svc = ClaimSyncService(db_session)
+        svc.sync_claims(conn, platform.id, *SPAN)
+        assert db_session.query(Return).count() == 0
+
+        # order_collect_job이 이후 이 주문을 수집했다고 가정.
+        order = _make_order(db_session, platform, order_no="LATE-ORDER")
+
+        result = svc.sync_claims(conn, platform.id, *SPAN)
+
+        assert result["resolved_unmatched"] == 1
+        promoted = db_session.query(Return).filter_by(order_id=order.id).one()
+        assert promoted.platform_claim_id == "R-1"
+        # 같은 sync_claims() 호출 안에서 승격(REVIEW) 직후 정규 기능별 수집이 곧바로
+        # 같은 클레임을 다시 조회해 실제 상태(REQUESTED)까지 채운다 - REVIEW는 항상
+        # 인식된 상태로 올라갈 수 있으므로(should_apply_claim_status) 한 번에 갱신된다.
+        assert promoted.status == "REQUESTED"
+        unmatched = db_session.query(ClaimUnmatched).filter_by(platform_claim_id="R-1").one()
+        assert unmatched.resolved_at is not None
+        assert unmatched.resolved_entity_id == promoted.id
+
+    def test_no_platform_claim_id_still_holds_unmatched(self, db_session, platform):
+        """공식 claim ID가 없는 경우에도(추측 없이) 미매칭 보존은 동작해야 한다."""
+        conn = StubClaimConnector(cancellations=[_claim("NO-SUCH-ORDER-2")], supports=("cancellation",))
+        ClaimSyncService(db_session).sync_claims(conn, platform.id, *SPAN)
+
+        held = ClaimUnmatchedRepository(db_session).list_unresolved(platform.id)
+        assert len(held) == 1
+        assert held[0].platform_claim_id is None

@@ -20,6 +20,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from api.deps import get_current_user, get_db, require_permission
+from config.settings import settings
 from integrations.malls import get_mall_connector
 from models.extra import Memo
 from models.user import User
@@ -623,6 +624,20 @@ def _claim_http_status(result: dict) -> int:
     responses={404: {"description": "플랫폼을 찾을 수 없습니다."}},
 )
 def sync_claims(payload: OrderSyncRequest, db: Session = Depends(get_db)) -> JSONResponse:
+    if not settings.claims_settlement_sync_enabled:
+        # 실계정 검증 승인 전 기본 차단 - 커넥터를 만들지도, 플랫폼을 조회하지도 않고
+        # 즉시 반환한다(외부 호출 0건). 기존 응답 계약(구조화 body + _claim_http_status)
+        # 은 그대로 유지한다 - UNSUPPORTED는 이미 501로 매핑되어 있다.
+        disabled = {"status": "UNSUPPORTED", "count": 0, "reason_code": "FEATURE_DISABLED", "retryable": False}
+        disabled_result = {
+            "overall_status": "UNSUPPORTED",
+            "cancellations": disabled,
+            "returns": disabled,
+            "exchanges": disabled,
+            "skipped_no_order": 0,
+        }
+        return JSONResponse(status_code=_claim_http_status(disabled_result), content=disabled_result)
+
     platform = PlatformRepository(db).get_by_id(payload.platform_id)
     if platform is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="플랫폼을 찾을 수 없습니다.")

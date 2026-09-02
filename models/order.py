@@ -12,6 +12,7 @@ returns, cancellations
 """
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Optional
 
 from sqlalchemy import DateTime, ForeignKey, Index, Numeric, String, UniqueConstraint
@@ -177,44 +178,113 @@ class ShipmentItem(Base):
     shipment: Mapped["Shipment"] = relationship(back_populates="items")
 
 
+# 상용 ERP 확장(2단계) - 채널 클레임(취소/반품/교환) 수집 공통 필드.
+# platform_claim_id: 채널이 발급한 클레임 고유 ID(쿠팡 receiptId/exchangeId 등) -
+#   같은 주문에 같은 유형의 클레임이 여러 건이어도(부분 클레임) 구분하고, 재수집 시
+#   새 행을 또 만들지 않고 기존 행을 갱신하기 위한 키다. 채널이 고유 ID를 주지 않으면
+#   추측해서 채우지 않고 NULL로 둔다(services.claim_sync_service 참고 - 이 경우
+#   "주문+유형" 단위의 보수적 중복방지로 폴백한다).
+# raw_status: 채널이 준 원본 상태 코드(예: 쿠팡 receiptStatus/exchangeStatus) -
+#   내부 정규화 상태(status)와 분리 보관해, 정규화 매핑이 나중에 바뀌어도 원본을
+#   다시 참조할 수 있게 한다. status="REVIEW"는 원본 코드가 알려진 매핑에 없어(또는
+#   재수집 시 상태가 뒤로 후퇴해) 자동으로 완료/특정 상태로 단정하지 않고 운영자
+#   확인이 필요함을 뜻한다(services.claim_state_machine 참고).
+# quantity/shipping_fee: 채널이 제공하는 경우에만 채운다(제공하지 않으면 NULL -
+#   0이나 임의값으로 추정하지 않는다).
 class Exchange(Base):
     """교환."""
 
     __tablename__ = "exchanges"
+    __table_args__ = (Index("uq_exchange_order_claim_id", "order_id", "platform_claim_id", unique=True),)
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False)
     order_item_id: Mapped[Optional[int]] = mapped_column(ForeignKey("order_items.id"), nullable=True)
     reason: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
-    status: Mapped[str] = mapped_column(String(20), nullable=False)  # REQUESTED/APPROVED/SHIPPED/COMPLETED/REJECTED
+    # REQUESTED/APPROVED/SHIPPED/COMPLETED/REJECTED(+동기화 전용 REVIEW - 위 설명 참고)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
     requested_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    platform_claim_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    raw_status: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    quantity: Mapped[Optional[int]] = mapped_column(nullable=True)
+    shipping_fee: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2), nullable=True)
+    # 귀책 주체 - 채널이 제공하는 경우에만(예: 쿠팡 교환 faultType: COUPANG/VENDOR/
+    # CUSTOMER/WMS/GENERAL 원본값 그대로 저장, 내부 재정의 없음).
+    fault_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
 
 
 class Return(Base):
     """반품."""
 
     __tablename__ = "returns"
+    __table_args__ = (Index("uq_return_order_claim_id", "order_id", "platform_claim_id", unique=True),)
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False)
     order_item_id: Mapped[Optional[int]] = mapped_column(ForeignKey("order_items.id"), nullable=True)
     reason: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
     refund_amount: Mapped[Optional[float]] = mapped_column(Numeric(14, 2), nullable=True)
-    status: Mapped[str] = mapped_column(String(20), nullable=False)  # REQUESTED/APPROVED/RECEIVED/REFUNDED/REJECTED
+    # REQUESTED/APPROVED/RECEIVED/REFUNDED/REJECTED(+동기화 전용 REVIEW)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
     requested_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    platform_claim_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    raw_status: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    quantity: Mapped[Optional[int]] = mapped_column(nullable=True)
+    shipping_fee: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2), nullable=True)
+    # 귀책 주체 - 반품도 채널이 제공하는 경우가 있다(예: 쿠팡 반품 응답의 faultByType).
+    fault_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
 
 
 class Cancellation(Base):
     """취소."""
 
     __tablename__ = "cancellations"
+    __table_args__ = (Index("uq_cancellation_order_claim_id", "order_id", "platform_claim_id", unique=True),)
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False)
+    # 취소는 기존에 주문 라인 연결이 없었다(주문 전체 취소만 가정) - 상용 ERP 확장(2단계)에서
+    # 라인 단위 부분취소를 표현할 수 있도록 반품/교환과 동일하게 추가한다(NULL이면 주문 전체).
+    order_item_id: Mapped[Optional[int]] = mapped_column(ForeignKey("order_items.id"), nullable=True)
     reason: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
     refund_amount: Mapped[Optional[float]] = mapped_column(Numeric(14, 2), nullable=True)
-    status: Mapped[str] = mapped_column(String(20), nullable=False)  # REQUESTED/COMPLETED
+    # REQUESTED/COMPLETED(+동기화 전용 REVIEW)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
     requested_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    platform_claim_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    raw_status: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    quantity: Mapped[Optional[int]] = mapped_column(nullable=True)
+    shipping_fee: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2), nullable=True)
+    fault_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+
+
+class ClaimUnmatched(Base):
+    """아직 수집되지 않은 주문(platform_order_no로 매칭 실패)의 클레임을 조용히 버리지
+    않고 보존한다 - order_collect_job이 나중에 그 주문을 수집하면, 다음 클레임
+    재수집 시(ClaimSyncService._resolve_pending_unmatched) 실제 Cancellation/Return/
+    Exchange 행으로 승격되고 이 행은 resolved_at이 채워진다.
+
+    원본 응답 전체는 저장하지 않는다(보존정책 승인 전) - 재매칭에 필요한 최소 필드만
+    담는다. reason은 안전하게 잘라 저장한다(개인정보 원문 없음).
+    """
+
+    __tablename__ = "claim_unmatched_items"
+    __table_args__ = (
+        Index(
+            "uq_claim_unmatched_key", "platform_id", "claim_type", "platform_claim_id", "platform_order_no", unique=True
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    platform_id: Mapped[int] = mapped_column(ForeignKey("platforms.id"), nullable=False)
+    claim_type: Mapped[str] = mapped_column(String(20), nullable=False)  # CANCELLATION/RETURN/EXCHANGE
+    platform_claim_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    platform_order_no: Mapped[str] = mapped_column(String(100), nullable=False)
+    raw_status: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    reason: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    detected_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    resolved_entity_id: Mapped[Optional[int]] = mapped_column(nullable=True)

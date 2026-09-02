@@ -29,9 +29,18 @@ fetch_orders()/fetch_order_detail() 반환 항목:
 
 fetch_settlements() 반환 항목:
     {
-        "settlement_cycle": str, "scheduled_date": date, "settled_date": Optional[date],
-        "expected_amount": float, "settled_amount": float, "status": str,
+        "settlement_cycle": str, "settlement_type": Optional[str], "scheduled_date": date,
+        "settled_date": Optional[date], "expected_amount": Decimal, "settled_amount": Decimal, "status": str,
     }
+
+fetch_settlement_details() 반환 항목(상용 ERP 확장 2단계 - 정산 회차의 주문별 상세,
+채널이 회차 요약과 별도 API로 준다면 그 결과를 그대로 정규화한다):
+    {
+        "platform_order_no": str, "platform_order_item_no": Optional[str],
+        "sale_type": "SALE"|"REFUND", "recognition_date": Optional[date], "settled_date": Optional[date],
+        "gross_amount": Decimal, "fee_amount": Decimal, "net_amount": Decimal,
+    }
+    금액 부호는 채널이 준 값을 그대로 따른다(REFUND가 음수일 수 있다 - 임의 반전 금지).
 
 실제 API 키가 없으면(또는 session/platform_id가 주어지지 않으면) 각
 구현체는 위 형식에 맞는 더미(가짜) 데이터를 생성한다. session과 platform_id를
@@ -76,6 +85,10 @@ class BaseMallConnector(ABC):
     # 오버라이드한다 - services.shipment_dispatch_service가 이 플래그로 채널을
     # 건너뛸지(CapabilityUnsupported) 판단한다.
     supports_shipment_submit: bool = False
+    # 정산 회차 요약/상세(주문 단위) 수집 지원 여부 - 상용 ERP 확장(2단계). 취소/반품/
+    # 교환과 같은 원칙: capability가 False면 서비스가 fetch_*를 호출하지 않는다.
+    supports_settlement_sync: bool = False
+    supports_settlement_detail_sync: bool = False
 
     def _marketplace_code(self) -> str:
         """오류 메시지용 안전한 채널 식별자(Secret/PII 아님). platform_code가 없으면 클래스명."""
@@ -143,32 +156,53 @@ class BaseMallConnector(ABC):
         supports_cancellation_sync=True인 커넥터만 오버라이드한다. 서비스는 capability가
         False면 이 메서드를 호출하지 않으므로, 이 raise는 직접 호출에 대한 2차 방어다.
 
-        반환 형식(정규화):
+        반환 형식(정규화, *는 2단계에서 추가된 선택 필드 - 채널이 제공하는 경우에만
+        채우고, 제공하지 않으면 생략하거나 None으로 둔다. 임의로 추정해 채우지 않는다):
             {"platform_order_no": str, "reason": Optional[str],
-             "status": "REQUESTED"|"COMPLETED", "requested_at": datetime,
-             "refund_amount": Optional[float]}
+             "status": "REQUESTED"|"COMPLETED"|"REVIEW", "requested_at": datetime,
+             "refund_amount": Optional[float],
+             "platform_claim_id": Optional[str],       # * 채널의 클레임 고유 ID(재수집 갱신/부분클레임 구분용)
+             "raw_status": Optional[str],               # * 채널 원본 상태 코드(정규화 이전)
+             "platform_order_item_no": Optional[str],   # * 상품주문/라인 식별자(OrderItem 연결용)
+             "quantity": Optional[int],
+             "shipping_fee": Optional[float],
+             "fault_type": Optional[str]}              # * 귀책 주체(채널이 제공하는 경우에만)
         """
         raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "cancellation_sync")
 
     def fetch_returns(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
         """기간 내 반품 내역을 정규화된 형식으로 조회한다(기본: 미지원 오류).
 
-        반환 형식(정규화):
+        반환 형식(정규화, *는 fetch_cancellations 참고와 동일한 2단계 선택 필드):
             {"platform_order_no": str, "reason": Optional[str],
-             "status": "REQUESTED"|"APPROVED"|"RECEIVED"|"REFUNDED"|"REJECTED",
-             "requested_at": datetime, "refund_amount": Optional[float]}
+             "status": "REQUESTED"|"APPROVED"|"RECEIVED"|"REFUNDED"|"REJECTED"|"REVIEW",
+             "requested_at": datetime, "refund_amount": Optional[float],
+             "platform_claim_id": Optional[str], "raw_status": Optional[str],
+             "platform_order_item_no": Optional[str], "quantity": Optional[int],
+             "shipping_fee": Optional[float], "fault_type": Optional[str]}
         """
         raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "return_sync")
 
     def fetch_exchanges(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
         """기간 내 교환 내역을 정규화된 형식으로 조회한다(기본: 미지원 오류).
 
-        반환 형식(정규화):
+        반환 형식(정규화, *는 fetch_cancellations 참고와 동일한 2단계 선택 필드.
+        fault_type은 교환 전용 - 채널이 귀책 주체를 제공하는 경우에만 원본값 그대로):
             {"platform_order_no": str, "reason": Optional[str],
-             "status": "REQUESTED"|"APPROVED"|"SHIPPED"|"COMPLETED"|"REJECTED",
-             "requested_at": datetime}
+             "status": "REQUESTED"|"APPROVED"|"SHIPPED"|"COMPLETED"|"REJECTED"|"REVIEW",
+             "requested_at": datetime,
+             "platform_claim_id": Optional[str], "raw_status": Optional[str],
+             "platform_order_item_no": Optional[str], "quantity": Optional[int],
+             "shipping_fee": Optional[float], "fault_type": Optional[str]}
         """
         raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "exchange_sync")
+
+    def fetch_settlement_details(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+        """기간 내 정산 상세(주문 단위) 내역을 정규화된 형식으로 조회한다(기본: 미지원
+        오류). supports_settlement_detail_sync=True인 커넥터만 오버라이드한다.
+
+        반환 형식은 모듈 docstring의 fetch_settlement_details() 항목 참고."""
+        raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "settlement_detail_sync")
 
     def fetch_products(self) -> list[dict[str, Any]]:
         """상품 목록을 정규화된 형식으로 조회한다(services.product_sync_service.

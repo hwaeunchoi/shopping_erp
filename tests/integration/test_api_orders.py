@@ -6,6 +6,10 @@ api/routers/orders.py 통합 테스트: 조회, 404, 인증/RBAC, 커넥터 연�
 
 from datetime import datetime, timezone
 
+import pytest
+
+from config.settings import settings
+
 
 def _create_order(api_session_factory, platform_id: int, order_no: str, order_date: datetime, status: str = "NEW"):
     from models.order import Order
@@ -259,6 +263,14 @@ class _StubClaimConnector:
 
 
 class TestSyncClaims:
+    """settings.claims_settlement_sync_enabled는 기본 False(실전송 기본 차단)이므로,
+    capability(지원/미지원) 자체를 검증하는 이 클래스의 나머지 테스트에서는 켜 둔다 -
+    TestSyncClaimsDisabledByDefault만 자체적으로 다시 꺼서 기본 차단을 검증한다."""
+
+    @pytest.fixture(autouse=True)
+    def _enable_claims_settlement_sync(self, monkeypatch):
+        monkeypatch.setattr(settings, "claims_settlement_sync_enabled", True)
+
     def _post(self, client, auth_headers, seed_data):
         return client.post(
             "/api/orders/sync-claims",
@@ -274,8 +286,11 @@ class TestSyncClaims:
     def _patch(self, monkeypatch, conn):
         monkeypatch.setattr("api.routers.orders.get_mall_connector", lambda *a, **k: conn)
 
-    def test_all_unsupported_returns_501_with_structured_body(self, client, auth_headers, seed_data):
-        # seed 플랫폼(쿠팡)은 세 capability 모두 False -> 전 기능 미지원 -> 501(성공 위장 아님).
+    def test_all_unsupported_returns_501_with_structured_body(self, client, auth_headers, seed_data, monkeypatch):
+        # 세 capability 모두 False인 커넥터로 강제(실제 쿠팡 커넥터는 상용 ERP 확장
+        # 2단계에서 반품/교환을 지원하게 됐으므로, 이 테스트의 의도(capability 자체가
+        # 없을 때의 501/UNSUPPORTED)를 정확히 재현하려면 스텁으로 고정해야 한다).
+        self._patch(monkeypatch, _StubClaimConnector(supports=()))
         resp = self._post(client, auth_headers, seed_data)
         assert resp.status_code == 501
         body = resp.json()
@@ -348,6 +363,52 @@ class TestSyncClaims:
         resp = self._post(client, auth_headers, seed_data)
         assert resp.status_code == 502
         assert resp.json()["overall_status"] == "FAILED"
+
+
+class TestSyncClaimsDisabledByDefault:
+    """실전송 기본 차단: 이 클래스는 TestSyncClaims의 autouse 픽스처를 상속하지 않으므로
+    실제 기본값(False) 상태에서 API가 플랫폼 조회/커넥터 생성 없이 안전하게 차단되는지
+    확인한다."""
+
+    def test_sync_claims_returns_501_without_touching_connector(self, client, auth_headers, seed_data, monkeypatch):
+        monkeypatch.setattr(settings, "claims_settlement_sync_enabled", False)
+        called = {"n": 0}
+
+        def _fail_if_called(*a, **k):
+            called["n"] += 1
+            raise AssertionError("기능이 OFF인데 get_mall_connector가 호출되었습니다.")
+
+        monkeypatch.setattr("api.routers.orders.get_mall_connector", _fail_if_called)
+
+        resp = client.post(
+            "/api/orders/sync-claims",
+            json={
+                "platform_id": seed_data["platform_id"],
+                "warehouse_id": seed_data["warehouse_id"],
+                "start_date": "2026-01-01",
+                "end_date": "2026-01-31",
+            },
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 501
+        body = resp.json()
+        assert body["overall_status"] == "UNSUPPORTED"
+        assert body["cancellations"]["reason_code"] == "FEATURE_DISABLED"
+        assert called["n"] == 0
+
+    def test_sync_claims_disabled_even_for_unknown_platform(self, client, auth_headers, monkeypatch):
+        """플랫폼 조회조차 하지 않는다 - 존재하지 않는 platform_id를 줘도 404가 아니라
+        여전히 501(비활성화)이다."""
+        monkeypatch.setattr(settings, "claims_settlement_sync_enabled", False)
+
+        resp = client.post(
+            "/api/orders/sync-claims",
+            json={"platform_id": 999999, "warehouse_id": 1, "start_date": "2026-01-01", "end_date": "2026-01-31"},
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 501
 
 
 class TestFilters:

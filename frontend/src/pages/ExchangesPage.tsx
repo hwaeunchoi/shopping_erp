@@ -149,6 +149,9 @@ export function ExchangesPage() {
                 <th>주문ID</th>
                 <th>사유</th>
                 <th>상태</th>
+                <th>채널 클레임ID</th>
+                <th>채널 원본상태</th>
+                <th>귀책</th>
                 <th>신청일시</th>
                 <th>완료일시</th>
                 <th>상태 변경</th>
@@ -161,6 +164,9 @@ export function ExchangesPage() {
                   <td>{ex.order_id}</td>
                   <td>{ex.reason ?? '-'}</td>
                   <td><span className="status-badge">{ex.status}</span></td>
+                  <td>{ex.platform_claim_id ?? '-'}</td>
+                  <td>{ex.raw_status ?? '-'}</td>
+                  <td>{ex.fault_type ?? '-'}</td>
                   <td>{new Date(ex.requested_at).toLocaleString()}</td>
                   <td>{ex.completed_at ? new Date(ex.completed_at).toLocaleString() : '-'}</td>
                   <td>
@@ -180,7 +186,7 @@ export function ExchangesPage() {
                 </tr>
               ))}
               {data.items.length === 0 && (
-                <tr><td colSpan={7}>등록된 교환 신청이 없습니다.</td></tr>
+                <tr><td colSpan={10}>등록된 교환 신청이 없습니다.</td></tr>
               )}
             </tbody>
           </table>

@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 from models.customer import Customer
 from models.extra import Memo
 from models.inventory import Inventory
-from models.order import Cancellation, Exchange, Order, OrderItem, Return, Shipment, ShipmentItem
+from models.order import Cancellation, ClaimUnmatched, Exchange, Order, OrderItem, Return, Shipment, ShipmentItem
 from models.product import Product, ProductOption, ProductPlatformMap
 from models.supplier import ProductSupplierMap, Supplier
 from repositories.base_repository import BaseRepository
@@ -392,6 +392,14 @@ class OrderRepository(BaseRepository[Order]):
     def get_item_by_id(self, order_item_id: int) -> Optional[OrderItem]:
         return self.session.get(OrderItem, order_item_id)
 
+    def get_item_by_platform_order_item_no(self, order_id: int, platform_order_item_no: str) -> Optional[OrderItem]:
+        """클레임(취소/반품/교환) 수집 시 채널 라인 식별자(예: 쿠팡 vendorItemId)로
+        어느 주문상품에 대한 클레임인지 연결한다(services.claim_sync_service 참고)."""
+        stmt = select(OrderItem).where(
+            OrderItem.order_id == order_id, OrderItem.platform_order_item_no == platform_order_item_no
+        )
+        return self.session.execute(stmt).scalar_one_or_none()
+
     def has_items_for_option(self, product_option_id: int) -> bool:
         """이 옵션(SKU)을 참조하는 실제 주문상품이 하나라도 있는지 확인한다.
 
@@ -515,6 +523,11 @@ class ExchangeRepository(BaseRepository[Exchange]):
         stmt = select(Exchange).where(Exchange.status == status)
         return list(self.session.execute(stmt).scalars().all())
 
+    def get_by_order_and_claim_id(self, order_id: int, platform_claim_id: str) -> Optional[Exchange]:
+        """재수집 시 이미 있는 클레임인지 확인한다(uq_exchange_order_claim_id와 짝)."""
+        stmt = select(Exchange).where(Exchange.order_id == order_id, Exchange.platform_claim_id == platform_claim_id)
+        return self.session.execute(stmt).scalar_one_or_none()
+
     def list_filtered(
         self,
         status: Optional[str] = None,
@@ -554,6 +567,11 @@ class ReturnRepository(BaseRepository[Return]):
     def list_by_status(self, status: str) -> list[Return]:
         stmt = select(Return).where(Return.status == status)
         return list(self.session.execute(stmt).scalars().all())
+
+    def get_by_order_and_claim_id(self, order_id: int, platform_claim_id: str) -> Optional[Return]:
+        """재수집 시 이미 있는 클레임인지 확인한다(uq_return_order_claim_id와 짝)."""
+        stmt = select(Return).where(Return.order_id == order_id, Return.platform_claim_id == platform_claim_id)
+        return self.session.execute(stmt).scalar_one_or_none()
 
     def list_filtered(
         self,
@@ -595,6 +613,13 @@ class CancellationRepository(BaseRepository[Cancellation]):
         stmt = select(Cancellation).where(Cancellation.status == status)
         return list(self.session.execute(stmt).scalars().all())
 
+    def get_by_order_and_claim_id(self, order_id: int, platform_claim_id: str) -> Optional[Cancellation]:
+        """재수집 시 이미 있는 클레임인지 확인한다(uq_cancellation_order_claim_id와 짝)."""
+        stmt = select(Cancellation).where(
+            Cancellation.order_id == order_id, Cancellation.platform_claim_id == platform_claim_id
+        )
+        return self.session.execute(stmt).scalar_one_or_none()
+
     def list_filtered(
         self,
         status: Optional[str] = None,
@@ -625,3 +650,25 @@ class CancellationRepository(BaseRepository[Cancellation]):
             _filtered_stmt(Cancellation, status, order_id, start_date, end_date, search).subquery()
         )
         return self.session.execute(stmt).scalar_one()
+
+
+class ClaimUnmatchedRepository(BaseRepository[ClaimUnmatched]):
+    """아직 수집되지 않은 주문의 클레임 보존소(models.order.ClaimUnmatched 참고)."""
+
+    def __init__(self, session: Session) -> None:
+        super().__init__(session, ClaimUnmatched)
+
+    def get_by_key(self, platform_id: int, claim_type: str, platform_claim_id: Optional[str], platform_order_no: str):
+        stmt = select(ClaimUnmatched).where(
+            ClaimUnmatched.platform_id == platform_id,
+            ClaimUnmatched.claim_type == claim_type,
+            ClaimUnmatched.platform_claim_id == platform_claim_id,
+            ClaimUnmatched.platform_order_no == platform_order_no,
+        )
+        return self.session.execute(stmt).scalar_one_or_none()
+
+    def list_unresolved(self, platform_id: Optional[int] = None) -> list[ClaimUnmatched]:
+        stmt = select(ClaimUnmatched).where(ClaimUnmatched.resolved_at.is_(None))
+        if platform_id is not None:
+            stmt = stmt.where(ClaimUnmatched.platform_id == platform_id)
+        return list(self.session.execute(stmt.order_by(ClaimUnmatched.detected_at.desc())).scalars())

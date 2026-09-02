@@ -186,8 +186,21 @@ class NaverSmartstoreConnector(BaseMallConnector):
         return ShipmentSubmitResult(accepted=False, platform_result_code=fail_code)
 
     def fetch_settlements(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
-        # 정산 연동 미구현 - 더미로 위장하지 않고 미지원 오류를 던진다.
+        # 정산 연동 미구현 - 더미로 위장하지 않고 미지원 오류를 던진다. 상용 ERP 확장
+        # (2단계) 조사에서도 apicenter.commerce.naver.com/GitHub commerce-api-naver
+        # discussions를 확인했으나 판매자용 정산/지급 조회 API 스펙을 찾지 못했다
+        # (2026-09 조회) - 확인되지 않은 계약을 지어내지 않고 미지원으로 유지한다.
         raise MarketplaceCapabilityUnsupportedError("naver", "settlement")
+
+    # 취소/반품/교환(fetch_cancellations/fetch_returns/fetch_exchanges)도 상용 ERP 확장
+    # (2단계)에서 조사했으나 base 기본 구현(미지원 오류)을 그대로 상속한다: 클레임
+    # 정보(claimId/claimStatus 등)는 "상품주문 상세 조회"(단건, productOrderId 필요)
+    # 응답에서만 확인되고, 쿠팡의 returnRequests/exchangeRequests처럼 기간으로 대량
+    # 조회하는 별도 목록 API가 공식 문서/GitHub discussions에서 확인되지 않았다
+    # (2026-09 조회) - 단건 조회를 주문 수만큼 반복 호출하는 구조는 이번 범위에서
+    # 구현하지 않는다(확인되지 않은 계약으로 짐작해 구현하지 않기 위함).
+    # supports_cancellation_sync/supports_return_sync/supports_exchange_sync는
+    # base 기본값(False)을 그대로 상속한다.
 
     def fetch_products(self) -> list[dict[str, Any]]:
         """상품(원본상품 + 채널상품 + 옵션조합) 목록을 정규화된 형식으로 조회한다.

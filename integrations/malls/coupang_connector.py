@@ -34,6 +34,7 @@ import logging
 import time as time_module
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Optional
 from urllib.parse import urlencode
 
@@ -84,10 +85,67 @@ INVOICE_PATH_TMPL = "/v2/providers/openapi/apis/api/v4/vendors/{vendor_id}/order
 RATE_LIMIT_MAX_RETRIES = 5
 RATE_LIMIT_BACKOFF_BASE_SECONDS = 1.0
 
+# --- 반품/취소 요청 목록 조회 (공식 문서: developers.coupang.com/ko/api/returns/
+# return-cancellation-request-list-query, 2026-09 조회) ---
+RETURN_REQUEST_PATH_TMPL = "/v2/providers/openapi/apis/api/v6/vendors/{vendor_id}/returnRequests"
+# status 쿼리 파라미터 코드(공식 문서 파라미터 표 원문): RU(출고중지요청)/UC(반품접수)/
+# CC(반품완료)/PR(쿠팡확인요청). status를 생략하면 orderId가 필수가 되고, cancelType=
+# CANCEL은 status 자체를 받을 수 없어(제거해야 함) 결과적으로 orderId 없이는(기간만
+# 으로는) 취소 목록을 조회할 공식 경로가 없다 - 그래서 취소(CANCEL)는 미지원으로 남기고
+# (supports_cancellation_sync는 기본값 False를 그대로 상속), 반품(RETURN, cancelType
+# 기본값)만 상태코드별로 순회해 기간 기반 대량 수집을 구현한다(주문 조회와 동일 이유로
+# 동일한 패턴 - 상태가 필수이며 한 번에 한 상태만 준다).
+RETURN_STATUS_CODES = ["RU", "UC", "CC", "PR"]
+RETURN_MAX_PER_PAGE = 50
+RETURN_MAX_RANGE_DAYS = 31
+
+# 응답 필드 receiptStatus(응답 예시로 확인, 파라미터 표의 코드와는 다른 표기) -> 내부
+# 정규화 상태. 실 응답 예시에서 확인된 값만 매핑하고 나머지는 REVIEW로 보존한다(완료로
+# 추정 금지) - services.claim_state_machine 참고.
+_RETURN_RAW_TO_STATUS = {
+    "RELEASE_STOP_UNCHECKED": "REQUESTED",  # 출고중지요청
+    "RETURNS_UNCHECKED": "REQUESTED",  # 반품접수
+    "VENDOR_WAREHOUSE_CONFIRM": "RECEIVED",  # 입고완료
+    "REQUEST_COUPANG_CHECK": "APPROVED",  # 쿠팡확인요청
+    "RETURNS_COMPLETED": "REFUNDED",  # 반품완료
+}
+
+# --- 교환 요청 목록 조회 (공식 문서: developers.coupang.com/ko/api/exchanges/
+# query-a-list-of-exchange-requests, 2026-09 조회) ---
+EXCHANGE_REQUEST_PATH_TMPL = "/v2/providers/openapi/apis/api/v4/vendors/{vendor_id}/exchangeRequests"
+# 조회기간 최대 7일(공식 문서 확인) - 반품/주문의 31일 제약보다 짧다.
+EXCHANGE_MAX_RANGE_DAYS = 7
+
+_EXCHANGE_RAW_TO_STATUS = {
+    "RECEIPT": "REQUESTED",
+    "PROGRESS": "APPROVED",
+    "SUCCESS": "COMPLETED",
+    "REJECT": "REJECTED",
+    "CANCEL": "REJECTED",  # 교환 철회 - 내부에는 별도 "철회" 상태가 없어 REJECTED로 취급.
+}
+
+# --- 정산 (공식 문서: developers.coupang.com/ko/api/settlement/settlement-detail-query
+# 및 .../sales-detail-query, 2026-09 조회) ---
+# 정산 회차 요약(월 단위 조회) - settlement_sync_job이 Settlement 행을 만드는 데 쓴다.
+SETTLEMENT_HISTORIES_PATH = "/v2/providers/marketplace_openapi/apis/api/v1/settlement-histories"
+# 주문 단위 매출/정산 상세 - SettlementDetail 행을 만드는 데 쓴다(정산 회차와는
+# 별도 API라 서로 다른 메서드/capability로 분리했다: fetch_settlements vs
+# fetch_settlement_details).
+REVENUE_HISTORY_PATH = "/v2/providers/openapi/apis/api/v1/revenue-history"
+REVENUE_HISTORY_MAX_RANGE_DAYS = 31
+
+_SETTLEMENT_STATUS_TO_STD = {"DONE": "COMPLETED", "SUBJECT": "SCHEDULED"}
+
 
 class CoupangConnector(BaseMallConnector):
     platform_code = "coupang"
     supports_shipment_submit = True
+    supports_return_sync = True
+    supports_exchange_sync = True
+    supports_settlement_sync = True
+    supports_settlement_detail_sync = True
+    # 취소(CANCEL)는 기간만으로 대량 조회할 공식 API 경로가 없다(RETURN_STATUS_CODES
+    # 주석 참고) - supports_cancellation_sync는 base 기본값(False)을 그대로 상속한다.
 
     def __init__(
         self, session: Any = None, platform_id: Optional[int] = None, http_client: Optional[httpx.Client] = None
@@ -169,8 +227,48 @@ class CoupangConnector(BaseMallConnector):
         return ShipmentSubmitResult(accepted=succeed, platform_result_code=str(payload.get("responseCode")))
 
     def fetch_settlements(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
-        # 정산 연동 미구현 - 더미로 위장하지 않고 미지원 오류를 던진다.
-        raise MarketplaceCapabilityUnsupportedError("coupang", "settlement")
+        """정산 회차 요약 조회(공식 문서: developers.coupang.com/ko/api/settlement/
+        settlement-detail-query, 2026-09 조회) - revenueRecognitionYearMonth(YYYY-MM)
+        단위로만 조회 가능해, [start_date, end_date]가 걸치는 각 월을 순회해 호출한다."""
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("coupang")
+        access_key, secret_key, _vendor_id = credentials
+        raw_items = self._fetch_raw_settlement_histories(start_date, end_date, access_key, secret_key)
+        return self._normalize_settlement_histories(raw_items)
+
+    def fetch_returns(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+        """반품 목록 조회(공식 문서: developers.coupang.com/ko/api/returns/
+        return-cancellation-request-list-query, 2026-09 조회) - status 코드별로 순회해
+        기간 내 전체를 모은다(모듈 상수 RETURN_STATUS_CODES 참고)."""
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("coupang")
+        access_key, secret_key, vendor_id = credentials
+        raw_items = self._fetch_raw_return_requests(start_date, end_date, access_key, secret_key, vendor_id)
+        return self._normalize_return_requests(raw_items)
+
+    def fetch_exchanges(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+        """교환 목록 조회(공식 문서: developers.coupang.com/ko/api/exchanges/
+        query-a-list-of-exchange-requests, 2026-09 조회) - 조회기간 최대 7일이라
+        내부적으로 7일 단위로 나눠 호출한다."""
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("coupang")
+        access_key, secret_key, vendor_id = credentials
+        raw_items = self._fetch_raw_exchange_requests(start_date, end_date, access_key, secret_key, vendor_id)
+        return self._normalize_exchange_requests(raw_items)
+
+    def fetch_settlement_details(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+        """매출내역(주문 단위 정산 상세) 조회(공식 문서: developers.coupang.com/ko/api/
+        settlement/sales-detail-query, 2026-09 조회) - recognitionDate(매출인식일) 기준
+        최대 31일 범위만 허용해 31일 단위로 나눠 token 페이지네이션으로 끝까지 순회한다."""
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("coupang")
+        access_key, secret_key, vendor_id = credentials
+        raw_items = self._fetch_raw_revenue_history(start_date, end_date, access_key, secret_key, vendor_id)
+        return self._normalize_revenue_history(raw_items)
 
     def fetch_products(self) -> list[dict[str, Any]]:
         # 상품 연동 미구현 - 빈 목록(정상 0건 위장) 대신 미지원 오류를 던진다.
@@ -381,6 +479,270 @@ class CoupangConnector(BaseMallConnector):
             )
         return normalized
 
+    # --- 반품 목록 조회 ---
+
+    def _fetch_raw_return_requests(
+        self, start_date: date, end_date: date, access_key: str, secret_key: str, vendor_id: str
+    ) -> list[dict[str, Any]]:
+        path = RETURN_REQUEST_PATH_TMPL.format(vendor_id=vendor_id)
+        raw_items: list[dict[str, Any]] = []
+
+        for status_value in RETURN_STATUS_CODES:
+            window_start = start_date
+            while window_start < end_date:
+                window_end = min(window_start + timedelta(days=RETURN_MAX_RANGE_DAYS), end_date)
+                next_token = ""
+                while True:
+                    params: list[tuple[str, str]] = [
+                        ("createdAtFrom", window_start.isoformat()),
+                        ("createdAtTo", window_end.isoformat()),
+                        ("status", status_value),
+                        ("maxPerPage", str(RETURN_MAX_PER_PAGE)),
+                    ]
+                    if next_token:
+                        params.append(("nextToken", next_token))
+                    query = urlencode(params)
+                    authorization = self._authorization(access_key, secret_key, "GET", path, query)
+                    response = self._request_with_retry(
+                        "GET", f"{path}?{query}", headers={"Authorization": authorization}
+                    )
+                    raise_for_status("coupang", response.status_code)
+                    with external_call("coupang"):
+                        payload = response.json()
+                        raw_items.extend(payload.get("data", []) or [])
+                        next_token = payload.get("nextToken") or ""
+                    if not next_token:
+                        break
+                window_start = window_end
+
+        return raw_items
+
+    @staticmethod
+    def _normalize_return_requests(raw_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """receiptType=="RETURN"만 대상으로 한다(CANCEL은 이 메서드의 대상이 아니다 -
+        fetch_returns()가 조회한 상태코드로는 RETURN 유형만 나오는 것으로 확인했지만,
+        방어적으로 한 번 더 필터링한다). 여러 라인이 포함된 반품은 첫 라인에만
+        order_item을 연결하고 수량은 라인별 합계로 기록한다(다중 라인 클레임을
+        완전히 분해하는 것은 이번 범위 밖)."""
+        normalized = []
+        for item in raw_items:
+            if item.get("receiptType") != "RETURN":
+                continue
+            order_id = item.get("orderId")
+            if order_id is None:
+                continue
+            raw_status = item.get("receiptStatus")
+            std_status = _RETURN_RAW_TO_STATUS.get(raw_status or "")
+            if std_status is None:
+                logger.warning("알 수 없는 쿠팡 반품 상태 - REVIEW로 보존")
+                std_status = "REVIEW"
+            return_items = item.get("returnItems") or []
+            first_item = return_items[0] if return_items else {}
+            quantity = sum(int(ri.get("cancelCount", 0) or 0) for ri in return_items) or None
+            shipping_fee = _money_to_decimal(item.get("returnShippingCharge"))
+            reason = item.get("reasonCodeText") or item.get("cancelReasonCategory2") or item.get("reasonCode")
+            normalized.append(
+                {
+                    "platform_order_no": str(order_id),
+                    "platform_claim_id": (str(item["receiptId"]) if item.get("receiptId") is not None else None),
+                    "platform_order_item_no": (
+                        str(first_item["vendorItemId"]) if first_item.get("vendorItemId") is not None else None
+                    ),
+                    "reason": _clip_reason(reason),
+                    "status": std_status,
+                    "raw_status": raw_status,
+                    "requested_at": _parse_coupang_offset_datetime(item.get("createdAt")),
+                    # 이 API는 환불액을 제공하지 않는다(0으로 추정하지 않음 - None 유지).
+                    "refund_amount": None,
+                    "quantity": quantity,
+                    "shipping_fee": shipping_fee,
+                    "fault_type": item.get("faultByType"),
+                }
+            )
+        return normalized
+
+    # --- 교환 목록 조회 ---
+
+    def _fetch_raw_exchange_requests(
+        self, start_date: date, end_date: date, access_key: str, secret_key: str, vendor_id: str
+    ) -> list[dict[str, Any]]:
+        path = EXCHANGE_REQUEST_PATH_TMPL.format(vendor_id=vendor_id)
+        raw_items: list[dict[str, Any]] = []
+
+        window_start = start_date
+        while window_start < end_date:
+            window_end = min(window_start + timedelta(days=EXCHANGE_MAX_RANGE_DAYS), end_date)
+            next_token = ""
+            while True:
+                params: list[tuple[str, str]] = [
+                    ("createdAtFrom", f"{window_start.isoformat()}T00:00:00"),
+                    ("createdAtTo", f"{window_end.isoformat()}T00:00:00"),
+                ]
+                if next_token:
+                    params.append(("nextToken", next_token))
+                query = urlencode(params)
+                authorization = self._authorization(access_key, secret_key, "GET", path, query)
+                response = self._request_with_retry("GET", f"{path}?{query}", headers={"Authorization": authorization})
+                raise_for_status("coupang", response.status_code)
+                with external_call("coupang"):
+                    payload = response.json()
+                    raw_items.extend(payload.get("data", []) or [])
+                    next_token = payload.get("nextToken") or ""
+                if not next_token:
+                    break
+            window_start = window_end
+
+        return raw_items
+
+    @staticmethod
+    def _normalize_exchange_requests(raw_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """vendorItemId(OrderItem 연결 키)는 exchangeItemDtoV1s가 아니라 더 깊은
+        collectInformationsDto.returndeliveryItemDtos에 있다(공식 문서 Response 확인,
+        2026-09) - 회수정보가 채워지기 전에는 없을 수 있어, 없으면 라인 연결 없이
+        주문 단위로만 남긴다(추측 금지)."""
+        normalized = []
+        for item in raw_items:
+            order_id = item.get("orderId")
+            if order_id is None:
+                continue
+            raw_status = item.get("exchangeStatus")
+            std_status = _EXCHANGE_RAW_TO_STATUS.get(raw_status or "")
+            if std_status is None:
+                logger.warning("알 수 없는 쿠팡 교환 상태 - REVIEW로 보존")
+                std_status = "REVIEW"
+            exchange_items = item.get("exchangeItemDtoV1s") or []
+            quantity = sum(int(ei.get("quantity", 0) or 0) for ei in exchange_items) or None
+            collect_items = ((item.get("collectInformationsDto") or {}).get("returndeliveryItemDtos")) or []
+            vendor_item_id = collect_items[0].get("vendorItemId") if collect_items else None
+            reason = item.get("reasonCodeText") or item.get("reason") or item.get("reasonCode")
+            normalized.append(
+                {
+                    "platform_order_no": str(order_id),
+                    "platform_claim_id": (str(item["exchangeId"]) if item.get("exchangeId") is not None else None),
+                    "platform_order_item_no": str(vendor_item_id) if vendor_item_id is not None else None,
+                    "reason": _clip_reason(reason),
+                    "status": std_status,
+                    "raw_status": raw_status,
+                    "requested_at": _parse_coupang_offset_datetime(item.get("createdAt")),
+                    "quantity": quantity,
+                    # exchangeAmount("교환배송비") - 공식 문서상 숫자로 확인됐으나(2026-09),
+                    # 다른 쿠팡 API처럼 {currencyCode, units, nanos} 구조로 올 가능성도
+                    # 방어적으로 처리한다.
+                    "shipping_fee": _to_decimal_or_money(item.get("exchangeAmount")),
+                    "fault_type": item.get("faultType"),
+                }
+            )
+        return normalized
+
+    # --- 정산 회차 요약 조회 ---
+
+    def _fetch_raw_settlement_histories(
+        self, start_date: date, end_date: date, access_key: str, secret_key: str
+    ) -> list[dict[str, Any]]:
+        path = SETTLEMENT_HISTORIES_PATH
+        raw_items: list[dict[str, Any]] = []
+        for year_month in _iter_year_months(start_date, end_date):
+            query = urlencode([("revenueRecognitionYearMonth", year_month)])
+            authorization = self._authorization(access_key, secret_key, "GET", path, query)
+            response = self._request_with_retry("GET", f"{path}?{query}", headers={"Authorization": authorization})
+            raise_for_status("coupang", response.status_code)
+            with external_call("coupang"):
+                payload = response.json()
+                # 문서 확인 응답은 최상위가 배열이다(2026-09 조회) - 혹시 {data:[...]}로
+                # 감싸져 오는 경우도 방어적으로 처리한다.
+                items = payload if isinstance(payload, list) else (payload.get("data") or [])
+                raw_items.extend(items)
+        return raw_items
+
+    @staticmethod
+    def _normalize_settlement_histories(raw_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        normalized = []
+        for item in raw_items:
+            settlement_date_str = item.get("settlementDate")
+            settlement_date = _parse_coupang_date_only(settlement_date_str)
+            raw_status = item.get("status")
+            std_status = _SETTLEMENT_STATUS_TO_STD.get(raw_status or "", "SCHEDULED")
+            expected = _to_decimal(item.get("settlementTargetAmount"))
+            settled = _to_decimal(item.get("finalAmount")) if std_status == "COMPLETED" else Decimal("0")
+            normalized.append(
+                {
+                    "settlement_cycle": settlement_date_str or "",
+                    "settlement_type": item.get("settlementType"),
+                    "scheduled_date": settlement_date,
+                    "settled_date": settlement_date if std_status == "COMPLETED" else None,
+                    "expected_amount": expected,
+                    "settled_amount": settled,
+                    "status": std_status,
+                }
+            )
+        return normalized
+
+    # --- 매출내역(정산 상세) 조회 ---
+
+    def _fetch_raw_revenue_history(
+        self, start_date: date, end_date: date, access_key: str, secret_key: str, vendor_id: str
+    ) -> list[dict[str, Any]]:
+        path = REVENUE_HISTORY_PATH
+        raw_orders: list[dict[str, Any]] = []
+
+        window_start = start_date
+        while window_start < end_date:
+            window_end = min(window_start + timedelta(days=REVENUE_HISTORY_MAX_RANGE_DAYS), end_date)
+            token = ""
+            while True:
+                params: list[tuple[str, str]] = [
+                    ("vendorId", vendor_id),
+                    ("recognitionDateFrom", window_start.isoformat()),
+                    ("recognitionDateTo", window_end.isoformat()),
+                    ("token", token),
+                ]
+                query = urlencode(params)
+                authorization = self._authorization(access_key, secret_key, "GET", path, query)
+                response = self._request_with_retry("GET", f"{path}?{query}", headers={"Authorization": authorization})
+                raise_for_status("coupang", response.status_code)
+                with external_call("coupang"):
+                    payload = response.json()
+                    raw_orders.extend(payload.get("data", []) or [])
+                    has_next = bool(payload.get("hasNext"))
+                    token = payload.get("nextToken") or ""
+                if not has_next or not token:
+                    break
+            window_start = window_end
+
+        return raw_orders
+
+    @staticmethod
+    def _normalize_revenue_history(raw_orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """data[] 각 원소는 주문 단위(orderId/saleType/recognitionDate 등 공통 필드)이고,
+        그 안의 items[] 배열이 라인(vendorItemId) 단위 금액이다(공식 문서 Response
+        확인, 2026-09) - 라인마다 SettlementDetail 한 행을 만든다."""
+        normalized = []
+        for order_entry in raw_orders:
+            order_id = order_entry.get("orderId")
+            if order_id is None:
+                continue
+            sale_type = order_entry.get("saleType")
+            recognition_date = _parse_coupang_date_only(order_entry.get("recognitionDate"))
+            settled_date = _parse_coupang_date_only(order_entry.get("settlementDate"))
+            for line in order_entry.get("items", []) or []:
+                vendor_item_id = line.get("vendorItemId")
+                gross = _to_decimal(line.get("saleAmount"))
+                fee = _to_decimal(line.get("serviceFee")) + _to_decimal(line.get("serviceFeeVat"))
+                net = _to_decimal(line.get("settlementAmount"))
+                normalized.append(
+                    {
+                        "platform_order_no": str(order_id),
+                        "platform_order_item_no": (str(vendor_item_id) if vendor_item_id is not None else None),
+                        "sale_type": sale_type,
+                        "recognition_date": recognition_date,
+                        "settled_date": settled_date,
+                        "gross_amount": gross,
+                        "fee_amount": fee,
+                        "net_amount": net,
+                    }
+                )
+        return normalized
+
 
 def _parse_coupang_datetime(value: Optional[str]) -> datetime:
     """쿠팡 orderedAt(예: "2026-07-01T09:00:00", KST·오프셋 없음)을 KST datetime으로 파싱한다.
@@ -394,3 +756,73 @@ def _parse_coupang_datetime(value: Optional[str]) -> datetime:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=_KST)
     return parsed
+
+
+def _parse_coupang_offset_datetime(value: Optional[str]) -> datetime:
+    """쿠팡 반품/교환 응답의 createdAt(예: "2025-01-15T14:17:13.973885-08:00" - 밀리초·
+    오프셋 포함)을 파싱한다. _parse_coupang_datetime과 달리 이 값은 항상 오프셋을
+    포함하는 것으로 확인됐다(공식 문서 Response 예시, 2026-09 조회)."""
+    if not value:
+        return datetime.now(timezone.utc)
+    return datetime.fromisoformat(value)
+
+
+def _parse_coupang_date_only(value: Optional[str]) -> Optional[date]:
+    """쿠팡 정산 API의 날짜 전용 필드(예: "2026-07-31", YYYY-MM-dd)를 파싱한다."""
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _money_to_decimal(money: Optional[dict[str, Any]]) -> Optional[Decimal]:
+    """쿠팡의 Money류 구조({currencyCode, units, nanos})를 Decimal로 변환한다.
+
+    units는 정수부, nanos는 소수부(10^-9 단위) - 부호는 그대로 따른다(반품 배송비처럼
+    고객에게 청구되는 금액은 음수로 내려올 수 있다, 임의 반전 금지)."""
+    if not money:
+        return None
+    units = money.get("units")
+    if units is None:
+        return None
+    nanos = money.get("nanos", 0) or 0
+    return Decimal(units) + Decimal(nanos) / Decimal(10**9)
+
+
+def _to_decimal(value: Any) -> Decimal:
+    """단순 숫자 금액 필드를 Decimal로 변환한다(미제공 시 0 - 이 헬퍼를 쓰는 필드는
+    모두 채널이 필수로 내려주는 것으로 확인된 필드에만 사용한다)."""
+    if value is None:
+        return Decimal("0")
+    return Decimal(str(value))
+
+
+def _to_decimal_or_money(value: Any) -> Optional[Decimal]:
+    """숫자 또는 Money류 구조({currencyCode, units, nanos}) 둘 다 방어적으로 처리한다
+    (교환 응답의 exchangeAmount 필드 형식이 문서마다 다르게 보고돼 확정하지 못했다)."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return _money_to_decimal(value)
+    return Decimal(str(value))
+
+
+def _clip_reason(value: Any, length: int = 200) -> Optional[str]:
+    """클레임 사유는 안전하게 잘라 저장한다(원문 전체 응답 저장 금지 - 모듈 docstring 참고)."""
+    if value is None:
+        return None
+    text = str(value)
+    return text[:length] if len(text) > length else text
+
+
+def _iter_year_months(start_date: date, end_date: date) -> list[str]:
+    """[start_date, end_date]가 걸치는 각 연-월을 "YYYY-MM" 문자열로 나열한다
+    (쿠팡 정산 회차 요약 API가 월 단위로만 조회 가능하기 때문)."""
+    months = []
+    cursor = date(start_date.year, start_date.month, 1)
+    while cursor <= end_date:
+        months.append(f"{cursor.year:04d}-{cursor.month:02d}")
+        cursor = date(cursor.year + 1, 1, 1) if cursor.month == 12 else date(cursor.year, cursor.month + 1, 1)
+    return months

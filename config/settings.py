@@ -58,6 +58,16 @@ class Settings(BaseSettings):
     # 이 잡도 실 채널 API(fetch_orders)를 호출하므로 위 플래그와 별개로 기본 차단한다.
     channel_status_sync_enabled: bool = False
 
+    # 상용 ERP 확장(2단계) - 취소/반품/교환 클레임 수집 + 정산(회차 요약/주문단위 상세)
+    # 수집을 자동(scheduler.jobs.claim_sync_job/settlement_sync_job) + 수동(POST
+    # /api/orders/sync-claims, /api/settlements/sync) 모두 이 플래그로 통제한다.
+    # False(기본값)면 실제 채널 호출 없이 안전하게 차단된다 - 실계정 검증 승인 후
+    # 운영자가 명시적으로 켜야 한다. 환불 실행/취소 승인/반품 완료 처리/교환
+    # 재발송처럼 채널에 "쓰는" 클레임 처리 액션은 이 플래그와 무관하게 이번 단계
+    # 범위 밖이다(Stage 2-B, docs/COMMERCIAL_ERP_ROADMAP.md 참고) - 아직 구현되지
+    # 않았다.
+    claims_settlement_sync_enabled: bool = False
+
     model_config = SettingsConfigDict(env_file=str(BASE_DIR / ".env"), env_file_encoding="utf-8", extra="ignore")
 
 

@@ -507,6 +507,7 @@ export interface Settlement {
   id: number
   platform_id: number
   settlement_cycle: string
+  settlement_type: string | null
   status: string
   expected_amount: number
   settled_amount: number
@@ -519,6 +520,24 @@ export interface SettlementDetail {
   gross_amount: number
   fee_amount: number
   net_amount: number
+  sale_type: string | null
+  recognition_date: string | null
+}
+
+// 상용 ERP 확장(2단계) - 주문/정산 매칭 실패 및 금액 불일치 조회.
+export interface SettlementDiscrepancy {
+  id: number
+  platform_id: number
+  settlement_id: number | null
+  order_id: number | null
+  reason: string
+  expected_amount: number | null
+  actual_amount: number | null
+  diff_amount: number | null
+  detail_summary: string | null
+  detected_at: string
+  resolved_at: string | null
+  resolution: string | null
 }
 
 export interface Cost {
@@ -643,6 +662,11 @@ export interface Exchange {
   status: string
   requested_at: string
   completed_at: string | null
+  platform_claim_id?: string | null
+  raw_status?: string | null
+  fault_type?: string | null
+  quantity?: number | null
+  shipping_fee?: number | null
 }
 
 export interface ExchangeCreate {
@@ -662,6 +686,11 @@ export interface Return {
   status: string
   requested_at: string
   completed_at: string | null
+  platform_claim_id?: string | null
+  raw_status?: string | null
+  fault_type?: string | null
+  quantity?: number | null
+  shipping_fee?: number | null
 }
 
 export interface ReturnCreate {
@@ -681,6 +710,11 @@ export interface Cancellation {
   status: string
   requested_at: string
   completed_at: string | null
+  platform_claim_id?: string | null
+  raw_status?: string | null
+  fault_type?: string | null
+  quantity?: number | null
+  shipping_fee?: number | null
 }
 
 export interface CancellationCreate {

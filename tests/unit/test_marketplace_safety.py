@@ -65,9 +65,12 @@ class TestCapabilityUnsupported:
         with pytest.raises(MarketplaceCapabilityUnsupportedError):
             CoupangConnector().fetch_order_detail("X")
 
-    def test_coupang_settlements_unsupported(self):
-        with pytest.raises(MarketplaceCapabilityUnsupportedError):
-            CoupangConnector().fetch_settlements(date(2026, 1, 1), date(2026, 1, 2))
+    # test_coupang_settlements_unsupported는 상용 ERP 확장(2단계)에서 제거됨:
+    # Coupang 정산 회차 조회(settlement-histories)는 공식 문서로 확인되어
+    # supports_settlement_sync=True로 전환되었다(더 이상 미지원이 아님). 인증정보
+    # 없이 호출했을 때의 동작은 tests/unit/test_coupang_connector_claims_settlement.py
+    # ::TestCredentialMissingFailsClosed::test_fetch_settlements_without_credentials_raises
+    # 에서 검증한다.
 
     def test_coupang_products_unsupported(self):
         with pytest.raises(MarketplaceCapabilityUnsupportedError):
@@ -115,11 +118,29 @@ class TestEmptyRealResultIsSuccess:
 class _StubConnector(BaseMallConnector):
     """지정한 결과를 반환하거나 지정한 예외를 던지는 테스트용 스텁(실 네트워크 없음)."""
 
-    def __init__(self, *, orders=None, error=None, products=None, settlements=None):
+    def __init__(
+        self,
+        *,
+        orders=None,
+        error=None,
+        products=None,
+        settlements=None,
+        settlement_details=None,
+        supports_settlement=False,
+    ):
         self._orders = orders or []
         self._error = error
         self._products = products or []
         self._settlements = settlements or []
+        self._settlement_details = settlement_details or []
+        if supports_settlement:
+            self.supports_settlement_sync = True
+            self.supports_settlement_detail_sync = True
+
+    def fetch_settlement_details(self, start_date, end_date):
+        if self._error:
+            raise self._error
+        return self._settlement_details
 
     def fetch_orders(self, start_date, end_date):
         if self._error:
@@ -197,18 +218,32 @@ class TestSchedulerChannelIsolation:
         assert results[bad.code] == {"skipped": "unsupported"}
 
     def test_settlement_sync_isolates_failing_channel(self, monkeypatch, db_session, two_active_platforms):
+        """상용 ERP 확장(2단계): settlement_sync_job은 기본 OFF라 우선 켜고, 채널별
+        격리는 (a) 팩토리가 미검증 커넥터 클래스를 거부하는 경우(bad)와 (b) 정상
+        커넥터가 두 정산 capability 모두 지원해 실제로 수집되는 경우(good)로 나눠
+        검증한다(services.settlement_sync_service의 기능별 capability 판정은
+        tests/unit/test_settlement_sync_service.py에서 이미 별도로 검증됨)."""
+        from config.settings import settings
+
+        monkeypatch.setattr(settings, "claims_settlement_sync_enabled", True)
+
         good, bad = two_active_platforms
-        good_conn = _StubConnector(settlements=[])
-        bad_conn = _StubConnector(error=MarketplaceCapabilityUnsupportedError("naver", "settlement"))
+        good_conn = _StubConnector(settlements=[], settlement_details=[], supports_settlement=True)
+
+        def _factory(connector_class, session=None, platform_id=None):
+            if platform_id == good.id:
+                return good_conn
+            raise MarketplaceCapabilityUnsupportedError("naver", "settlement")
 
         monkeypatch.setattr(settlement_job, "session_scope", lambda: _fake_scope(db_session))
-        monkeypatch.setattr(settlement_job, "get_mall_connector", _connector_router(good.id, good_conn, bad_conn))
+        monkeypatch.setattr(settlement_job, "get_mall_connector", _factory)
 
         results = settlement_job.run()
 
         assert good.code in results and bad.code in results
         assert results[bad.code] == {"skipped": "unsupported"}
-        assert results[good.code] == {"created": 0, "updated": 0}
+        assert results[good.code]["settlements"]["status"] == "SUCCESS"
+        assert results[good.code]["settlement_details"]["status"] == "SUCCESS"
 
 
 class TestSafeLogging:
