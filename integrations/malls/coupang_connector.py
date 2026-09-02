@@ -40,7 +40,13 @@ from urllib.parse import urlencode
 
 import httpx
 
-from integrations.malls.base_mall_connector import BaseMallConnector, ShipmentSubmitResult
+from integrations.malls.base_mall_connector import (
+    SALE_STATUS_ON_SALE,
+    SALE_STATUS_SUSPENDED,
+    BaseMallConnector,
+    ProductSyncActionResult,
+    ShipmentSubmitResult,
+)
 from integrations.malls.errors import (
     MarketplaceCapabilityUnsupportedError,
     MarketplaceCredentialMissingError,
@@ -165,6 +171,17 @@ REVENUE_HISTORY_MAX_RANGE_DAYS = 31
 
 _SETTLEMENT_STATUS_TO_STD = {"DONE": "COMPLETED", "SUBJECT": "SCHEDULED"}
 
+# --- 상품 아이템별 재고/판매상태 변경 (상용 ERP 확장 3단계, 첫 묶음) ---
+# 공식 문서(developers.coupang.com/hc/ko/articles/360034156253, .../360034156313,
+# .../360033645154, 2026-09 조회) - 셋 다 요청 바디 없이 경로 파라미터만으로 동작하고
+# 응답은 동일한 {code: "SUCCESS"|"ERROR", message} 형식이다. 세 API 모두 "판매요청
+# 승인 완료 후 vendorItemId가 발급된 상태"가 전제조건이다(문서 원문).
+QUANTITY_PATH_TMPL = (
+    "/v2/providers/seller_api/apis/api/v1/marketplace/vendor-items/{vendor_item_id}/quantities/{quantity}"
+)
+SALES_STOP_PATH_TMPL = "/v2/providers/seller_api/apis/api/v1/marketplace/vendor-items/{vendor_item_id}/sales/stop"
+SALES_RESUME_PATH_TMPL = "/v2/providers/seller_api/apis/api/v1/marketplace/vendor-items/{vendor_item_id}/sales/resume"
+
 
 class CoupangConnector(BaseMallConnector):
     platform_code = "coupang"
@@ -177,6 +194,8 @@ class CoupangConnector(BaseMallConnector):
     # 주석 참고) - supports_cancellation_sync는 base 기본값(False)을 그대로 상속한다.
     # 대신 "후보 주문 단건 조회"는 지원한다(CANCEL_LOOKUP_WINDOW_DAYS 주석 참고).
     supports_cancellation_lookup_by_order = True
+    supports_inventory_update = True
+    supports_sale_status_update = True
 
     def __init__(
         self, session: Any = None, platform_id: Optional[int] = None, http_client: Optional[httpx.Client] = None
@@ -323,6 +342,50 @@ class CoupangConnector(BaseMallConnector):
     def fetch_products(self) -> list[dict[str, Any]]:
         # 상품 연동 미구현 - 빈 목록(정상 0건 위장) 대신 미지원 오류를 던진다.
         raise MarketplaceCapabilityUnsupportedError("coupang", "products")
+
+    def update_inventory(
+        self, platform_option_id: str, quantity: int, platform_origin_product_id: Optional[str] = None
+    ) -> ProductSyncActionResult:
+        """상품 아이템별 수량 변경(공식 문서: developers.coupang.com/hc/ko/articles/
+        360034156253, 2026-09 조회) - PUT .../vendor-items/{vendorItemId}/quantities/
+        {quantity}, 요청 바디 없음. platform_origin_product_id는 쿠팡에서 쓰지 않는다
+        (vendorItemId 하나로 충분 - 공식 문서 원문: "Option ID. It is a unique
+        identifier for the vendor item.")."""
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("coupang")
+        access_key, secret_key, _vendor_id = credentials
+        path = QUANTITY_PATH_TMPL.format(vendor_item_id=platform_option_id, quantity=quantity)
+        return self._call_product_action(path, access_key, secret_key)
+
+    def update_sale_status(
+        self, platform_option_id: str, target_status: str, platform_origin_product_id: Optional[str] = None
+    ) -> ProductSyncActionResult:
+        """상품 아이템별 판매 재개/중지(공식 문서: developers.coupang.com/hc/ko/articles/
+        360033645154(재개)/360034156313(중지), 2026-09 조회) - 둘 다 PUT
+        .../vendor-items/{vendorItemId}/sales/{resume|stop}, 요청 바디 없음."""
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("coupang")
+        access_key, secret_key, _vendor_id = credentials
+        if target_status == SALE_STATUS_ON_SALE:
+            path = SALES_RESUME_PATH_TMPL.format(vendor_item_id=platform_option_id)
+        elif target_status == SALE_STATUS_SUSPENDED:
+            path = SALES_STOP_PATH_TMPL.format(vendor_item_id=platform_option_id)
+        else:
+            raise ValueError(f"알 수 없는 target_status입니다: {target_status}")
+        return self._call_product_action(path, access_key, secret_key)
+
+    def _call_product_action(self, path: str, access_key: str, secret_key: str) -> ProductSyncActionResult:
+        """재고/판매상태 변경 API 공통 호출 - 셋 다 요청 바디 없이 PUT하고 {code,
+        message} 형식으로 응답한다(공식 문서 Response 확인, 2026-09 조회)."""
+        authorization = self._authorization(access_key, secret_key, "PUT", path, "")
+        response = self._request_with_retry("PUT", path, headers={"Authorization": authorization})
+        raise_for_status("coupang", response.status_code)
+        with external_call("coupang"):
+            payload = response.json()
+            code = payload.get("code")
+        return ProductSyncActionResult(accepted=(code == "SUCCESS"), platform_result_code=str(code))
 
     # --- 실제 API 연동 ---
 

@@ -43,7 +43,13 @@ from typing import Any, Optional
 import bcrypt
 import httpx
 
-from integrations.malls.base_mall_connector import BaseMallConnector, ShipmentSubmitResult
+from integrations.malls.base_mall_connector import (
+    SALE_STATUS_ON_SALE,
+    SALE_STATUS_SUSPENDED,
+    BaseMallConnector,
+    ProductSyncActionResult,
+    ShipmentSubmitResult,
+)
 from integrations.malls.errors import (
     MarketplaceCapabilityUnsupportedError,
     MarketplaceCredentialMissingError,
@@ -101,6 +107,36 @@ DISPATCH_PATH = "/external/v1/pay-order/seller/product-orders/dispatch"
 PRODUCT_SEARCH_PATH = "/external/v1/products/search"
 PRODUCT_PAGE_SIZE = 100
 
+# --- 재고/판매상태 변경 (상용 ERP 확장 3단계, 첫 묶음) ---
+# 공식 OpenAPI 스펙(commerce-api-naver/commerce-api 저장소 docs/2.0.0-RC.js에 포함된
+# 스펙 파일에서 직접 확인, 2026-09 조회 - apicenter.commerce.naver.com 자체는 이
+# 세션의 WebFetch로 접근 불가했으나, 저장소에 공개된 실제 스펙 파일을 원문 그대로
+# 파싱해 아래 경로/필드를 확인했다):
+#   PUT /v1/products/origin-products/{originProductNo}/change-status
+#   요청 바디(ExternalApiProductSaleStatusUpdateRequestVo.product):
+#     {statusType: "SALE"|"OUTOFSTOCK"|"SUSPENSION"(필수, 이 셋만 입력 가능 - WAIT/
+#      UNADMISSION/REJECTION/CLOSE/PROHIBITION/DELETE는 시스템 산출 상태라 입력 불가),
+#      stockQuantity?: int(선택, 생략하면 재고 그대로 유지 - 같은 서비스의 원상품
+#      전체수정 API 필드 설명 원문: "재고 수량을 입력하지 않으면...변하지 않습니다")}
+#   재고 0으로 저장하면(원상품 전체수정 API의 동일 필드 설명 원문) statusType으로
+#   보낸 값은 무시되고 상품 상태가 OUTOFSTOCK으로 강제된다 - 이 change-status
+#   엔드포인트 자체의 설명에는 재반복되어 있지 않지만, 같은 서비스의 동일 필드가
+#   공유하는 규칙으로 보고 그대로 적용한다(완전히 별개로 재확인되지는 않음).
+#   응답: CommonResponse {code, message, data} - code로 성공/실패만 판단하고 그 외
+#   원본 응답은 저장하지 않는다.
+# path 파라미터는 channelProductNo가 아니라 originProductNo다 - 상품 검색 API
+# 원본 응답에 이미 있던 값을 상품동기화 때 함께 저장해 둔다
+# (models.product.ProductPlatformMap.platform_origin_product_id 참고).
+PRODUCT_STATUS_PATH_TMPL = "/v1/products/origin-products/{origin_product_no}/change-status"
+_SALE_STATUS_TO_NAVER = {SALE_STATUS_ON_SALE: "SALE", SALE_STATUS_SUSPENDED: "SUSPENSION"}
+# 재고만 바꿀 때 현재 판매상태를 그대로 유지하기 위해 먼저 조회한다(원상품 조회 API,
+# 같은 OpenAPI 스펙에서 확인 - GET 응답도 originProduct.statusType을 그대로 포함한다).
+ORIGIN_PRODUCT_GET_PATH_TMPL = "/v2/products/origin-products/{origin_product_no}"
+# change-status가 입력으로 받는 것으로 확인된 값(모듈 상단 주석 참고) - 조회된 현재
+# 상태가 이 밖이면(승인대기/판매종료 등 시스템 상태) 재고만 바꾸려는 시도도 안전하게
+# 차단한다(추측으로 강제 전환하지 않음).
+_NAVER_INPUTABLE_STATUS_TYPES = frozenset({"SALE", "OUTOFSTOCK", "SUSPENSION"})
+
 # HTTP 429(Rate Limit) 재시도 정책: Retry-After 헤더가 있으면 그 값을, 없으면
 # 1s -> 2s -> 4s -> 8s -> 16s 지수 백오프로 대기 후 재시도한다.
 RATE_LIMIT_MAX_RETRIES = 5
@@ -110,6 +146,8 @@ RATE_LIMIT_BACKOFF_BASE_SECONDS = 1.0
 class NaverSmartstoreConnector(BaseMallConnector):
     platform_code = "naver_smartstore"
     supports_shipment_submit = True
+    supports_inventory_update = True
+    supports_sale_status_update = True
 
     def __init__(
         self, session: Any = None, platform_id: Optional[int] = None, http_client: Optional[httpx.Client] = None
@@ -219,6 +257,72 @@ class NaverSmartstoreConnector(BaseMallConnector):
         result = self._normalize_live_products(raw_pages)
         self._product_cache = result
         return result
+
+    def update_inventory(
+        self, platform_option_id: str, quantity: int, platform_origin_product_id: Optional[str] = None
+    ) -> ProductSyncActionResult:
+        """재고 수량만 전송한다(모듈 상단 PRODUCT_STATUS_PATH_TMPL 주석의 공식 스펙
+        근거 참고). change-status는 statusType이 필수라, 재고만 바꾸고 판매상태는
+        건드리지 않기 위해 먼저 현재 statusType을 조회해 그대로 함께 보낸다."""
+        if not platform_origin_product_id:
+            # vendorItemId(channelProductNo)만으로는 이 API를 호출할 수 없다 - 원상품번호를
+            # 상품동기화 때 저장해 두지 못한(과거 데이터) 매핑은 안전하게 차단한다.
+            raise MarketplaceCapabilityUnsupportedError("naver", "inventory_update_missing_origin_product_id")
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("naver")
+        client_id, client_secret, seller_id = credentials
+        access_token = self._fetch_access_token(client_id, client_secret, seller_id)
+        current_status = self._fetch_current_status_type(platform_origin_product_id, access_token)
+        if current_status not in _NAVER_INPUTABLE_STATUS_TYPES:
+            # 승인대기/판매종료 등 시스템 상태 - 추측으로 SALE/SUSPENSION 중 하나로
+            # 강제 전환하지 않고 명시적으로 차단한다.
+            raise MarketplaceCapabilityUnsupportedError("naver", f"inventory_update_blocked_status_{current_status}")
+        return self._put_change_status(
+            platform_origin_product_id, access_token, status_type=current_status, stock_quantity=quantity
+        )
+
+    def update_sale_status(
+        self, platform_option_id: str, target_status: str, platform_origin_product_id: Optional[str] = None
+    ) -> ProductSyncActionResult:
+        """판매상태만 전송한다(재고는 stockQuantity를 생략해 현재값을 유지한다 -
+        모듈 상단 주석의 공식 필드 설명 근거 참고)."""
+        if not platform_origin_product_id:
+            raise MarketplaceCapabilityUnsupportedError("naver", "sale_status_update_missing_origin_product_id")
+        naver_status = _SALE_STATUS_TO_NAVER.get(target_status)
+        if naver_status is None:
+            raise ValueError(f"알 수 없는 target_status입니다: {target_status}")
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("naver")
+        client_id, client_secret, seller_id = credentials
+        access_token = self._fetch_access_token(client_id, client_secret, seller_id)
+        return self._put_change_status(platform_origin_product_id, access_token, status_type=naver_status)
+
+    def _fetch_current_status_type(self, origin_product_no: str, access_token: str) -> str:
+        path = ORIGIN_PRODUCT_GET_PATH_TMPL.format(origin_product_no=origin_product_no)
+        response = self._request_with_retry("GET", path, headers={"Authorization": f"Bearer {access_token}"})
+        raise_for_status("naver", response.status_code)
+        with external_call("naver"):
+            payload = response.json()
+            status_type = (payload.get("originProduct") or {}).get("statusType")
+        if not status_type:
+            raise MarketplaceExternalAPIError("naver", "PARSE_FAILED", False, http_status=response.status_code)
+        return str(status_type)
+
+    def _put_change_status(
+        self, origin_product_no: str, access_token: str, status_type: str, stock_quantity: Optional[int] = None
+    ) -> ProductSyncActionResult:
+        path = PRODUCT_STATUS_PATH_TMPL.format(origin_product_no=origin_product_no)
+        body: dict[str, Any] = {"statusType": status_type}
+        if stock_quantity is not None:
+            body["stockQuantity"] = stock_quantity
+        response = self._request_with_retry("PUT", path, headers={"Authorization": f"Bearer {access_token}"}, json=body)
+        raise_for_status("naver", response.status_code)
+        with external_call("naver"):
+            payload = response.json()
+            code = payload.get("code")
+        return ProductSyncActionResult(accepted=(code == "SUCCESS"), platform_result_code=str(code))
 
     # --- 실제 API 연동 ---
 
@@ -550,12 +654,20 @@ class NaverSmartstoreConnector(BaseMallConnector):
             for content in group_contents:
                 channel_product = (content.get("channelProducts") or [{}])[0]
                 channel_product_no = channel_product.get("channelProductNo")
+                origin_product_no = content.get("originProductNo")
                 items.append(
                     {
                         # 옵션(채널상품) 단위 식별자 - product_platform_map.platform_option_id의
                         # 매핑 키(유니크)가 된다.
                         "platform_option_id": str(channel_product_no) if channel_product_no is not None else None,
                         "platform_product_id": str(group_no),
+                        # 원상품 단위 식별자(channelProductNo와 다른 값) - 상용 ERP 확장(3단계)
+                        # 재고/판매상태 변경 API가 경로 파라미터로 요구한다(모듈 상단
+                        # PRODUCT_STATUS_PATH_TMPL 주석 참고). 실 응답에 이미 포함돼 있던
+                        # 값을 그대로 저장한다(추측 아님).
+                        "platform_origin_product_id": (
+                            str(origin_product_no) if origin_product_no is not None else None
+                        ),
                         "option_name": channel_product.get("name"),
                         "seller_product_code": channel_product.get("sellerManagementCode"),
                         "sale_price": channel_product.get("salePrice"),

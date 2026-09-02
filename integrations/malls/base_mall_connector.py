@@ -70,6 +70,22 @@ class ShipmentSubmitResult:
     platform_result_code: Optional[str] = None  # 예: "OK" / 실패 사유 코드(짧은 문자열)
 
 
+@dataclass
+class ProductSyncActionResult:
+    """update_inventory()/update_sale_status()의 안전한 결과 요약(원본 응답 전문 없음) -
+    ShipmentSubmitResult와 동일한 설계 원칙."""
+
+    accepted: bool
+    platform_result_code: Optional[str] = None  # 예: "SUCCESS" / 실패 사유 코드(짧은 문자열)
+
+
+# update_sale_status()의 target_status 값 - 채널 무관 내부 표현(models.integration_sync.
+# ProductSyncCommandDetail 모듈 docstring 참고). "OUTOFSTOCK/품절"은 재고 0에 따른
+# 파생 상태로 보고 여기 포함하지 않는다.
+SALE_STATUS_ON_SALE = "ON_SALE"
+SALE_STATUS_SUSPENDED = "SUSPENDED"
+
+
 class BaseMallConnector(ABC):
     """모든 쇼핑몰 커넥터가 구현해야 하는 공통 인터페이스."""
 
@@ -94,6 +110,10 @@ class BaseMallConnector(ABC):
     # 되는 공식 제약)에서, ERP가 이미 알고 있는 주문 ID를 대상으로 개별 조회하는
     # 경로다(fetch_cancellations의 기간 기반 대량 수집과는 별개 capability).
     supports_cancellation_lookup_by_order: bool = False
+    # 기존 채널 상품(옵션)의 재고 수량/판매상태 "전송"(쓰기) 지원 여부 - 상용 ERP
+    # 확장(3단계, 첫 묶음). 신규 상품 등록/전체 상품정보 수정과는 별개 capability다.
+    supports_inventory_update: bool = False
+    supports_sale_status_update: bool = False
 
     def _marketplace_code(self) -> str:
         """오류 메시지용 안전한 채널 식별자(Secret/PII 아님). platform_code가 없으면 클래스명."""
@@ -222,6 +242,31 @@ class BaseMallConnector(ABC):
 
         반환 형식은 모듈 docstring의 fetch_settlement_details() 항목 참고."""
         raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "settlement_detail_sync")
+
+    def update_inventory(
+        self, platform_option_id: str, quantity: int, platform_origin_product_id: Optional[str] = None
+    ) -> ProductSyncActionResult:
+        """기존 채널 상품(옵션) 하나의 재고 수량을 target quantity로 전송한다(기본:
+        미지원 오류). supports_inventory_update=True인 커넥터만 오버라이드한다.
+
+        quantity는 호출부(services.product_sync_dispatch_service)가 이미 "운영자가
+        명시적으로 입력한 목표 수량"임을 확정한 값이다 - 이 메서드는 자동 재고배분/
+        안전재고/예약재고 차감 등 어떤 정책도 적용하지 않고 주어진 값을 그대로
+        전송한다. platform_origin_product_id는 채널에 따라 필요 여부가 다르다
+        (네이버는 원상품번호가 필요, 쿠팡은 vendorItemId 하나로 충분해 무시한다 -
+        NaverSmartstoreConnector.update_inventory 참고)."""
+        raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "inventory_update")
+
+    def update_sale_status(
+        self, platform_option_id: str, target_status: str, platform_origin_product_id: Optional[str] = None
+    ) -> ProductSyncActionResult:
+        """기존 채널 상품(옵션) 하나의 판매상태를 전송한다(기본: 미지원 오류).
+        supports_sale_status_update=True인 커넥터만 오버라이드한다.
+
+        target_status는 SALE_STATUS_ON_SALE|SALE_STATUS_SUSPENDED 중 하나다(채널
+        무관 내부 값 - 모듈 상단 상수 참고). platform_origin_product_id는
+        update_inventory()와 동일하게 채널에 따라 필요 여부가 다르다."""
+        raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "sale_status_update")
 
     def fetch_products(self) -> list[dict[str, Any]]:
         """상품 목록을 정규화된 형식으로 조회한다(services.product_sync_service.

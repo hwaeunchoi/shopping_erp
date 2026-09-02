@@ -112,6 +112,31 @@ class ExternalCommandLineResult(Base, TimestampMixin):
     result_code: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
 
+class ProductSyncCommandDetail(Base):
+    """ExternalCommand(command_type IN (INVENTORY_UPDATE, SALE_STATUS_UPDATE))의 구조화된
+    목표값 - 상용 ERP 확장(3단계, 첫 묶음). 명령 접수(enqueue) 시점에 운영자가 입력한
+    목표 수량/판매상태를 확정해 저장하고, 재시도 때도 이 값을 그대로 재사용한다(화면에서
+    다시 읽은 최신 입력값으로 바꾸지 않는다 - 재시도는 "정확히 같은 요청"의 반복이어야
+    한다). 하나의 ExternalCommand에는 정확히 하나의 상세 행만 연결된다(1:1).
+
+    target_sale_status는 채널 무관 내부 값(ON_SALE/SUSPENDED) 두 가지만 쓴다 - 커넥터가
+    채널별 표현으로 변환한다(쿠팡: sales/resume·sales/stop 호출, 네이버: statusType=
+    SALE·SUSPENSION). "품절(OUTOFSTOCK)"은 두 채널 다 재고 0에 따라 시스템이 계산하는
+    파생 상태로 보고(네이버 공식 문서: "재고 수량이 0으로 입력되면 StatusType으로
+    전달된 항목은 무시되며 상품 상태는 OUTOFSTOCK으로 저장됩니다") 사용자가 직접
+    지정하는 목표값으로 두지 않는다.
+    """
+
+    __tablename__ = "product_sync_command_details"
+    __table_args__ = (Index("uq_product_sync_command_detail", "command_id", unique=True),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    command_id: Mapped[int] = mapped_column(ForeignKey("external_commands.id"), nullable=False)
+    product_platform_map_id: Mapped[int] = mapped_column(ForeignKey("product_platform_map.id"), nullable=False)
+    target_quantity: Mapped[Optional[int]] = mapped_column(nullable=True)  # INVENTORY_UPDATE 전용
+    target_sale_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)  # SALE_STATUS_UPDATE 전용
+
+
 class OrderStatusConflict(Base, TimestampMixin):
     """내부 주문상태와 채널 주문상태가 "허용된 전이"로 설명되지 않을 때의 기록.
 

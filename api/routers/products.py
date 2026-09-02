@@ -11,8 +11,10 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
-from api.deps import get_db, require_permission
+from api.deps import get_current_user, get_db, require_permission
 from integrations.malls import get_mall_connector
+from models.user import User
+from repositories.integration_sync_repository import ExternalCommandRepository
 from repositories.inventory_repository import InventoryRepository
 from repositories.order_repository import OrderRepository
 from repositories.platform_repository import PlatformRepository
@@ -25,6 +27,12 @@ from repositories.product_repository import (
     UnmatchedPlatformItemRepository,
 )
 from services.product_service import ProductCostService, ProductService
+from services.product_sync_dispatch_service import TARGET_TYPE as PRODUCT_SYNC_TARGET_TYPE
+from services.product_sync_dispatch_service import (
+    ProductChannelSyncDisabledError,
+    ProductSyncDispatchService,
+    ProductSyncMappingNotFoundError,
+)
 from services.product_sync_service import ProductSyncService
 
 router = APIRouter(
@@ -114,6 +122,7 @@ class ProductPlatformMapOut(BaseModel):
     platform_id: int
     platform_option_id: str
     platform_product_id: Optional[str]
+    platform_origin_product_id: Optional[str] = None
     display_name: Optional[str]
     seller_product_code: Optional[str]
 
@@ -718,3 +727,159 @@ def delete_product_image(image_id: int, db: Session = Depends(get_db)) -> None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="이미지를 찾을 수 없습니다.")
     ProductService(db).delete_image(image)
     db.commit()
+
+
+# --- 상용 ERP 확장(3단계, 첫 묶음): 재고 수량/판매상태 전송 -----------------------
+
+
+class InventorySyncRequest(BaseModel):
+    target_quantity: int
+
+
+class SaleStatusSyncRequest(BaseModel):
+    target_status: str  # "ON_SALE" | "SUSPENDED"
+
+
+class ProductSyncCommandOut(BaseModel):
+    command_id: int
+    status: str
+    already_processed: bool
+    error_code: Optional[str] = None
+
+
+@router.post(
+    "/platform-map/{mapping_id}/sync-inventory",
+    response_model=ProductSyncCommandOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="채널로 재고 수량 전송 요청(비동기)",
+    description="지정한 플랫폼 매핑의 재고 수량을 채널(네이버/쿠팡)에 전송할 명령을 생성한다. "
+    "이 API는 실제 채널 호출을 하지 않고 명령만 접수한다(202) - 실제 전송은 스케줄러의 "
+    "product_sync_dispatch_job이 비동기로 수행하며, 처리 결과는 GET /api/products/"
+    "sync-commands/{command_id}로 폴링해 확인해야 한다. 같은 매핑에 이미 같은 목표 수량으로 "
+    "생성된 명령이 있으면(버튼 연타 포함) 새로 만들지 않고 기존 명령을 그대로 반환한다.",
+    responses={
+        404: {"description": "플랫폼 매핑을 찾을 수 없습니다."},
+        400: {"description": "재고 수량이 계약 범위를 벗어났습니다(음수/소수/상한 초과 등)."},
+        503: {"description": "재고/판매상태 전송 기능이 비활성화(OFF) 상태입니다(실계정 검증 승인 전)."},
+    },
+)
+def sync_inventory(
+    mapping_id: int, payload: InventorySyncRequest, db: Session = Depends(get_db)
+) -> ProductSyncCommandOut:
+    service = ProductSyncDispatchService(db)
+    try:
+        outcome = service.enqueue_inventory_update(mapping_id, payload.target_quantity)
+    except ProductChannelSyncDisabledError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)) from e
+    except ProductSyncMappingNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except ValueError as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    db.commit()
+    return ProductSyncCommandOut(
+        command_id=outcome.command.id,
+        status=outcome.command.status,
+        already_processed=outcome.already_processed,
+        error_code=outcome.command.error_code,
+    )
+
+
+@router.post(
+    "/platform-map/{mapping_id}/sync-sale-status",
+    response_model=ProductSyncCommandOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="채널로 판매상태 전송 요청(비동기)",
+    description="지정한 플랫폼 매핑의 판매상태(ON_SALE|SUSPENDED)를 채널에 전송할 명령을 "
+    "생성한다. sync-inventory와 동일하게 명령만 접수하고(202) 실제 전송은 스케줄러가 수행한다.",
+    responses={
+        404: {"description": "플랫폼 매핑을 찾을 수 없습니다."},
+        400: {"description": "알 수 없는 target_status입니다."},
+        503: {"description": "재고/판매상태 전송 기능이 비활성화(OFF) 상태입니다(실계정 검증 승인 전)."},
+    },
+)
+def sync_sale_status(
+    mapping_id: int, payload: SaleStatusSyncRequest, db: Session = Depends(get_db)
+) -> ProductSyncCommandOut:
+    service = ProductSyncDispatchService(db)
+    try:
+        outcome = service.enqueue_sale_status_update(mapping_id, payload.target_status)
+    except ProductChannelSyncDisabledError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)) from e
+    except ProductSyncMappingNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except ValueError as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    db.commit()
+    return ProductSyncCommandOut(
+        command_id=outcome.command.id,
+        status=outcome.command.status,
+        already_processed=outcome.already_processed,
+        error_code=outcome.command.error_code,
+    )
+
+
+class ProductSyncExternalCommandOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    command_type: str
+    status: str
+    attempt_count: int
+    retryable: bool
+    error_code: Optional[str]
+    next_retry_at: Optional[datetime]
+    completed_at: Optional[datetime]
+
+
+@router.get(
+    "/sync-commands/{command_id}",
+    response_model=ProductSyncExternalCommandOut,
+    summary="재고/판매상태 전송 명령 상태 조회",
+    description="POST .../sync-inventory 또는 .../sync-sale-status가 반환한 command_id로 "
+    "처리 상태를 폴링한다. 화면은 status가 SUCCESS로 확인된 뒤에만 성공으로 표시해야 한다.",
+    responses={404: {"description": "명령을 찾을 수 없습니다."}},
+)
+def get_product_sync_command(command_id: int, db: Session = Depends(get_db)) -> ProductSyncExternalCommandOut:
+    command = ExternalCommandRepository(db).get_by_id(command_id)
+    if command is None or command.target_type != PRODUCT_SYNC_TARGET_TYPE:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="명령을 찾을 수 없습니다.")
+    return ProductSyncExternalCommandOut.model_validate(command, from_attributes=True)
+
+
+class ResolveProductSyncCommandRequest(BaseModel):
+    resolution: str  # "CONFIRMED_NOT_SENT" | "CONFIRMED_SUCCESS" | "CONFIRMED_FAILED"
+
+
+@router.post(
+    "/sync-commands/{command_id}/resolve",
+    response_model=ProductSyncExternalCommandOut,
+    summary="결과 확인 필요(UNKNOWN) 재고/판매상태 명령 수동 해소",
+    description="채널이 실제로 처리했는지 알 수 없는(UNKNOWN) 명령을, 운영자가 채널을 직접 "
+    "확인한 뒤 해소한다(services.shipment_dispatch_service.resolve_unknown_command와 동일한 "
+    "세 가지 해소 방식).",
+    responses={
+        404: {"description": "명령을 찾을 수 없습니다."},
+        400: {"description": "UNKNOWN 상태가 아니거나 알 수 없는 해소 방식입니다."},
+    },
+)
+def resolve_product_sync_command(
+    command_id: int,
+    payload: ResolveProductSyncCommandRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ProductSyncExternalCommandOut:
+    existing = ExternalCommandRepository(db).get_by_id(command_id)
+    if existing is None or existing.target_type != PRODUCT_SYNC_TARGET_TYPE:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="명령을 찾을 수 없습니다.")
+    try:
+        resolved = ProductSyncDispatchService(db).resolve_unknown_command(
+            command_id, payload.resolution, resolved_by=current_user.id
+        )
+    except ValueError as e:
+        db.rollback()
+        code = status.HTTP_404_NOT_FOUND if "찾을 수 없습니다" in str(e) else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(status_code=code, detail=str(e)) from e
+    db.commit()
+    return ProductSyncExternalCommandOut.model_validate(resolved, from_attributes=True)

@@ -188,6 +188,7 @@ class ProductSyncService:
                 platform_id=platform_id,
                 platform_option_id=platform_option_id,
                 platform_product_id=(item.get("platform_product_id") or None),
+                platform_origin_product_id=(item.get("platform_origin_product_id") or None),
                 display_name=(product_name[:200] if product_name else None),
                 seller_product_code=(item.get("seller_product_code") or None),
             )
@@ -221,6 +222,8 @@ class ProductSyncService:
             mapping.display_name = product_name[:200]
         if item.get("platform_product_id"):
             mapping.platform_product_id = item["platform_product_id"]
+        if item.get("platform_origin_product_id"):
+            mapping.platform_origin_product_id = item["platform_origin_product_id"]
 
     def _save_product_images(self, product_id: int, raw: dict[str, Any]) -> None:
         images = raw.get("images") or {}

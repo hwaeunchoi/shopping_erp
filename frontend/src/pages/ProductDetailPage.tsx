@@ -13,6 +13,9 @@ import type {
   ProductOptionDetail,
   ProductOptionUpdate,
   ProductPlatformMap,
+  ProductSyncCommand,
+  ProductSyncExternalCommand,
+  SaleStatusValue,
 } from '../api/types'
 
 const OPTIONS_TABLE_COLUMNS = 11
@@ -329,7 +332,7 @@ function PlatformMapEditRow({ mapping, onSaved, onCancel }: { mapping: ProductPl
 
   return (
     <tr>
-      <td colSpan={7}>
+      <td colSpan={8}>
         <form className="inline-form" onSubmit={handleSave}>
           <input
             value={form.display_name}
@@ -352,6 +355,111 @@ function PlatformMapEditRow({ mapping, onSaved, onCancel }: { mapping: ProductPl
         </form>
       </td>
     </tr>
+  )
+}
+
+const SYNC_STATUS_LABELS: Record<string, string> = {
+  PENDING: '접수됨(전송 대기)',
+  RUNNING: '전송 중',
+  SUCCESS: '성공',
+  FAILED: '실패',
+  RETRY_WAIT: '재시도 대기',
+  UNKNOWN: '확인 필요(운영자 확인 대상)',
+  CANCELLED: '취소됨(더 최신 요청으로 대체)',
+}
+
+// 상용 ERP 확장(3단계, 첫 묶음) - 기존 채널 상품(옵션) 하나의 재고/판매상태를
+// 채널에 전송하는 최소한의 UI. 이 화면은 "채널의 현재 값을 읽어 보여주는" 기능이
+// 없으므로(별도 조회 API 없음) 목표값 입력·전송·명령 상태 폴링만 제공하고,
+// 채널의 현재 값은 항상 "확인되지 않음"으로 고정 표기한다(0이나 최신값으로
+// 추정해 보여주지 않는다).
+function ProductSyncControls({ mapping }: { mapping: ProductPlatformMap }) {
+  const [quantity, setQuantity] = useState('')
+  const [saleStatus, setSaleStatus] = useState<SaleStatusValue>('ON_SALE')
+  const [command, setCommand] = useState<ProductSyncExternalCommand | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [isSubmittingQty, setIsSubmittingQty] = useState(false)
+  const [isSubmittingStatus, setIsSubmittingStatus] = useState(false)
+
+  const pollCommand = async (commandId: number) => {
+    try {
+      const result = await api.get<ProductSyncExternalCommand>(`/api/products/sync-commands/${commandId}`)
+      setCommand(result)
+    } catch {
+      // 폴링 실패는 조용히 무시한다 - 다음 수동 새로고침으로 다시 시도할 수 있다.
+    }
+  }
+
+  const handleSyncInventory = async (e: FormEvent) => {
+    e.preventDefault()
+    if (quantity === '') {
+      setError('전송할 재고 수량을 입력하세요.')
+      return
+    }
+    setError(null)
+    setIsSubmittingQty(true)
+    try {
+      const result = await api.post<ProductSyncCommand>(`/api/products/platform-map/${mapping.id}/sync-inventory`, {
+        target_quantity: Number(quantity),
+      })
+      await pollCommand(result.command_id)
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '재고 전송 요청 중 오류가 발생했습니다.')
+    } finally {
+      setIsSubmittingQty(false)
+    }
+  }
+
+  const handleSyncSaleStatus = async () => {
+    setError(null)
+    setIsSubmittingStatus(true)
+    try {
+      const result = await api.post<ProductSyncCommand>(
+        `/api/products/platform-map/${mapping.id}/sync-sale-status`,
+        { target_status: saleStatus },
+      )
+      await pollCommand(result.command_id)
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '판매상태 전송 요청 중 오류가 발생했습니다.')
+    } finally {
+      setIsSubmittingStatus(false)
+    }
+  }
+
+  return (
+    <div>
+      <p className="hint-text">채널 현재 값: 확인되지 않음(이 화면은 목표값 전송 전용)</p>
+      <form className="inline-form" onSubmit={handleSyncInventory} style={{ marginBottom: 4 }}>
+        <input
+          type="number"
+          value={quantity}
+          onChange={(e) => setQuantity(e.target.value)}
+          placeholder="목표 재고수량"
+          min={0}
+        />
+        <button type="submit" disabled={isSubmittingQty}>
+          {isSubmittingQty ? '전송 중...' : '재고 전송'}
+        </button>
+      </form>
+      <div className="inline-form" style={{ marginBottom: 4 }}>
+        <select value={saleStatus} onChange={(e) => setSaleStatus(e.target.value as SaleStatusValue)}>
+          <option value="ON_SALE">판매중으로</option>
+          <option value="SUSPENDED">판매중지로</option>
+        </select>
+        <button type="button" onClick={handleSyncSaleStatus} disabled={isSubmittingStatus}>
+          {isSubmittingStatus ? '전송 중...' : '판매상태 전송'}
+        </button>
+      </div>
+      {error && <p className="form-error">{error}</p>}
+      {command && (
+        <p>
+          명령 #{command.id}: <span className="status-badge">{SYNC_STATUS_LABELS[command.status] ?? command.status}</span>
+          {command.error_code && ` (사유: ${command.error_code})`}
+          {' '}
+          <button type="button" onClick={() => pollCommand(command.id)}>상태 새로고침</button>
+        </p>
+      )}
+    </div>
   )
 }
 
@@ -483,7 +591,7 @@ function OptionSubDetail({ option, warehousePlatformId }: { option: ProductOptio
         <table className="data-table nested">
           <thead>
             <tr>
-              <th>ID</th><th>플랫폼ID</th><th>옵션번호</th><th>상품번호</th><th>노출상품명</th><th>판매자상품코드</th><th></th>
+              <th>ID</th><th>플랫폼ID</th><th>옵션번호</th><th>상품번호</th><th>노출상품명</th><th>판매자상품코드</th><th></th><th>재고/판매상태 전송</th>
             </tr>
           </thead>
           <tbody>
@@ -502,6 +610,7 @@ function OptionSubDetail({ option, warehousePlatformId }: { option: ProductOptio
                     </button>
                     <button type="button" onClick={() => handleDeleteMap(m.id)}>삭제</button>
                   </td>
+                  <td><ProductSyncControls mapping={m} /></td>
                 </tr>
                 {editingMapId === m.id && (
                   <PlatformMapEditRow
@@ -515,7 +624,7 @@ function OptionSubDetail({ option, warehousePlatformId }: { option: ProductOptio
                 )}
               </Fragment>
             ))}
-            {maps?.length === 0 && <tr><td colSpan={7}>등록된 매핑이 없습니다.</td></tr>}
+            {maps?.length === 0 && <tr><td colSpan={8}>등록된 매핑이 없습니다.</td></tr>}
           </tbody>
         </table>
 

@@ -68,6 +68,15 @@ class Settings(BaseSettings):
     # 않았다.
     claims_settlement_sync_enabled: bool = False
 
+    # 상용 ERP 확장(3단계, 첫 묶음) - 기존 채널 상품(옵션)의 재고 수량/판매상태 전송을
+    # 자동(scheduler.jobs.product_sync_dispatch_job) + 수동(POST /api/products/
+    # platform-map/{id}/sync-inventory, /sync-sale-status) 모두 이 플래그로 통제한다.
+    # False(기본값)면 세션도 열지 않고 커넥터도 만들지 않아 외부 호출이 0건임을
+    # 보장한다 - 실계정 검증 승인 후 운영자가 명시적으로 켜야 한다. 신규 상품 등록,
+    # 상품명/가격/이미지 등 전체 상품정보 수정, 클레임 승인/환불 등 다른 쓰기 액션은
+    # 이 플래그와 무관하게 이번 묶음 범위 밖이다(docs/COMMERCIAL_ERP_ROADMAP.md 참고).
+    product_channel_sync_enabled: bool = False
+
     model_config = SettingsConfigDict(env_file=str(BASE_DIR / ".env"), env_file_encoding="utf-8", extra="ignore")
 
 

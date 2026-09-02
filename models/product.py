@@ -128,6 +128,16 @@ class ProductPlatformMap(Base):
     # 판매자상품코드(네이버 sellerManagementCode 등) - ERP 내부 SKU(ProductOption.sku_code)와는
     # 완전히 별개다. SKU는 ERP 자체 채번값이고, 이 값은 플랫폼에 등록된 셀러 관리코드다.
     seller_product_code: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)  # 판매자상품코드
+    # 원상품(origin product) 단위 식별자 - 상용 ERP 확장(3단계) 재고/판매상태 전송 전용.
+    # 네이버는 재고/판매상태 변경 API(PUT .../origin-products/{originProductNo}/
+    # change-status)가 channelProductNo가 아니라 originProductNo를 경로 파라미터로
+    # 받는다(공식 OpenAPI 스펙, 2026-09 조회 - commerce-api-naver/commerce-api
+    # 저장소 docs/2.0.0-RC.js에 포함된 스펙 파일에서 직접 확인). 상품 검색 API 응답에
+    # 이미 포함돼 있던 값이라(services.product_sync_service._normalize_live_products가
+    # 쓰는 원본 응답의 "originProductNo" 필드) 상품동기화 시 함께 저장한다. 쿠팡은
+    # 재고/판매상태 API 모두 platform_option_id(vendorItemId)만으로 충분해 이 컬럼을
+    # 쓰지 않는다(항상 None).
+    platform_origin_product_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
 
     product_option: Mapped["ProductOption"] = relationship(back_populates="platform_maps")
     platform: Mapped["Platform"] = relationship()  # type: ignore[name-defined]  # 순환참조 방지용 지연 문자열 참조 (models.platform.Platform)

@@ -95,8 +95,31 @@ export interface ProductPlatformMap {
   platform_id: number
   platform_option_id: string
   platform_product_id: string | null
+  platform_origin_product_id?: string | null
   display_name: string | null
   seller_product_code: string | null
+}
+
+// 상용 ERP 확장(3단계, 첫 묶음) - 기존 채널 상품(옵션)의 재고/판매상태 전송.
+export const SALE_STATUS_VALUES = ['ON_SALE', 'SUSPENDED'] as const
+export type SaleStatusValue = (typeof SALE_STATUS_VALUES)[number]
+
+export interface ProductSyncCommand {
+  command_id: number
+  status: string
+  already_processed: boolean
+  error_code: string | null
+}
+
+export interface ProductSyncExternalCommand {
+  id: number
+  command_type: string
+  status: string
+  attempt_count: number
+  retryable: boolean
+  error_code: string | null
+  next_retry_at: string | null
+  completed_at: string | null
 }
 
 export interface ProductPlatformMapCreate {

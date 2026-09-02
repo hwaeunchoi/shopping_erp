@@ -11,7 +11,12 @@ from sqlalchemy import func, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
-from models.integration_sync import ExternalCommand, ExternalCommandLineResult, OrderStatusConflict
+from models.integration_sync import (
+    ExternalCommand,
+    ExternalCommandLineResult,
+    OrderStatusConflict,
+    ProductSyncCommandDetail,
+)
 
 
 class ExternalCommandRepository:
@@ -96,6 +101,58 @@ class ExternalCommandRepository:
         )
         result = cast(CursorResult, self.session.execute(stmt))
         return result.rowcount == 1
+
+    def list_active_for_target(self, command_type: str, target_type: str, target_id: int) -> list[ExternalCommand]:
+        """같은 대상(target_type+target_id)·같은 명령종류에 대해 아직 종료되지 않은
+        (PENDING/RETRY_WAIT/RUNNING) 명령을 전부 찾는다 - 새로운 목표값이 들어왔을 때
+        낡은 명령을 취소 대상으로 찾는 데 쓴다(services.product_sync_dispatch_service
+        참고). list_due_for_execution과 달리 next_retry_at이 아직 지나지 않은
+        RETRY_WAIT도 포함한다(대기 중이어도 낡은 값이면 취소해야 하므로)."""
+        return list(
+            self.session.execute(
+                select(ExternalCommand).where(
+                    ExternalCommand.command_type == command_type,
+                    ExternalCommand.target_type == target_type,
+                    ExternalCommand.target_id == target_id,
+                    ExternalCommand.status.in_(("PENDING", "RETRY_WAIT", "RUNNING")),
+                )
+            ).scalars()
+        )
+
+    def exists_unresolved_unknown_predecessor(
+        self, command_type: str, target_type: str, target_id: int, before_id: int
+    ) -> bool:
+        """같은 대상·같은 명령종류에 대해 이 명령(before_id)보다 먼저 생성된(id가 더
+        작은) UNKNOWN(결과 확인 필요) 명령이 있는지 확인한다 - 채널이 그 이전 명령을
+        실제로 처리했는지 알 수 없는 채로 새 명령을 실행하면, 이후 UNKNOWN이 실은
+        "이미 처리됨"으로 확인될 경우 두 요청이 뒤섞여 어떤 값이 실제로 반영됐는지
+        알 수 없게 된다 - 그래서 UNKNOWN이 해소되기 전에는 새 명령을 실행하지 않는다
+        (services.product_sync_dispatch_service.execute_command 참고)."""
+        stmt = select(func.count()).where(
+            ExternalCommand.command_type == command_type,
+            ExternalCommand.target_type == target_type,
+            ExternalCommand.target_id == target_id,
+            ExternalCommand.id < before_id,
+            ExternalCommand.status == "UNKNOWN",
+        )
+        return int(self.session.execute(stmt).scalar_one()) > 0
+
+    def exists_newer_command_for_target(
+        self, command_type: str, target_type: str, target_id: int, after_id: int
+    ) -> bool:
+        """같은 대상(target_type+target_id)·같은 명령종류(command_type)에 대해 이
+        명령(after_id)보다 나중에 생성된(id가 더 큰) 다른 명령이 있는지 확인한다 -
+        오래된 명령이 나중에 실행되어 최신 목표값을 덮어쓰지 않도록 실행 직전에
+        확인하는 근거다(services.product_sync_dispatch_service 참고). CANCELLED는
+        더 이상 진행되지 않을 것이 확정된 명령이라 "더 최신"으로 치지 않는다."""
+        stmt = select(func.count()).where(
+            ExternalCommand.command_type == command_type,
+            ExternalCommand.target_type == target_type,
+            ExternalCommand.target_id == target_id,
+            ExternalCommand.id > after_id,
+            ExternalCommand.status != "CANCELLED",
+        )
+        return int(self.session.execute(stmt).scalar_one()) > 0
 
     def try_transition(self, command_id: int, expected_lease_token: str, **values: Any) -> bool:
         """lease_token이 아직 자신의 것일 때만 원자적으로 최종 상태를 반영한다(소유권 검증).
@@ -190,4 +247,22 @@ class OrderStatusConflictRepository:
                 OrderStatusConflict.channel_status == channel_status,
                 OrderStatusConflict.resolved_at.is_(None),
             )
+        ).scalar_one_or_none()
+
+
+class ProductSyncCommandDetailRepository:
+    """ExternalCommand(INVENTORY_UPDATE/SALE_STATUS_UPDATE)의 확정된 목표값
+    (models.integration_sync.ProductSyncCommandDetail)."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def add(self, detail: ProductSyncCommandDetail) -> ProductSyncCommandDetail:
+        self.session.add(detail)
+        self.session.flush()
+        return detail
+
+    def get_by_command_id(self, command_id: int) -> Optional[ProductSyncCommandDetail]:
+        return self.session.execute(
+            select(ProductSyncCommandDetail).where(ProductSyncCommandDetail.command_id == command_id)
         ).scalar_one_or_none()

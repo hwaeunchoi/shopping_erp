@@ -400,6 +400,11 @@ class TestFetchProducts:
         assert ivory["sale_price"] == 7700
         blue = next(i for i in product["items"] if i["platform_option_id"] == "13650616697")
         assert blue["is_selling"] is False  # channelProductDisplayStatusType != "ON"
+        # 상용 ERP 확장(3단계) - 재고/판매상태 변경 API가 요구하는 원상품번호를 응답에서
+        # 그대로 뽑아 함께 반환한다(channelProductNo와는 다른 값 - 서로 다른 변형이라도
+        # groupProductNo는 공유하지만 originProductNo는 각자 다르다).
+        assert ivory["platform_origin_product_id"] == "13590724369"
+        assert blue["platform_origin_product_id"] == "13590724367"
 
     def test_live_treats_ungrouped_product_as_its_own_group(self, db_session, platform):
         """groupProductNo가 없는 항목은 originProductNo를 그룹 키로 대체 사용해

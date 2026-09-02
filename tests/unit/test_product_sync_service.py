@@ -93,6 +93,27 @@ class TestSyncProductsFromNaver:
         assert product.brand == "브랜드A"
         assert product.manufacturer == "제조사A"
 
+    def test_persists_platform_origin_product_id_for_inventory_sync(self, db_session, platform):
+        """상용 ERP 확장(3단계) - 재고/판매상태 변경 API가 요구하는 원상품번호를
+        신규 등록/재동기화(갱신) 모두에서 저장한다."""
+        item = _naver_product()["items"][0]
+        item["platform_origin_product_id"] = "ORIGIN-001"
+        connector = StubProductConnector([_naver_product(items=[item])])
+        service = ProductSyncService(db_session)
+
+        service.sync_products_from_naver(connector, platform.id)
+
+        mapping = (
+            db_session.query(ProductPlatformMap).filter_by(platform_id=platform.id, platform_option_id="ITEM-001").one()
+        )
+        assert mapping.platform_origin_product_id == "ORIGIN-001"
+
+        # 재동기화 시 값이 바뀌면 갱신된다.
+        item["platform_origin_product_id"] = "ORIGIN-002"
+        service.sync_products_from_naver(StubProductConnector([_naver_product(items=[item])]), platform.id)
+        db_session.refresh(mapping)
+        assert mapping.platform_origin_product_id == "ORIGIN-002"
+
     def test_sku_is_erp_internal_not_derived_from_platform_data(self, db_session, platform):
         """SKU는 ERP 내부 채번(SKU-{id:06d})이어야 하고, 판매자상품코드/플랫폼코드와
         절대 같은 값이 되어서는 안 된다 - AUTO-{platform_id}-{code} 방식은 폐기."""
