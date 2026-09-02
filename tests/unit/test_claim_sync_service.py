@@ -583,21 +583,55 @@ class TestCancellationOrderLookup:
         svc.sync_cancellations_by_candidate_orders(conn, platform.id, max_requests=2)
         assert conn.calls == ["O-0", "O-1", "O-0", "O-1"]
 
-    def test_per_order_external_error_is_skipped_not_fatal(self, db_session, platform):
-        """한 후보 주문의 외부 API 오류는 그 주문만 건너뛰고 나머지는 계속 처리한다."""
-        o1 = _make_order_with_status(db_session, platform, "O-BAD", "NEW")
-        o2 = _make_order_with_status(db_session, platform, "O-OK", "NEW")
+    def test_external_error_stops_batch_and_checkpoint_does_not_pass_it(self, db_session, platform):
+        """실패한 주문 이후 후보는 이번 실행에서 시도하지 않는다(레이트리밋 등 채널쪽
+        문제를 계속 밀어붙이지 않기 위함) - 커서는 실패한 주문 이전까지만 전진해서
+        다음 실행이 실패한 주문부터 맨 먼저 다시 시도하게 한다(영구 누락 방지)."""
+        _make_order_with_status(db_session, platform, "O-BAD", "NEW")
+        _make_order_with_status(db_session, platform, "O-AFTER", "NEW")
         conn = StubCancellationLookupConnector(
-            errors={"O-BAD": MarketplaceExternalAPIError("coupang", "SERVER_ERROR", True)},
-            results={"O-OK": _claim("O-OK", platform_claim_id="C-OK")},
+            errors={"O-BAD": MarketplaceExternalAPIError("coupang", "SERVER_ERROR", True)}, results={"O-AFTER": None}
         )
 
         result = ClaimSyncService(db_session).sync_cancellations_by_candidate_orders(conn, platform.id)
 
-        assert result["status"] == "SUCCESS"
+        assert result["status"] == "FAILED"  # 성공 건 0개(실패한 주문이 첫 후보였음).
+        assert result["count"] == 0
+        assert conn.calls == ["O-BAD"]  # O-AFTER는 이번 실행에서 시도하지 않음.
+
+    def test_orders_succeeded_before_a_later_failure_are_still_committed(self, db_session, platform):
+        """실패 지점 이전에 이미 성공적으로 확인/저장된 주문은 롤백되지 않는다 -
+        저장이 성공한 범위까지만 커서가 전진하되, 그 성공한 데이터 자체는 유지된다."""
+        o_ok = _make_order_with_status(db_session, platform, "O-OK", "NEW")
+        _make_order_with_status(db_session, platform, "O-BAD", "PREPARING")
+        conn = StubCancellationLookupConnector(
+            results={"O-OK": _claim("O-OK", platform_claim_id="C-OK")},
+            errors={"O-BAD": MarketplaceExternalAPIError("coupang", "TIMEOUT", True)},
+        )
+
+        result = ClaimSyncService(db_session).sync_cancellations_by_candidate_orders(conn, platform.id)
+
+        assert result["status"] == "PARTIAL"
         assert result["count"] == 1
-        assert db_session.query(Cancellation).filter_by(order_id=o2.id).count() == 1
-        assert db_session.query(Cancellation).filter_by(order_id=o1.id).count() == 0
+        assert result["reason_code"] == "TIMEOUT"
+        assert db_session.query(Cancellation).filter_by(order_id=o_ok.id).count() == 1
+
+    def test_failed_order_is_retried_first_on_next_run_not_after_a_full_rotation(self, db_session, platform):
+        """실패한 주문이 다음 실행에서 맨 먼저 다시 시도돼야 한다(전체 회전을 다
+        돌 때까지 기다리지 않음) - 영구 누락 방지의 핵심 검증."""
+        _make_order_with_status(db_session, platform, "O-BAD", "NEW")
+        _make_order_with_status(db_session, platform, "O-AFTER", "NEW")
+        svc = ClaimSyncService(db_session)
+
+        conn1 = StubCancellationLookupConnector(
+            errors={"O-BAD": MarketplaceExternalAPIError("coupang", "SERVER_ERROR", True)}
+        )
+        svc.sync_cancellations_by_candidate_orders(conn1, platform.id)
+
+        conn2 = StubCancellationLookupConnector(results={"O-BAD": None, "O-AFTER": None})
+        svc.sync_cancellations_by_candidate_orders(conn2, platform.id)
+
+        assert conn2.calls == ["O-BAD", "O-AFTER"]
 
     def test_credential_missing_aborts_batch_and_does_not_advance_checkpoint(self, db_session, platform):
         _make_order_with_status(db_session, platform, "O-1", "NEW")
@@ -613,3 +647,51 @@ class TestCancellationOrderLookup:
         conn2 = StubCancellationLookupConnector(results={"O-1": None, "O-2": None})
         svc.sync_cancellations_by_candidate_orders(conn2, platform.id)
         assert conn2.calls == ["O-1", "O-2"]
+
+    def test_credential_missing_rolls_back_earlier_successes_in_the_same_batch(self, db_session, platform):
+        """인증정보 누락은 이후 모든 호출이 똑같이 실패할 오류이므로, 이번 배치에서
+        앞서 이미 성공한 항목까지 포함해 전부 롤백하고 커서도 전혀 전진하지 않는다
+        (부분 실패인 MarketplaceExternalAPIError와는 다른 처리 - 위 test_orders_
+        succeeded_before_a_later_failure_are_still_committed와 대비)."""
+        o_ok = _make_order_with_status(db_session, platform, "O-OK", "NEW")
+        _make_order_with_status(db_session, platform, "O-CRED-FAIL", "NEW")
+        conn = StubCancellationLookupConnector(
+            results={"O-OK": _claim("O-OK", platform_claim_id="C-OK")},
+            errors={"O-CRED-FAIL": MarketplaceCredentialMissingError("coupang")},
+        )
+
+        result = ClaimSyncService(db_session).sync_cancellations_by_candidate_orders(conn, platform.id)
+
+        assert result["status"] == "FAILED"
+        assert result["reason_code"] == "CREDENTIAL_MISSING"
+        assert db_session.query(Cancellation).filter_by(order_id=o_ok.id).count() == 0
+
+    def test_cursors_do_not_mix_across_platforms(self, db_session, platform):
+        """서로 다른 플랫폼(판매자 계정)의 회전 진행 위치는 섞이지 않는다 -
+        ClaimCollectionCursor가 (platform_id, claim_type) 단위로 분리 저장됨을 검증."""
+        from models.platform import Platform
+
+        second_platform = Platform(
+            code="coupang2", name="쿠팡(다른계정)", connector_class="CoupangConnector", is_active=True
+        )
+        db_session.add(second_platform)
+        db_session.flush()
+
+        _make_order_with_status(db_session, platform, "P1-O1", "NEW")
+        _make_order_with_status(db_session, platform, "P1-O2", "NEW")
+        _make_order_with_status(db_session, second_platform, "P2-O1", "NEW")
+        svc = ClaimSyncService(db_session)
+
+        conn_p1 = StubCancellationLookupConnector(results={"P1-O1": None, "P1-O2": None})
+        svc.sync_cancellations_by_candidate_orders(conn_p1, platform.id, max_requests=1)
+        assert conn_p1.calls == ["P1-O1"]  # platform 1의 커서만 P1-O1까지 전진.
+
+        conn_p2 = StubCancellationLookupConnector(results={"P2-O1": None})
+        svc.sync_cancellations_by_candidate_orders(conn_p2, second_platform.id, max_requests=10)
+        assert conn_p2.calls == ["P2-O1"]  # platform 2는 platform 1의 진행 위치와 무관하게 처음부터.
+
+        # platform 1을 이어서 실행하면 앞서 멈춘 지점(P1-O2)부터 이어간다 - platform 2
+        # 실행이 platform 1의 커서에 영향을 주지 않았음을 확인한다.
+        conn_p1_again = StubCancellationLookupConnector(results={"P1-O2": None})
+        svc.sync_cancellations_by_candidate_orders(conn_p1_again, platform.id, max_requests=1)
+        assert conn_p1_again.calls == ["P1-O2"]

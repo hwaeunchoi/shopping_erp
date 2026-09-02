@@ -145,15 +145,36 @@ class ClaimSyncService:
         상태(NEW/PREPARING/SHIPPING)의 주문만 후보로 삼는다(repositories.order_repository.
         CANCELLATION_LOOKUP_CANDIDATE_STATUSES 참고).
 
-        ⚠️ 알려진 한계: ERP에 아직 수집되지 않은 주문(order_collect_job이 아직 못 가져온
-        주문)의 취소는 이 방식으로 알 수 없다 - 후보 목록 자체가 이미 수집된 Order
-        테이블에서 나오기 때문이다. 그 주문이 나중에 수집되면 다음 회전에서부터 후보에
-        포함된다(늦게라도 감지는 되지만 즉시는 아니다).
+        ⚠️ 알려진 한계 1(주문 자체를 모름): ERP에 아직 수집되지 않은 주문
+        (order_collect_job이 아직 못 가져온 주문)의 취소는 이 방식으로 알 수 없다 -
+        후보 목록 자체가 이미 수집된 Order 테이블에서 나오기 때문이다. 그 주문이
+        나중에 수집되면 다음 회전에서부터 후보에 포함된다(늦게라도 감지는 되지만
+        즉시는 아니다).
 
-        한 후보 주문의 외부 API 호출 실패(MarketplaceExternalAPIError)는 그 주문만
-        건너뛰고 다음 후보로 계속 진행한다(요청 자체가 주문마다 독립적인 개별 호출이라
-        전체 기능 롤백과는 격리 원칙을 다르게 적용 - 인증정보 누락처럼 이후 모든 호출이
-        똑같이 실패할 오류는 예외로 전파해 배치를 즉시 중단한다)."""
+        ⚠️ 알려진 한계 2(재조회 창 정책 - 후발 취소 커버리지): 커넥터의 조회기간은
+        "오늘 기준 최근 CANCEL_LOOKUP_WINDOW_DAYS일"(쿠팡은 31일, 채널이 허용하는
+        최대 range)이지 "주문일 이후 전체 기간"이 아니다(coupang_connector.
+        fetch_cancellation_status 참고). 그래서 한 주문이 다시 점검되는 "간격"이
+        CANCEL_LOOKUP_WINDOW_DAYS를 넘지 않는 한 그 사이에 발생한 취소는 반드시
+        어느 한 번의 점검 창에는 걸린다(오래된 주문이라서가 아니라 "점검 간격"이
+        관건). 반대로 후보 전체를 한 바퀴 도는 데(회전 주기) max_requests와 실행
+        빈도 대비 후보 수가 너무 많아 CANCEL_LOOKUP_WINDOW_DAYS일을 초과하면, 그
+        간격 동안 발생한 취소가 어느 창에도 걸리지 않아 놓칠 수 있다 - 운영자는
+        (비활성 상태로 오래 머무는 후보 수) / (실행당 max_requests * 실행 빈도)가
+        CANCEL_LOOKUP_WINDOW_DAYS일보다 작게 유지되도록 스케줄/배치 크기를
+        조정해야 한다.
+
+        한 후보 주문의 외부 API 호출 실패(MarketplaceExternalAPIError - 429/timeout/
+        연결실패/파싱실패 등, 이미 커넥터의 _request_with_retry가 재시도를 소진한
+        뒤 던진 것)를 만나면 그 지점에서 이번 배치를 멈춘다(이후 후보는 이번 실행에서
+        시도하지 않음 - 레이트리밋 등 채널 쪽 문제일 가능성이 높은데 계속 밀어붙이지
+        않기 위함). 커서는 실패한 주문 **이전까지** 성공적으로 확인된 위치에만
+        전진한다 - 실패한 주문은 다음 실행에서 맨 먼저 다시 시도되어 영구적으로
+        누락되지 않는다(재조회는 claim_id 기반 dedup이라 중복 생성도 없다).
+        인증정보 누락처럼 이후 모든 호출이 똑같이 실패할 오류는 예외로 전파해
+        커서를 전혀 전진시키지 않고(이번 실행에서 성공한 것도 포함해 전부 롤백)
+        배치를 즉시 중단한다 - 다음 실행이 이번 실행과 동일한 지점부터 다시
+        시도한다."""
         if not getattr(connector, "supports_cancellation_lookup_by_order", False):
             return _feature_result("UNSUPPORTED", 0, "CAPABILITY_UNSUPPORTED", False)
 
@@ -172,18 +193,22 @@ class ClaimSyncService:
 
             skipped = {"count": 0}
             count = 0
-            last_id = cursor.last_order_id
+            last_safe_id = cursor.last_order_id
+            failure: Optional[MarketplaceExternalAPIError] = None
             for order in candidates:
-                last_id = order.id
                 try:
                     raw = connector.fetch_cancellation_status(order.platform_order_no, order.order_date.date())
                 except MarketplaceExternalAPIError as e:
                     logger.warning(
-                        "취소 후보 주문 조회 실패(다음 주문 계속): platform_id=%s, reason=%s",
+                        "취소 후보 주문 조회 실패(이번 배치 중단, 다음 실행에서 재시도): platform_id=%s, reason=%s",
                         platform_id,
                         e.reason_code,
                     )
-                    continue
+                    failure = e
+                    break
+                # 조회 자체는 성공했다(취소 없음/있음 둘 다 "확인 완료") - 여기까지 온
+                # 주문만 커서 전진 대상이다.
+                last_safe_id = order.id
                 if raw is None:
                     continue
                 if self._persist_claim(
@@ -192,10 +217,13 @@ class ClaimSyncService:
                     count += 1
 
             if candidates:
-                cursor.last_order_id = last_id
+                cursor.last_order_id = last_safe_id
             cursor.updated_at = datetime.now(timezone.utc)
             self.session.flush()
             savepoint.commit()
+            if failure is not None:
+                status = "PARTIAL" if count > 0 else "FAILED"
+                return _feature_result(status, count, failure.reason_code, bool(failure.retryable))
             return _feature_result("SUCCESS", count, None, None)
         except MarketplaceCredentialMissingError:
             savepoint.rollback()
