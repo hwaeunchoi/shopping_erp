@@ -12,13 +12,18 @@ CoupangConnector의 상용 ERP 확장(2단계) - 취소/반품/교환 클레임 
 - 정산 상세(매출내역): /ko/api/settlement/sales-detail-query
 """
 
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 import httpx
 import pytest
 
-from integrations.malls.coupang_connector import COUPANG_API_BASE, RETURN_STATUS_CODES, CoupangConnector
+from integrations.malls.coupang_connector import (
+    CANCEL_LOOKUP_WINDOW_DAYS,
+    COUPANG_API_BASE,
+    RETURN_STATUS_CODES,
+    CoupangConnector,
+)
 from integrations.malls.errors import MarketplaceCredentialMissingError
 from services.settings_service import ApiCredentialService
 
@@ -113,6 +118,12 @@ class TestCapabilityFlags:
         상수 RETURN_STATUS_CODES 주석 참고). 추측으로 지원한다고 표시하지 않는다."""
         assert CoupangConnector.supports_cancellation_sync is False
 
+    def test_cancellation_lookup_by_order_is_supported(self):
+        """orderId+cancelType=CANCEL 조합의 단건 조회는 공식 파라미터 표가 명시적으로
+        허용한다(CANCEL_LOOKUP_WINDOW_DAYS 모듈 주석의 공식 문서 근거 참고) - 기간
+        대량조회 불가와는 별개 capability다."""
+        assert CoupangConnector.supports_cancellation_lookup_by_order is True
+
 
 class TestCredentialMissingFailsClosed:
     def test_fetch_returns_without_credentials_raises(self, db_session, platform):
@@ -134,6 +145,11 @@ class TestCredentialMissingFailsClosed:
         connector = CoupangConnector(session=db_session, platform_id=platform.id)
         with pytest.raises(MarketplaceCredentialMissingError):
             connector.fetch_settlement_details(date(2026, 1, 1), date(2026, 1, 31))
+
+    def test_fetch_cancellation_status_without_credentials_raises(self, db_session, platform):
+        connector = CoupangConnector(session=db_session, platform_id=platform.id)
+        with pytest.raises(MarketplaceCredentialMissingError):
+            connector.fetch_cancellation_status("28000008707838", date(2026, 1, 1))
 
 
 class TestFetchReturns:
@@ -239,6 +255,130 @@ class TestFetchReturns:
         assert "구*숙" not in blob
         assert "송파대로" not in blob
         assert "+1(555)444-1234" not in blob
+
+
+class TestFetchCancellationStatus:
+    """ "후보 주문 단건 조회" 방식 취소 조회(fetch_cancellation_status) - 상용 ERP
+    확장(2단계-A 보완). orderId+cancelType=CANCEL 조합, status 파라미터는 쓰지 않는다."""
+
+    def test_returns_normalized_cancellation_when_found(self, db_session, platform):
+        _register_credentials(db_session, platform)
+        captured_params = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured_params.update(dict(request.url.params))
+            return httpx.Response(
+                200,
+                json={
+                    "data": [_return_item(receipt_type="CANCEL", receipt_status="RELEASE_STOP_UNCHECKED")],
+                    "nextToken": "",
+                },
+            )
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url=COUPANG_API_BASE)
+        connector = CoupangConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        result = connector.fetch_cancellation_status("28000008707838", date(2026, 1, 1))
+
+        assert result is not None
+        assert result["platform_order_no"] == "28000008707838"
+        assert result["status"] == "REQUESTED"  # RELEASE_STOP_UNCHECKED -> REQUESTED(취소용 매핑)
+        assert result["raw_status"] == "RELEASE_STOP_UNCHECKED"
+        # status 파라미터는 쓰지 않는다(cancelType=CANCEL과 함께 쓸 수 없음 - 공식 문서 근거).
+        assert "status" not in captured_params
+        assert captured_params["cancelType"] == "CANCEL"
+        assert captured_params["orderId"] == "28000008707838"
+
+    def test_returns_none_when_no_cancellation_found(self, db_session, platform):
+        _register_credentials(db_session, platform)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"data": [], "nextToken": ""})
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url=COUPANG_API_BASE)
+        connector = CoupangConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        result = connector.fetch_cancellation_status("28000008707838", date(2026, 1, 1))
+
+        assert result is None
+
+    def test_completed_status_maps_to_completed(self, db_session, platform):
+        _register_credentials(db_session, platform)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [_return_item(receipt_type="CANCEL", receipt_status="RETURNS_COMPLETED")],
+                    "nextToken": "",
+                },
+            )
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url=COUPANG_API_BASE)
+        connector = CoupangConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        result = connector.fetch_cancellation_status("28000008707838", date(2026, 1, 1))
+
+        assert result is not None
+        assert result["status"] == "COMPLETED"
+
+    def test_unknown_raw_status_maps_to_review_not_completed(self, db_session, platform):
+        """Cancellation 상태머신은 REQUESTED/COMPLETED만 허용한다 - 모르는 원본상태를
+        완료로 추정하지 않고 REVIEW로 보존해야 한다."""
+        _register_credentials(db_session, platform)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [_return_item(receipt_type="CANCEL", receipt_status="NEW_UNKNOWN_STATUS")],
+                    "nextToken": "",
+                },
+            )
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url=COUPANG_API_BASE)
+        connector = CoupangConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        result = connector.fetch_cancellation_status("28000008707838", date(2026, 1, 1))
+
+        assert result is not None
+        assert result["status"] == "REVIEW"
+
+    def test_excludes_non_cancel_receipt_type(self, db_session, platform):
+        """같은 엔드포인트가 RETURN 유형을 섞어 줄 가능성에 대비해 CANCEL만 남긴다."""
+        _register_credentials(db_session, platform)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, json={"data": [_return_item(receipt_id=1, receipt_type="RETURN")], "nextToken": ""}
+            )
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url=COUPANG_API_BASE)
+        connector = CoupangConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        result = connector.fetch_cancellation_status("28000008707838", date(2026, 1, 1))
+
+        assert result is None
+
+    def test_window_is_clamped_to_lookup_window_days(self, db_session, platform):
+        """오래된 주문(since가 CANCEL_LOOKUP_WINDOW_DAYS보다 훨씬 이전)이어도 조회
+        시작일은 오늘 기준 최근 CANCEL_LOOKUP_WINDOW_DAYS일로 제한된다(그 이전 취소는
+        이 방식으로 확인할 수 없다는 한계 - fetch_cancellation_status docstring 참고)."""
+        _register_credentials(db_session, platform)
+        captured_params = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured_params.update(dict(request.url.params))
+            return httpx.Response(200, json={"data": [], "nextToken": ""})
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url=COUPANG_API_BASE)
+        connector = CoupangConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        connector.fetch_cancellation_status("28000008707838", date(2020, 1, 1))
+
+        assert captured_params["createdAtFrom"] != "2020-01-01"
+        expected_earliest = (date.today() - timedelta(days=CANCEL_LOOKUP_WINDOW_DAYS)).isoformat()
+        assert captured_params["createdAtFrom"] == expected_earliest
 
 
 class TestFetchExchanges:

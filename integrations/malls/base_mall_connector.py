@@ -89,6 +89,11 @@ class BaseMallConnector(ABC):
     # 교환과 같은 원칙: capability가 False면 서비스가 fetch_*를 호출하지 않는다.
     supports_settlement_sync: bool = False
     supports_settlement_detail_sync: bool = False
+    # 취소 "후보 주문 ID" 단건 조회 지원 여부 - 상용 ERP 확장(2단계-A 보완). 기간만으로
+    # 대량 조회가 불가능한 채널(예: 쿠팡 - cancelType=CANCEL 조회 시 orderId가 필수가
+    # 되는 공식 제약)에서, ERP가 이미 알고 있는 주문 ID를 대상으로 개별 조회하는
+    # 경로다(fetch_cancellations의 기간 기반 대량 수집과는 별개 capability).
+    supports_cancellation_lookup_by_order: bool = False
 
     def _marketplace_code(self) -> str:
         """오류 메시지용 안전한 채널 식별자(Secret/PII 아님). platform_code가 없으면 클래스명."""
@@ -196,6 +201,20 @@ class BaseMallConnector(ABC):
              "shipping_fee": Optional[float], "fault_type": Optional[str]}
         """
         raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "exchange_sync")
+
+    def fetch_cancellation_status(self, platform_order_no: str, since: date) -> Optional[dict[str, Any]]:
+        """특정 주문(platform_order_no) 하나의 취소 여부/상태를 단건 조회한다(기본:
+        미지원 오류). supports_cancellation_lookup_by_order=True인 커넥터만
+        오버라이드한다.
+
+        since는 이 주문이 ERP에 처음 수집된 날짜(주문일) 힌트다 - 커넥터는 이
+        값과 오늘 사이에서 채널이 허용하는 조회기간 제약에 맞춰 실제 조회 범위를
+        정한다(예: 쿠팡은 최근 N일만 확인 - 커넥터 구현 주석 참고, 그보다 오래된
+        미출고 주문의 뒤늦은 취소는 이 방식으로 놓칠 수 있다는 한계가 있다).
+
+        반환 형식은 fetch_cancellations()와 동일한 단일 딕셔너리이거나, 조회기간
+        내 취소 사실이 없으면 None(빈 결과 - 오류 아님)."""
+        raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "cancellation_lookup_by_order")
 
     def fetch_settlement_details(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
         """기간 내 정산 상세(주문 단위) 내역을 정규화된 형식으로 조회한다(기본: 미지원

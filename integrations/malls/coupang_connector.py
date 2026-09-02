@@ -110,6 +110,35 @@ _RETURN_RAW_TO_STATUS = {
     "RETURNS_COMPLETED": "REFUNDED",  # 반품완료
 }
 
+# --- 취소 "후보 주문" 단건 조회 (상용 ERP 확장 2단계-A 보완) ---
+# 공식 문서(developers.coupang.com/ko/api/returns/return-cancellation-request-list-query,
+# 2026-09 재조회) 파라미터 표 원문: "orderId: 주문번호 / status 파라메터를 제외하고
+# 조회할 경우에는 orderId가 파라메터에 포함되어야 합니다." + "cancelType=CANCEL일
+# 경우 status는 지원하지 않는 파라메터입니다." 즉 cancelType=CANCEL 조회는 status를
+# 쓸 수 없어 orderId가 항상 필수가 된다 - 그래서 날짜range만으로의 대량(bulk) 취소
+# 수집은 여전히 불가능하지만(위 RETURN_STATUS_CODES 주석과 동일 결론), ERP가 이미
+# 알고 있는 주문 하나를 대상으로 "orderId+cancelType=CANCEL+날짜range"를 조합하는
+# 조회는 파라미터 표가 명시적으로 허용한다(같은 표의 orderId 행: "searchType=
+# timeFrame일 경우 지원하지 않는 파라메터" - 즉 searchType을 쓰지 않는 이 모드에서는
+# orderId 사용이 정상 경로). 이 정합성은 공식 문서 파라미터 표 자체에서 확인했다
+# (참고: 같은 채널의 별도 FAQ "결제완료 단계에서 취소된 주문 정보를 확인할 수
+# 있나요?"는 "status, orderId 파라메터를 모두 제외"라고 안내해 파라미터 표와
+# 서로 모순되는데, 이 모순은 "orderId 없이 날짜range만으로 대량 조회가 되는지"에만
+# 관련되고, 이 기능이 실제로 구현하는 "orderId를 포함해 조회"하는 경로 자체는 두
+# 문서 어디서도 부정하지 않는다 - 그래서 이 좁은 범위만 구현한다).
+CANCEL_LOOKUP_WINDOW_DAYS = 31  # RETURN_MAX_RANGE_DAYS와 동일한 문서상 최대 조회기간.
+_CANCEL_RAW_TO_STATUS = {
+    # Cancellation 모델은 REQUESTED->COMPLETED 두 상태만 허용한다(REVIEW 제외) -
+    # RETURN_RAW_TO_STATUS의 5단계 세분 상태를 이 두 상태로 보수적으로 접는다:
+    # 아직 최종 처리 전(출고중지요청/반품접수/쿠팡확인요청)은 REQUESTED,
+    # 최종 처리 확인(입고완료/반품완료)은 COMPLETED로 본다.
+    "RELEASE_STOP_UNCHECKED": "REQUESTED",
+    "RETURNS_UNCHECKED": "REQUESTED",
+    "REQUEST_COUPANG_CHECK": "REQUESTED",
+    "VENDOR_WAREHOUSE_CONFIRM": "COMPLETED",
+    "RETURNS_COMPLETED": "COMPLETED",
+}
+
 # --- 교환 요청 목록 조회 (공식 문서: developers.coupang.com/ko/api/exchanges/
 # query-a-list-of-exchange-requests, 2026-09 조회) ---
 EXCHANGE_REQUEST_PATH_TMPL = "/v2/providers/openapi/apis/api/v4/vendors/{vendor_id}/exchangeRequests"
@@ -146,6 +175,8 @@ class CoupangConnector(BaseMallConnector):
     supports_settlement_detail_sync = True
     # 취소(CANCEL)는 기간만으로 대량 조회할 공식 API 경로가 없다(RETURN_STATUS_CODES
     # 주석 참고) - supports_cancellation_sync는 base 기본값(False)을 그대로 상속한다.
+    # 대신 "후보 주문 단건 조회"는 지원한다(CANCEL_LOOKUP_WINDOW_DAYS 주석 참고).
+    supports_cancellation_lookup_by_order = True
 
     def __init__(
         self, session: Any = None, platform_id: Optional[int] = None, http_client: Optional[httpx.Client] = None
@@ -247,6 +278,25 @@ class CoupangConnector(BaseMallConnector):
         access_key, secret_key, vendor_id = credentials
         raw_items = self._fetch_raw_return_requests(start_date, end_date, access_key, secret_key, vendor_id)
         return self._normalize_return_requests(raw_items)
+
+    def fetch_cancellation_status(self, platform_order_no: str, since: date) -> Optional[dict[str, Any]]:
+        """지정한 주문 하나의 취소 여부를 조회한다(모듈 상단 CANCEL_LOOKUP_WINDOW_DAYS
+        주석의 공식 문서 근거 참고) - orderId+cancelType=CANCEL 조합, status 파라미터
+        제외. 조회기간은 [since, 오늘] 중 최근 CANCEL_LOOKUP_WINDOW_DAYS일로 제한한다
+        (그보다 오래전에 발생한 취소는 이 방식으로 확인할 수 없다는 한계가 있다 -
+        services.claim_sync_service의 후보 선정 자체가 배송 전 상태의 주문만 대상으로
+        하므로 실무적으로는 이 범위 밖 사례가 드물 것으로 본다)."""
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("coupang")
+        access_key, secret_key, vendor_id = credentials
+        today = date.today()
+        window_start = max(since, today - timedelta(days=CANCEL_LOOKUP_WINDOW_DAYS))
+        raw_items = self._fetch_raw_cancel_by_order(
+            window_start, today, platform_order_no, access_key, secret_key, vendor_id
+        )
+        normalized = self._normalize_cancel_requests(raw_items)
+        return normalized[0] if normalized else None
 
     def fetch_exchanges(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
         """교환 목록 조회(공식 문서: developers.coupang.com/ko/api/exchanges/
@@ -521,45 +571,52 @@ class CoupangConnector(BaseMallConnector):
     def _normalize_return_requests(raw_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """receiptType=="RETURN"만 대상으로 한다(CANCEL은 이 메서드의 대상이 아니다 -
         fetch_returns()가 조회한 상태코드로는 RETURN 유형만 나오는 것으로 확인했지만,
-        방어적으로 한 번 더 필터링한다). 여러 라인이 포함된 반품은 첫 라인에만
-        order_item을 연결하고 수량은 라인별 합계로 기록한다(다중 라인 클레임을
-        완전히 분해하는 것은 이번 범위 밖)."""
-        normalized = []
-        for item in raw_items:
-            if item.get("receiptType") != "RETURN":
-                continue
-            order_id = item.get("orderId")
-            if order_id is None:
-                continue
-            raw_status = item.get("receiptStatus")
-            std_status = _RETURN_RAW_TO_STATUS.get(raw_status or "")
-            if std_status is None:
-                logger.warning("알 수 없는 쿠팡 반품 상태 - REVIEW로 보존")
-                std_status = "REVIEW"
-            return_items = item.get("returnItems") or []
-            first_item = return_items[0] if return_items else {}
-            quantity = sum(int(ri.get("cancelCount", 0) or 0) for ri in return_items) or None
-            shipping_fee = _money_to_decimal(item.get("returnShippingCharge"))
-            reason = item.get("reasonCodeText") or item.get("cancelReasonCategory2") or item.get("reasonCode")
-            normalized.append(
-                {
-                    "platform_order_no": str(order_id),
-                    "platform_claim_id": (str(item["receiptId"]) if item.get("receiptId") is not None else None),
-                    "platform_order_item_no": (
-                        str(first_item["vendorItemId"]) if first_item.get("vendorItemId") is not None else None
-                    ),
-                    "reason": _clip_reason(reason),
-                    "status": std_status,
-                    "raw_status": raw_status,
-                    "requested_at": _parse_coupang_offset_datetime(item.get("createdAt")),
-                    # 이 API는 환불액을 제공하지 않는다(0으로 추정하지 않음 - None 유지).
-                    "refund_amount": None,
-                    "quantity": quantity,
-                    "shipping_fee": shipping_fee,
-                    "fault_type": item.get("faultByType"),
-                }
-            )
-        return normalized
+        방어적으로 한 번 더 필터링한다)."""
+        return [
+            _normalize_receipt_item(item, _RETURN_RAW_TO_STATUS, "반품")
+            for item in raw_items
+            if item.get("receiptType") == "RETURN" and item.get("orderId") is not None
+        ]
+
+    def _fetch_raw_cancel_by_order(
+        self, start_date: date, end_date: date, platform_order_no: str, access_key: str, secret_key: str, vendor_id: str
+    ) -> list[dict[str, Any]]:
+        """단일 주문의 취소 여부를 orderId+cancelType=CANCEL로 조회한다(status는
+        쿼리에서 제외 - 모듈 상단 CANCEL_LOOKUP_WINDOW_DAYS 주석 참고). 단건이라
+        nextToken 반복은 방어적으로만 유지한다(사실상 1페이지로 끝난다)."""
+        path = RETURN_REQUEST_PATH_TMPL.format(vendor_id=vendor_id)
+        raw_items: list[dict[str, Any]] = []
+        next_token = ""
+        while True:
+            params: list[tuple[str, str]] = [
+                ("createdAtFrom", start_date.isoformat()),
+                ("createdAtTo", end_date.isoformat()),
+                ("cancelType", "CANCEL"),
+                ("orderId", platform_order_no),
+            ]
+            if next_token:
+                params.append(("nextToken", next_token))
+            query = urlencode(params)
+            authorization = self._authorization(access_key, secret_key, "GET", path, query)
+            response = self._request_with_retry("GET", f"{path}?{query}", headers={"Authorization": authorization})
+            raise_for_status("coupang", response.status_code)
+            with external_call("coupang"):
+                payload = response.json()
+                raw_items.extend(payload.get("data", []) or [])
+                next_token = payload.get("nextToken") or ""
+            if not next_token:
+                break
+        return raw_items
+
+    @staticmethod
+    def _normalize_cancel_requests(raw_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """receiptType=="CANCEL"만 대상으로 한다(방어적 필터 - _fetch_raw_cancel_by_order가
+        cancelType=CANCEL로 요청했지만 응답 필드 자체를 한 번 더 확인한다)."""
+        return [
+            _normalize_receipt_item(item, _CANCEL_RAW_TO_STATUS, "취소")
+            for item in raw_items
+            if item.get("receiptType") == "CANCEL" and item.get("orderId") is not None
+        ]
 
     # --- 교환 목록 조회 ---
 
@@ -742,6 +799,41 @@ class CoupangConnector(BaseMallConnector):
                     }
                 )
         return normalized
+
+
+def _normalize_receipt_item(item: dict[str, Any], status_mapping: dict[str, str], type_label: str) -> dict[str, Any]:
+    """반품(RETURN)/취소(CANCEL) 응답 항목 공통 정규화 - 두 유형이 같은 응답 스키마를
+    공유한다(공식 문서 Response 필드 확인, 2026-09). status_mapping만 유형별로 다르다
+    (반품은 5단계 세분 상태, 취소는 REQUESTED/COMPLETED 두 상태로 접는다 -
+    _CANCEL_RAW_TO_STATUS 주석 참고). 호출부가 이미 receiptType으로 필터링했다고
+    가정한다(order_id는 None이 아님을 호출부가 보장)."""
+    order_id = item["orderId"]
+    raw_status = item.get("receiptStatus")
+    std_status = status_mapping.get(raw_status or "")
+    if std_status is None:
+        logger.warning("알 수 없는 쿠팡 %s 상태 - REVIEW로 보존", type_label)
+        std_status = "REVIEW"
+    return_items = item.get("returnItems") or []
+    first_item = return_items[0] if return_items else {}
+    quantity = sum(int(ri.get("cancelCount", 0) or 0) for ri in return_items) or None
+    shipping_fee = _money_to_decimal(item.get("returnShippingCharge"))
+    reason = item.get("reasonCodeText") or item.get("cancelReasonCategory2") or item.get("reasonCode")
+    return {
+        "platform_order_no": str(order_id),
+        "platform_claim_id": (str(item["receiptId"]) if item.get("receiptId") is not None else None),
+        "platform_order_item_no": (
+            str(first_item["vendorItemId"]) if first_item.get("vendorItemId") is not None else None
+        ),
+        "reason": _clip_reason(reason),
+        "status": std_status,
+        "raw_status": raw_status,
+        "requested_at": _parse_coupang_offset_datetime(item.get("createdAt")),
+        # 이 API는 환불액을 제공하지 않는다(0으로 추정하지 않음 - None 유지).
+        "refund_amount": None,
+        "quantity": quantity,
+        "shipping_fee": shipping_fee,
+        "fault_type": item.get("faultByType"),
+    }
 
 
 def _parse_coupang_datetime(value: Optional[str]) -> datetime:

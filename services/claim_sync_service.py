@@ -50,6 +50,7 @@ from integrations.malls.errors import (
 from models.order import Cancellation, ClaimUnmatched, Exchange, Return
 from repositories.order_repository import (
     CancellationRepository,
+    ClaimCollectionCursorRepository,
     ClaimUnmatchedRepository,
     ExchangeRepository,
     OrderRepository,
@@ -67,6 +68,13 @@ logger = logging.getLogger(__name__)
 # 각 클레임 유형에서 "완료(종결)"로 보는 상태 - completed_at을 채운다.
 _TERMINAL_STATUSES = {"COMPLETED", "REFUNDED", "REJECTED"}
 
+# "후보 주문 단건 조회" 방식 취소 수집(예: 쿠팡)의 회전식 체크포인트 claim_type 값
+# (models.order.ClaimCollectionCursor - 실제 Cancellation.claim_type이 아니라
+# 진행 위치 구분용 키다).
+CANCELLATION_ORDER_LOOKUP_CURSOR_TYPE = "CANCELLATION_ORDER_LOOKUP"
+# 실행 1회당 최대 조회 요청 수 - 전체 주문을 무제한 순회하지 않기 위한 예산.
+DEFAULT_CANCELLATION_LOOKUP_BATCH = 50
+
 
 class ClaimSyncService:
     def __init__(self, session: Session) -> None:
@@ -76,6 +84,7 @@ class ClaimSyncService:
         self.return_repo = ReturnRepository(session)
         self.cancellation_repo = CancellationRepository(session)
         self.unmatched_repo = ClaimUnmatchedRepository(session)
+        self.cursor_repo = ClaimCollectionCursorRepository(session)
 
     def sync_claims(self, connector: Any, platform_id: int, start_date: date, end_date: date) -> dict[str, Any]:
         """취소/반품/교환을 capability 기준으로 미러링하고 구조화된 기능별 결과를 반환한다.
@@ -121,6 +130,87 @@ class ClaimSyncService:
             "skipped_no_order": skipped["count"],
             "resolved_unmatched": resolved_unmatched,
         }
+
+    def sync_cancellations_by_candidate_orders(
+        self, connector: Any, platform_id: int, max_requests: int = DEFAULT_CANCELLATION_LOOKUP_BATCH
+    ) -> dict[str, Any]:
+        """ "후보 주문 단건 조회" 방식의 취소 수집(상용 ERP 확장 2단계-A 보완) -
+        기간만으로 대량조회가 안 되는 채널(쿠팡 등, supports_cancellation_lookup_by_order
+        참고) 전용. sync_claims()의 기간 기반 대량조회(supports_cancellation_sync)와는
+        별개 경로이며, 같은 sync_claims() 호출 안에 넣지 않고 별도로 호출한다(스케줄러가
+        둘 다 호출 - scheduler/jobs/claim_sync_job.py 참고).
+
+        회전식 체크포인트(ClaimCollectionCursor)로 Order.id 오름차순 최대 max_requests건만
+        조회해(전체 무제한 순회 금지) 매 실행 요청 수를 예산 내로 제한한다. 배송 전
+        상태(NEW/PREPARING/SHIPPING)의 주문만 후보로 삼는다(repositories.order_repository.
+        CANCELLATION_LOOKUP_CANDIDATE_STATUSES 참고).
+
+        ⚠️ 알려진 한계: ERP에 아직 수집되지 않은 주문(order_collect_job이 아직 못 가져온
+        주문)의 취소는 이 방식으로 알 수 없다 - 후보 목록 자체가 이미 수집된 Order
+        테이블에서 나오기 때문이다. 그 주문이 나중에 수집되면 다음 회전에서부터 후보에
+        포함된다(늦게라도 감지는 되지만 즉시는 아니다).
+
+        한 후보 주문의 외부 API 호출 실패(MarketplaceExternalAPIError)는 그 주문만
+        건너뛰고 다음 후보로 계속 진행한다(요청 자체가 주문마다 독립적인 개별 호출이라
+        전체 기능 롤백과는 격리 원칙을 다르게 적용 - 인증정보 누락처럼 이후 모든 호출이
+        똑같이 실패할 오류는 예외로 전파해 배치를 즉시 중단한다)."""
+        if not getattr(connector, "supports_cancellation_lookup_by_order", False):
+            return _feature_result("UNSUPPORTED", 0, "CAPABILITY_UNSUPPORTED", False)
+
+        savepoint = self.session.begin_nested()
+        try:
+            cursor = self.cursor_repo.get_or_create(platform_id, CANCELLATION_ORDER_LOOKUP_CURSOR_TYPE)
+            candidates = self.order_repo.list_cancellation_lookup_candidates(
+                platform_id, cursor.last_order_id, max_requests
+            )
+            if len(candidates) < max_requests:
+                seen_ids = {o.id for o in candidates}
+                wrapped = self.order_repo.list_cancellation_lookup_candidates(
+                    platform_id, 0, max_requests - len(candidates)
+                )
+                candidates += [o for o in wrapped if o.id not in seen_ids]
+
+            skipped = {"count": 0}
+            count = 0
+            last_id = cursor.last_order_id
+            for order in candidates:
+                last_id = order.id
+                try:
+                    raw = connector.fetch_cancellation_status(order.platform_order_no, order.order_date.date())
+                except MarketplaceExternalAPIError as e:
+                    logger.warning(
+                        "취소 후보 주문 조회 실패(다음 주문 계속): platform_id=%s, reason=%s",
+                        platform_id,
+                        e.reason_code,
+                    )
+                    continue
+                if raw is None:
+                    continue
+                if self._persist_claim(
+                    "CANCELLATION", platform_id, raw, skipped, self.cancellation_repo, CANCELLATION_TRANSITIONS
+                ):
+                    count += 1
+
+            if candidates:
+                cursor.last_order_id = last_id
+            cursor.updated_at = datetime.now(timezone.utc)
+            self.session.flush()
+            savepoint.commit()
+            return _feature_result("SUCCESS", count, None, None)
+        except MarketplaceCredentialMissingError:
+            savepoint.rollback()
+            return _feature_result("FAILED", 0, "CREDENTIAL_MISSING", False)
+        except MarketplaceCapabilityUnsupportedError:
+            savepoint.rollback()
+            return _feature_result("UNSUPPORTED", 0, "CAPABILITY_UNSUPPORTED", False)
+        except SQLAlchemyError:
+            savepoint.rollback()
+            logger.warning("취소 후보조회 DB 반영 실패: trace=%s", uuid.uuid4().hex[:8])
+            return _feature_result("FAILED", 0, "DB_WRITE_FAILED", False)
+        except Exception:  # noqa: BLE001 - 예상 밖 예외도 이 기능만 격리(내부 전문 미노출)
+            savepoint.rollback()
+            logger.warning("취소 후보조회 예상 밖 오류: trace=%s", uuid.uuid4().hex[:8])
+            return _feature_result("FAILED", 0, "INTERNAL_ERROR", False)
 
     def _sync_feature(
         self, supported: bool, fetch: Callable[[], list], persist: Callable[[dict], bool], feature: str

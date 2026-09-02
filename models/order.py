@@ -288,3 +288,21 @@ class ClaimUnmatched(Base):
     detected_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     resolved_entity_id: Mapped[Optional[int]] = mapped_column(nullable=True)
+
+
+class ClaimCollectionCursor(Base):
+    """ "후보 주문" 기반 클레임 조회(예: 쿠팡 취소 - orderId 단건 조회만 가능해 기간
+    대량조회가 안 되는 채널)가 매 실행마다 전체 주문을 무제한 순회하지 않도록 진행
+    위치를 저장한다. platform_id + claim_type(예: "CANCELLATION_ORDER_LOOKUP") 단위로
+    1행 - Order.id 오름차순으로 last_order_id 다음부터 최대 요청 수만큼 조회하고,
+    끝에 도달하면 처음(0)부터 다시 순회한다(회전식 - 한 번에 다 못 봐도 시간이
+    지나면 결국 전체 후보를 한 바퀴 훑는다). services.claim_sync_service 참고."""
+
+    __tablename__ = "claim_collection_cursors"
+    __table_args__ = (Index("uq_claim_collection_cursor", "platform_id", "claim_type", unique=True),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    platform_id: Mapped[int] = mapped_column(ForeignKey("platforms.id"), nullable=False)
+    claim_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    last_order_id: Mapped[int] = mapped_column(nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)

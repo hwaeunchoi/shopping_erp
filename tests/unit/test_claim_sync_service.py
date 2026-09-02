@@ -482,3 +482,134 @@ class TestUnmatchedClaimPreservation:
         held = ClaimUnmatchedRepository(db_session).list_unresolved(platform.id)
         assert len(held) == 1
         assert held[0].platform_claim_id is None
+
+
+def _make_order_with_status(db_session, platform, order_no, status):
+    order = Order(
+        platform_id=platform.id,
+        platform_order_no=order_no,
+        status=status,
+        order_date=datetime.now(timezone.utc),
+        total_amount=10000,
+        discount_amount=0,
+    )
+    db_session.add(order)
+    db_session.flush()
+    return order
+
+
+class StubCancellationLookupConnector:
+    """fetch_cancellation_status()를 order_no별로 제어할 수 있는 스텁 - 결과 dict,
+    None(취소 없음), 또는 예외를 지정할 수 있다."""
+
+    def __init__(self, *, supported=True, results=None, errors=None):
+        self.supports_cancellation_lookup_by_order = supported
+        self._results = results or {}
+        self._errors = errors or {}
+        self.calls: list[str] = []
+
+    def fetch_cancellation_status(self, platform_order_no, since):
+        self.calls.append(platform_order_no)
+        if platform_order_no in self._errors:
+            raise self._errors[platform_order_no]
+        return self._results.get(platform_order_no)
+
+
+class TestCancellationOrderLookup:
+    """상용 ERP 확장(2단계-A 보완): "후보 주문 단건 조회" 방식 취소 수집
+    (sync_cancellations_by_candidate_orders) - 쿠팡처럼 기간 대량조회가 안 되는
+    채널 전용 경로."""
+
+    def test_unsupported_capability_returns_unsupported_without_querying(self, db_session, platform):
+        _make_order_with_status(db_session, platform, "O-1", "NEW")
+        conn = StubCancellationLookupConnector(supported=False)
+
+        result = ClaimSyncService(db_session).sync_cancellations_by_candidate_orders(conn, platform.id)
+
+        assert result["status"] == "UNSUPPORTED"
+        assert conn.calls == []
+
+    def test_only_non_terminal_orders_are_candidates(self, db_session, platform):
+        o1 = _make_order_with_status(db_session, platform, "O-NEW", "NEW")
+        _make_order_with_status(db_session, platform, "O-DELIVERED", "DELIVERED")
+        _make_order_with_status(db_session, platform, "O-CANCELED", "CANCELED")
+        conn = StubCancellationLookupConnector(results={o1.platform_order_no: None})
+
+        ClaimSyncService(db_session).sync_cancellations_by_candidate_orders(conn, platform.id, max_requests=10)
+
+        assert conn.calls == ["O-NEW"]
+
+    def test_found_cancellation_is_persisted(self, db_session, platform):
+        order = _make_order_with_status(db_session, platform, "O-1", "PREPARING")
+        conn = StubCancellationLookupConnector(
+            results={"O-1": _claim("O-1", platform_claim_id="C-1", status="REQUESTED")}
+        )
+
+        result = ClaimSyncService(db_session).sync_cancellations_by_candidate_orders(conn, platform.id)
+
+        assert result["status"] == "SUCCESS"
+        assert result["count"] == 1
+        created = db_session.query(Cancellation).filter_by(order_id=order.id).one()
+        assert created.platform_claim_id == "C-1"
+
+    def test_batch_is_limited_and_checkpoint_persists_across_calls(self, db_session, platform):
+        """max_requests보다 후보가 많으면 이번 실행은 앞쪽만 처리하고, 다음 호출은
+        체크포인트(마지막으로 본 Order.id)부터 이어서 처리한다(전체 무제한 순회 금지).
+        max_requests=1로 둬 이번 실행이 정확히 예산만큼만 채워지게 해서(끝에 도달하지
+        않음) 회전(wrap-around) 보충 로직이 끼어들지 않는 상태로 체크포인트 이어받기만
+        검증한다(회전 자체는 test_wraps_around_after_reaching_the_end에서 별도 검증)."""
+        orders = [_make_order_with_status(db_session, platform, f"O-{i}", "NEW") for i in range(3)]
+        conn = StubCancellationLookupConnector(results={o.platform_order_no: None for o in orders})
+        svc = ClaimSyncService(db_session)
+
+        svc.sync_cancellations_by_candidate_orders(conn, platform.id, max_requests=1)
+        assert conn.calls == ["O-0"]
+
+        svc.sync_cancellations_by_candidate_orders(conn, platform.id, max_requests=1)
+        assert conn.calls == ["O-0", "O-1"]
+
+        svc.sync_cancellations_by_candidate_orders(conn, platform.id, max_requests=1)
+        assert conn.calls == ["O-0", "O-1", "O-2"]
+
+    def test_wraps_around_after_reaching_the_end(self, db_session, platform):
+        orders = [_make_order_with_status(db_session, platform, f"O-{i}", "NEW") for i in range(2)]
+        conn = StubCancellationLookupConnector(results={o.platform_order_no: None for o in orders})
+        svc = ClaimSyncService(db_session)
+
+        svc.sync_cancellations_by_candidate_orders(conn, platform.id, max_requests=2)
+        assert conn.calls == ["O-0", "O-1"]
+
+        # 후보가 2건뿐인데 max_requests=2를 다 채우지 못했으니(끝에 도달) 처음부터 다시 순회한다.
+        svc.sync_cancellations_by_candidate_orders(conn, platform.id, max_requests=2)
+        assert conn.calls == ["O-0", "O-1", "O-0", "O-1"]
+
+    def test_per_order_external_error_is_skipped_not_fatal(self, db_session, platform):
+        """한 후보 주문의 외부 API 오류는 그 주문만 건너뛰고 나머지는 계속 처리한다."""
+        o1 = _make_order_with_status(db_session, platform, "O-BAD", "NEW")
+        o2 = _make_order_with_status(db_session, platform, "O-OK", "NEW")
+        conn = StubCancellationLookupConnector(
+            errors={"O-BAD": MarketplaceExternalAPIError("coupang", "SERVER_ERROR", True)},
+            results={"O-OK": _claim("O-OK", platform_claim_id="C-OK")},
+        )
+
+        result = ClaimSyncService(db_session).sync_cancellations_by_candidate_orders(conn, platform.id)
+
+        assert result["status"] == "SUCCESS"
+        assert result["count"] == 1
+        assert db_session.query(Cancellation).filter_by(order_id=o2.id).count() == 1
+        assert db_session.query(Cancellation).filter_by(order_id=o1.id).count() == 0
+
+    def test_credential_missing_aborts_batch_and_does_not_advance_checkpoint(self, db_session, platform):
+        _make_order_with_status(db_session, platform, "O-1", "NEW")
+        _make_order_with_status(db_session, platform, "O-2", "NEW")
+        conn = StubCancellationLookupConnector(errors={"O-1": MarketplaceCredentialMissingError("coupang")})
+        svc = ClaimSyncService(db_session)
+
+        result = svc.sync_cancellations_by_candidate_orders(conn, platform.id)
+
+        assert result["status"] == "FAILED"
+        assert result["reason_code"] == "CREDENTIAL_MISSING"
+        # 아무 것도 커밋되지 않았으니 다음 실행도 처음(O-1)부터 다시 시도해야 한다.
+        conn2 = StubCancellationLookupConnector(results={"O-1": None, "O-2": None})
+        svc.sync_cancellations_by_candidate_orders(conn2, platform.id)
+        assert conn2.calls == ["O-1", "O-2"]

@@ -49,6 +49,7 @@ from models.order import (  # noqa: F401
     Return,
     Cancellation,
     ClaimUnmatched,
+    ClaimCollectionCursor,
 )
 
 # 정산
@@ -120,6 +121,7 @@ __all__ = [
     "Return",
     "Cancellation",
     "ClaimUnmatched",
+    "ClaimCollectionCursor",
     "Settlement",
     "SettlementDetail",
     "SettlementDiscrepancy",

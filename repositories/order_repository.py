@@ -22,12 +22,28 @@ from sqlalchemy.orm import Session
 from models.customer import Customer
 from models.extra import Memo
 from models.inventory import Inventory
-from models.order import Cancellation, ClaimUnmatched, Exchange, Order, OrderItem, Return, Shipment, ShipmentItem
+from models.order import (
+    Cancellation,
+    ClaimCollectionCursor,
+    ClaimUnmatched,
+    Exchange,
+    Order,
+    OrderItem,
+    Return,
+    Shipment,
+    ShipmentItem,
+)
 from models.product import Product, ProductOption, ProductPlatformMap
 from models.supplier import ProductSupplierMap, Supplier
 from repositories.base_repository import BaseRepository
 
 RequestDateRangeModel = Union[type[Exchange], type[Return], type[Cancellation]]
+
+# "취소 후보 주문"으로 볼 상태 - 아직 배송이 끝나지 않아 취소될 여지가 있는 주문만
+# 대상으로 한다(DELIVERED/CANCELED/EXCHANGED/RETURNED/REFUNDED는 제외 - 이미
+# 종결됐거나 취소가 아닌 다른 클레임 경로로 처리될 상태). services.claim_sync_service
+# 참고.
+CANCELLATION_LOOKUP_CANDIDATE_STATUSES = ["NEW", "PREPARING", "SHIPPING"]
 
 
 def _filtered_stmt(
@@ -68,6 +84,24 @@ class OrderRepository(BaseRepository[Order]):
 
     def list_by_date_range(self, start: datetime, end: datetime) -> list[Order]:
         stmt = select(Order).where(Order.order_date >= start, Order.order_date < end, Order.is_deleted.is_(False))
+        return list(self.session.execute(stmt).scalars().all())
+
+    def list_cancellation_lookup_candidates(self, platform_id: int, after_id: int, limit: int) -> list[Order]:
+        """취소 "후보 주문 단건 조회"(예: 쿠팡)의 다음 배치를 Order.id 오름차순으로
+        가져온다. 매 실행 최대 limit건만 반환해(전체 무제한 순회 금지) 요청 수를
+        예산 내로 제한한다 - 회전식 순회는 호출부(ClaimCollectionCursor 갱신)가
+        담당한다."""
+        stmt = (
+            select(Order)
+            .where(
+                Order.platform_id == platform_id,
+                Order.id > after_id,
+                Order.status.in_(CANCELLATION_LOOKUP_CANDIDATE_STATUSES),
+                Order.is_deleted.is_(False),
+            )
+            .order_by(Order.id.asc())
+            .limit(limit)
+        )
         return list(self.session.execute(stmt).scalars().all())
 
     def list_filtered(
@@ -672,3 +706,24 @@ class ClaimUnmatchedRepository(BaseRepository[ClaimUnmatched]):
         if platform_id is not None:
             stmt = stmt.where(ClaimUnmatched.platform_id == platform_id)
         return list(self.session.execute(stmt.order_by(ClaimUnmatched.detected_at.desc())).scalars())
+
+
+class ClaimCollectionCursorRepository(BaseRepository[ClaimCollectionCursor]):
+    """ "후보 주문" 기반 클레임 조회의 회전식 순회 체크포인트(models.order.
+    ClaimCollectionCursor 참고)."""
+
+    def __init__(self, session: Session) -> None:
+        super().__init__(session, ClaimCollectionCursor)
+
+    def get_or_create(self, platform_id: int, claim_type: str) -> ClaimCollectionCursor:
+        stmt = select(ClaimCollectionCursor).where(
+            ClaimCollectionCursor.platform_id == platform_id, ClaimCollectionCursor.claim_type == claim_type
+        )
+        existing = self.session.execute(stmt).scalar_one_or_none()
+        if existing is not None:
+            return existing
+        return self.add(
+            ClaimCollectionCursor(
+                platform_id=platform_id, claim_type=claim_type, last_order_id=0, updated_at=datetime.now(timezone.utc)
+            )
+        )

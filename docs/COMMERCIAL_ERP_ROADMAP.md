@@ -7,12 +7,16 @@
   완료(pytest/Ruff/MyPy, 격리 PostgreSQL, 클린 워크트리 재검증). **운영 실전송은
   비활성**(`shipment_channel_submit_enabled`/`channel_status_sync_enabled` 모두 기본
   False) - 활성화 전 필요 조건은 "실전송 활성화 체크리스트" 참고.
-- **2단계**(`feature/commercial-erp-stage2-claims-settlements`, 1단계 완료 커밋
-  `d25ea73`에서 분기): 취소/반품/교환/정산 "수집·상태 갱신·금액 대사·조회 UI"
-  구현·격리 검증 완료. **승인/거부/환불실행/반품완료처리/교환재발송 등 채널
-  상태를 실제로 바꾸는 조치는 이번 단계에 없음** - 아래 "2-B단계"로 분리.
-  운영 자동/수동 수집 모두 신규 플래그 `claims_settlement_sync_enabled`(기본
-  False)로 차단.
+- **2-A단계**(`feature/commercial-erp-stage2-claims-settlements`, 1단계 완료 커밋
+  `d25ea73`에서 분기): 취소/반품/교환/정산 "수집·상태 갱신·금액 대사·조회 UI".
+  **`072facb`는 2-A단계의 일부 구현**이다(전체 2단계 완료 아님) - 네이버
+  클레임/정산은 공식 문서 확인이 막혀 있었고, 쿠팡 취소는 "기간 대량조회
+  불가"로만 결론짓고 주문ID 단건 조회 가능성을 더 조사하지 않은 채 종료했다.
+  이후 커밋(`67754b4ac7fb` 스키마 반영분)에서 쿠팡 취소의 "후보 주문 단건 조회"
+  경로를 보완했다 - 아래 "2-A단계 보완 사항" 참고. **승인/거부/환불실행/
+  반품완료처리/교환재발송 등 채널 상태를 실제로 바꾸는 조치는 2-A단계 범위에
+  없음** - 아래 "2-B단계"로 분리. 운영 자동/수동 수집 모두
+  `claims_settlement_sync_enabled`(기본 False)로 차단.
 
 ## 공통 원칙 (모든 단계에 적용)
 
@@ -73,7 +77,7 @@
     stale RUNNING 회수 테스트)
   - 실계정 검증은 별도 단계(아래 "실계정 검증 전 필요 조건" 참고, 아직 미충족).
 
-### 2단계 - 취소/반품/교환/정산 채널 연동 (구현·격리 검증 완료)
+### 2-A단계 - 취소/반품/교환/정산 채널 연동 (일부 구현 - 진행 중)
 
 - **범위**: 이미 존재하는 내부 취소/반품/교환/정산 모델을 각 채널의 공식
   조회 API와 연동해 **수집·상태 갱신·금액 대사·조회 UI**만 구현한다. 승인/거부/
@@ -82,25 +86,57 @@
 - **의존성**: 1단계의 outbox/상태전이/SAVEPOINT 격리 패턴을 재사용. 기존
   `ClaimSyncService`/`services/exchange_return_service.py`를 확장(중복 모델
   생성 없음).
-- **완료 기준(충족)**:
-  - 채널별 실제 지원 캐패빌리티는 공식 문서로 확인한 것만 True로 켠다(아래
-    Capability Matrix 참고) - 미확인 API는 구현을 지어내지 않고 capability만
-    False로 유지.
+- **`072facb`에서 구현된 것(전체 완료 아님)**:
+  - 쿠팡 반품(returnRequests v6 상태코드 순회)/교환(exchangeRequests v4)/
+    정산 회차(settlement-histories v1)/정산 상세(revenue-history v1) - 기간
+    기반 대량 수집.
   - 채널 claim ID 기준 dedup + 재수집 시 상태 갱신(과거 상태로 되돌리지 않음),
     claim ID가 없는 경우의 보수적 폴백, 아직 수집되지 않은 주문에 걸린 클레임은
     `ClaimUnmatched`에 보관 후 주문 수집 시 자동 승격.
   - 정산 회차/상세는 전부 `Decimal`로 계산하고, 회차-상세 매칭 실패/금액 불일치는
     `SettlementDiscrepancy`로 분리 기록(자동 추정으로 덮어쓰지 않음), 재수집 시
     중복 생성 방지.
-  - 자동/수동 수집 모두 `claims_settlement_sync_enabled`(기본 False)로 차단 -
-    OFF일 때 외부 호출 0건(세션도 열지 않음).
+- **`67754b4ac7fb`에서 보완된 것(2-A단계 후속 - 쿠팡 취소 재조사)**:
+  - `072facb` 시점에는 "쿠팡 취소는 기간만으로 대량조회가 안 된다"에서 조사를
+    멈췄으나, 재조사 결과 orderId+cancelType=CANCEL 조합의 **단건 조회**는
+    공식 파라미터 표가 명시적으로 허용함을 확인했다(`integrations/malls/
+    coupang_connector.py`의 `CANCEL_LOOKUP_WINDOW_DAYS` 주석 - 공식 문서
+    파라미터 표 원문 인용 포함, 같은 채널의 별도 FAQ와는 "날짜range만으로 대량
+    조회가 되는지"에서만 모순되고 이 좁은 기능 자체는 부정하지 않음도 함께
+    기록). 이를 근거로 "후보 주문(배송 전 상태) 단건 조회 + 회전식 체크포인트
+    + 요청 수 예산 제한"을 구현했다(`ClaimSyncService.
+    sync_cancellations_by_candidate_orders`, `ClaimCollectionCursor`).
+  - **한계(명시)**: ERP에 아직 수집되지 않은 주문의 취소, 그리고 후보 주문이
+    CANCEL_LOOKUP_WINDOW_DAYS(31일)보다 오래전에 발생한 취소는 이 방식으로
+    감지되지 않는다(services/claim_sync_service.py의 메서드 docstring 참고).
+- **여전히 미구현/차단(2-A단계 잔여)**:
+  - 네이버 취소/반품/교환: 상품주문 상세 조회(`POST /external/v1/pay-order/
+    seller/product-orders/query`) 응답에 `currentClaim`/`beforeClaim`/
+    `completedClaims`(claimId 포함) 필드가 존재함을 GitHub 공식 저장소 릴리즈
+    노트로 확인했고, 변경상태 조회(`GET .../product-orders/last-changed-statuses`)
+    로 클레임 관련 변경 후보를 저비용으로 찾을 수 있음도 확인했다 - 그러나
+    claim 하위 필드의 정확한 JSON 경로/이름과 claimStatus enum 값은 공식
+    레퍼런스 문서(apicenter.commerce.naver.com)에서만 확인 가능한데 이
+    사이트는 WebFetch로 접근 불가(JS 렌더링 사이트로 추정)했다. 확인되지
+    않은 필드 경로로 파싱 코드를 작성하는 것은 추측 구현이 되므로 보류했다 -
+    **필요한 것**: apicenter.commerce.naver.com의 "상품주문 상세 내역 조회"
+    API 레퍼런스 페이지 원문(또는 동등한 OpenAPI/Postman 스펙) 접근.
+  - 네이버 정산: "일별 정산 내역 조회" API(정산예정일 기준 집계)가 존재함을
+    GitHub discussion으로 간접 확인했으나, 정확한 엔드포인트 경로/응답
+    필드/커머스API 앱에 정산 조회 권한(스코프)이 부여돼 있는지는 확인하지
+    못했다(동일하게 apicenter 접근 차단). **필요한 것**: 위와 동일하게
+    apicenter의 정산 API 레퍼런스 페이지 접근, 그리고 등록된 커머스API
+    앱(App)에 정산 조회 권한이 부여돼 있는지 확인.
+  - 위 두 항목은 이번 보완에서도 추측으로 구현하지 않고 capability False를
+    유지했다(`supports_cancellation_sync`/`supports_return_sync`/
+    `supports_exchange_sync`/`supports_settlement_sync`는 네이버 전부 False).
   - MockTransport 기반 단위/통합 테스트, 격리 PostgreSQL 마이그레이션 검증,
-    클린 워크트리 재검증 완료(아래 "2단계 완료 요약" 참고).
-  - 실계정 검증은 별도 승인 필요(아직 미실시).
+    클린 워크트리 재검증은 구현된 범위 안에서 완료(아래 "2-A단계 진행 요약"
+    참고). 실계정 검증은 별도 승인 필요(아직 미실시).
 
 #### 2-B단계 - 클레임/정산 상태 변경(승인/환불/처리) 액션 (미구현, 향후 분리 진행)
 
-2단계에서 명시적으로 **구현하지 않은** 항목들 - 채널에 실제 쓰기 요청을 보내
+2-A단계에서 명시적으로 **구현하지 않은** 항목들 - 채널에 실제 쓰기 요청을 보내
 상태를 바꾸는 조치이므로, 1단계의 outbox(멱등키+atomic lease+UNKNOWN 처리)
 패턴과 동일한 안전장치를 갖춘 뒤 별도 단계로 진행해야 한다.
 
@@ -160,21 +196,27 @@
   방식 대신 건별 독립 커밋(또는 실패해도 outbox 행은 보존하고 도메인 변경만
   롤백하는 방식)으로 재설계해야 한다.
 
-## Capability Matrix (2단계 기준 현황)
+## Capability Matrix (2-A단계 진행 현황)
 
 | 캐패빌리티 | 네이버 스마트스토어 | 쿠팡 | ESM | 11번가 | 카카오쇼핑 |
 |---|---|---|---|---|---|
 | 주문 수집 (`fetch_orders`) | O (기존 구현) | O (기존 구현) | X (`CapabilityUnsupported`) | X (`CapabilityUnsupported`) | X (`CapabilityUnsupported`) |
 | 송장 전송 (`submit_shipment`, 1단계, outbox 비동기 실행) | O | O | X | X | X |
 | 채널 상태 동기화 (전송성공 반영 + 주기적 읽기전용 재조회) | O | O | X | X | X |
-| 취소 수집 (`fetch_cancellations`, 2단계) | X (일괄조회 API 미확인) | X (`cancelType=CANCEL` 조회 시 `orderId` 필수가 되어 날짜range 일괄조회 불가 - 공식 문서로 확인된 구조적 한계) | X | X | X |
-| 반품 수집 (`fetch_returns`, 2단계) | X (일괄조회 API 미확인) | **O (returnRequests v6, 상태코드 4종 순회로 전체 수집)** | X | X | X |
-| 교환 수집 (`fetch_exchanges`, 2단계) | X (일괄조회 API 미확인) | **O (exchangeRequests v4, 최대 7일 range)** | X | X | X |
-| 정산 회차 수집 (`fetch_settlements`) | X (공식 API 미확인) | **O (settlement-histories v1, 2단계에서 실구현으로 교체)** | X | X | X |
-| 정산 상세 수집 (`fetch_settlement_details`, 2단계 신규) | X | **O (revenue-history v1, 주문/라인 단위)** | X | X | X |
+| 취소 기간 대량 수집 (`fetch_cancellations`) | X (문서 미확인 - 아래 참고) | X (`cancelType=CANCEL` 조회 시 status를 못 써 `orderId`가 필수가 되는 공식 제약 - 날짜range만으로의 대량조회는 여전히 불가) | X | X | X |
+| 취소 후보 주문 단건 조회 (`fetch_cancellation_status`, 2-A단계 보완 신규) | X (base 기본 미지원 상속) | **O (orderId+cancelType=CANCEL, 회전식 체크포인트로 매 실행 요청 수 제한 - 한계: 미수집 주문/31일 초과 지연 취소는 감지 불가)** | X | X | X |
+| 반품 수집 (`fetch_returns`) | X (문서 미확인 - 아래 참고) | **O (returnRequests v6, 상태코드 4종 순회로 전체 수집)** | X | X | X |
+| 교환 수집 (`fetch_exchanges`) | X (문서 미확인 - 아래 참고) | **O (exchangeRequests v4, 최대 7일 range)** | X | X | X |
+| 정산 회차 수집 (`fetch_settlements`) | X (문서 미확인 - 아래 참고) | **O (settlement-histories v1)** | X | X | X |
+| 정산 상세 수집 (`fetch_settlement_details`) | X | **O (revenue-history v1, 주문/라인 단위)** | X | X | X |
 | 클레임 승인/거부/환불실행/처리(2-B단계) | X | X | X | X | X |
 | 상품 동기화 (`fetch_products`) | **O (기존 구현, 1단계 이전부터 운영 중 - `product_sync_job` 20분 주기, 1단계에서 변경 없음)** | X | X | X | X |
 | 재고 동기화 (3단계 예정) | X | X | X | X | X |
+
+- 네이버 취소/반품/교환/정산의 "문서 미확인"은 API 존재 자체가 아니라 **정확한
+  필드 스펙 확인이 막힌 상태**를 뜻한다 - "2-A단계 - 취소/반품/교환/정산 채널
+  연동" 절의 "여전히 미구현/차단" 항목에 근거와 필요한 문서/권한을 구체적으로
+  적어 뒀다.
 
 - O = 실제 구현 + MockTransport 계약 테스트로 검증됨 (실계정 검증은 별도).
 - X = 미구현/미확인. 호출 시 `MarketplaceCapabilityUnsupportedError`를 명시적으로
@@ -198,11 +240,11 @@
   회수 시 근거)은 채널이 같은 송장번호 재제출을 upsert로 처리한다는 전제다 - 실
   계정으로 중복 제출 시 채널이 오류를 내는지 확인이 필요하다.
 
-## 실전송 활성화 체크리스트 (1·2단계 공통 - 아직 미충족, 재검토 없이 그대로 유지)
+## 실전송 활성화 체크리스트 (1·2-A단계 공통 - 아직 미충족, 재검토 없이 그대로 유지)
 
 두 기능 플래그(`shipment_channel_submit_enabled`/`channel_status_sync_enabled`,
 `claims_settlement_sync_enabled`)를 운영에서 켜기 전 반드시 확인해야 하는 항목.
-1단계 완결 검토에서 식별된 뒤 2단계에서도 재검증하지 않고 그대로 이월했다.
+1단계 완결 검토에서 식별된 뒤 2-A단계에서도 재검증하지 않고 그대로 이월했다.
 
 - **재시도 분류 근거 검증**: `ShipmentDispatchService._classify_write_outcome()`의
   SAFE_RETRY/CONFIRMED_FAILED/UNKNOWN 판정 기준(어떤 HTTP상태/예외를 어느
@@ -212,26 +254,31 @@
   상태를 사람이 수동 해소하는 절차 - 실제로 이 권한을 누가 갖고 어떤 확인
   절차(채널 관리자센터에서 실제 접수 여부 확인 등)를 거쳐 해소할지 운영 프로세스
   합의 필요(코드는 상태 전이만 제공, 운영 절차는 별도 승인 대상).
-- 위 두 항목 모두 아직 실계정 검증이 이뤄지지 않았으므로, 이번(2단계) 작업에서도
+- 위 두 항목 모두 아직 실계정 검증이 이뤄지지 않았으므로, 이번(2-A단계) 작업에서도
   다시 조사/변경하지 않고 이 체크리스트로만 유지한다.
-- 2단계 신규: `claims_settlement_sync_enabled` 활성화 전에도 위와 동일하게, 쿠팡
+- 2-A단계 신규: `claims_settlement_sync_enabled` 활성화 전에도 위와 동일하게, 쿠팡
   returnRequests/exchangeRequests/settlement-histories/revenue-history 각 API의
   실제 실패 응답(레이트리밋/일시 오류) 패턴을 실계정으로 먼저 확인해야 한다.
 
-## 2단계 완료 요약 (구현·격리 검증, 운영 실전송 비활성)
+## 2-A단계 진행 요약 (일부 구현 - 완료 아님, 운영 실전송 비활성)
 
 - **브랜치/커밋**: `feature/commercial-erp-stage2-claims-settlements`
-  (1단계 완료 커밋 `d25ea73`에서 분기 확인).
-- **테스트**: 신규/확장 단위 테스트(클레임 dedup·미매칭 보존, 쿠팡 반품/교환/정산
-  정규화, 정산 동기화 서비스, 클레임/정산 스케줄러 잡) + 통합 테스트
-  (`test_api_orders.py`, 신규 `test_api_settlements.py`) 전부 통과, 전체 회귀
-  867 passed. Ruff/MyPy 전체 통과.
-- **마이그레이션**: 격리 SQLite 스크래치 DB에서 autogenerate 후 2단계 스키마
-  변경만 남도록 무관한 드리프트(orders.assignee_id/confirmed_by,
+  (1단계 완료 커밋 `d25ea73`에서 분기 확인). `072facb`(2-A단계 최초 구현분,
+  일부) → `67754b4ac7fb`(쿠팡 취소 후보 주문 단건 조회 보완, 스키마 반영분).
+- **테스트**: 신규/확장 단위 테스트(클레임 dedup·미매칭 보존, 쿠팡 반품/교환/정산/
+  취소 후보조회 정규화, 정산 동기화 서비스, 클레임/정산 스케줄러 잡) + 통합 테스트
+  (`test_api_orders.py`, `test_api_settlements.py`) 전부 통과, 전체 회귀 그린.
+  Ruff/MyPy 전체 통과.
+- **마이그레이션**: 두 건 모두 격리 SQLite 스크래치 DB에서 autogenerate 후
+  스키마 변경만 남도록 무관한 드리프트(orders.assignee_id/confirmed_by,
   order_items.channel_product_id 미명명 FK, product_options 등 컬럼 길이 차이 -
-  전부 2단계 이전부터 있던 기존 드리프트)를 수동으로 제외. SQLite는 제약 추가에
-  batch mode가 필요해 `cancellations.order_item_id` FK만 `batch_alter_table`로
-  처리. upgrade/downgrade 모두 격리 환경에서 확인.
+  2-A단계 이전부터 있던 기존 드리프트)를 수동으로 제외. `0dcbe421ba67`은 SQLite
+  제약 추가에 batch mode가 필요해 `cancellations.order_item_id` FK만
+  `batch_alter_table`로 처리. `67754b4ac7fb`(체크포인트 테이블만 추가)은 격리
+  PostgreSQL에서 기존 샘플 데이터가 있는 상태로 upgrade/downgrade 왕복 검증
+  완료(체크포인트 테이블은 진행 상태일 뿐이라 downgrade로 사라져도 업무 데이터
+  손실 아님). upgrade/downgrade 모두 격리 환경에서 확인, 운영 컨테이너
+  (`erp-postgres`/`erp-api`/`erp-web`/`erp-scheduler`) ID·StartedAt 불변 확인.
 - **기본 차단**: `claims_settlement_sync_enabled` 기본 False 확인
   (`tests/unit/test_claim_sync_job.py`, `tests/unit/test_settlement_sync_job.py`,
   `tests/integration/test_api_orders.py::TestSyncClaimsDisabledByDefault`,
