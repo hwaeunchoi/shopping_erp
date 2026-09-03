@@ -125,6 +125,22 @@ class ProductPlatformMapRepository(BaseRepository[ProductPlatformMap]):
         )
         return self.session.execute(stmt).scalar_one_or_none()
 
+    def list_by_platform_and_origin_product_id(
+        self, platform_id: int, platform_origin_product_id: str
+    ) -> list[ProductPlatformMap]:
+        """(platform_id, platform_origin_product_id)를 공유하는 매핑을 전부 찾는다 -
+        platform_option_id와 달리 platform_origin_product_id에는 유니크 제약이 없어
+        (네이버 원상품 하나가 스마트스토어/윈도우 등 복수 채널상품을 가질 수 있어
+        의도적으로 허용) 서로 다른 ProductPlatformMap 행이 같은 원상품을 가리킬 수
+        있다 - 상용 ERP 확장(3단계)의 재고/판매상태 전송 동시성 제어가 이 경우를
+        같은 외부 대상으로 묶어 처리하기 위해 조회한다(services.
+        product_sync_dispatch_service._resolve_contention_target_ids 참고)."""
+        stmt = select(ProductPlatformMap).where(
+            ProductPlatformMap.platform_id == platform_id,
+            ProductPlatformMap.platform_origin_product_id == platform_origin_product_id,
+        )
+        return list(self.session.execute(stmt).scalars().all())
+
     def list_by_option(self, product_option_id: int) -> list[ProductPlatformMap]:
         stmt = select(ProductPlatformMap).where(ProductPlatformMap.product_option_id == product_option_id)
         return list(self.session.execute(stmt).scalars().all())

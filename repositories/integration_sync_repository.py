@@ -5,7 +5,7 @@ ExternalCommand(outbox)/ExternalCommandLineResult(라인별 결과)/OrderStatusC
 """
 
 from datetime import datetime, timezone
-from typing import Any, Optional, cast
+from typing import Any, Iterable, Optional, cast
 
 from sqlalchemy import func, select, update
 from sqlalchemy.engine import CursorResult
@@ -102,55 +102,88 @@ class ExternalCommandRepository:
         result = cast(CursorResult, self.session.execute(stmt))
         return result.rowcount == 1
 
-    def list_active_for_target(self, command_type: str, target_type: str, target_id: int) -> list[ExternalCommand]:
-        """같은 대상(target_type+target_id)·같은 명령종류에 대해 아직 종료되지 않은
+    def list_active_for_target(
+        self, command_type: str, target_type: str, target_ids: Iterable[int] | int
+    ) -> list[ExternalCommand]:
+        """같은 대상(target_type+target_ids)·같은 명령종류에 대해 아직 종료되지 않은
         (PENDING/RETRY_WAIT/RUNNING) 명령을 전부 찾는다 - 새로운 목표값이 들어왔을 때
         낡은 명령을 취소 대상으로 찾는 데 쓴다(services.product_sync_dispatch_service
         참고). list_due_for_execution과 달리 next_retry_at이 아직 지나지 않은
-        RETRY_WAIT도 포함한다(대기 중이어도 낡은 값이면 취소해야 하므로)."""
+        RETRY_WAIT도 포함한다(대기 중이어도 낡은 값이면 취소해야 하므로).
+
+        target_ids는 단일 target_id 또는 그 목록을 받는다 - 서로 다른 내부 대상이
+        같은 외부 대상(예: 네이버 원상품번호)을 공유하는 경우, 호출부가 그 전부를
+        모아 넘긴다(services.product_sync_dispatch_service._resolve_contention_target_ids
+        참고)."""
+        ids = [target_ids] if isinstance(target_ids, int) else list(target_ids)
         return list(
             self.session.execute(
                 select(ExternalCommand).where(
                     ExternalCommand.command_type == command_type,
                     ExternalCommand.target_type == target_type,
-                    ExternalCommand.target_id == target_id,
+                    ExternalCommand.target_id.in_(ids),
                     ExternalCommand.status.in_(("PENDING", "RETRY_WAIT", "RUNNING")),
                 )
             ).scalars()
         )
 
     def exists_unresolved_unknown_predecessor(
-        self, command_type: str, target_type: str, target_id: int, before_id: int
+        self, command_type: str, target_type: str, target_ids: Iterable[int] | int, before_id: int
     ) -> bool:
-        """같은 대상·같은 명령종류에 대해 이 명령(before_id)보다 먼저 생성된(id가 더
-        작은) UNKNOWN(결과 확인 필요) 명령이 있는지 확인한다 - 채널이 그 이전 명령을
-        실제로 처리했는지 알 수 없는 채로 새 명령을 실행하면, 이후 UNKNOWN이 실은
-        "이미 처리됨"으로 확인될 경우 두 요청이 뒤섞여 어떤 값이 실제로 반영됐는지
-        알 수 없게 된다 - 그래서 UNKNOWN이 해소되기 전에는 새 명령을 실행하지 않는다
-        (services.product_sync_dispatch_service.execute_command 참고)."""
+        """같은 대상(들)·같은 명령종류에 대해 이 명령(before_id)보다 먼저 생성된(id가
+        더 작은) UNKNOWN(결과 확인 필요) 명령이 있는지 확인한다 - 채널이 그 이전
+        명령을 실제로 처리했는지 알 수 없는 채로 새 명령을 실행하면, 이후 UNKNOWN이
+        실은 "이미 처리됨"으로 확인될 경우 두 요청이 뒤섞여 어떤 값이 실제로
+        반영됐는지 알 수 없게 된다 - 그래서 UNKNOWN이 해소되기 전에는 새 명령을
+        실행하지 않는다(services.product_sync_dispatch_service.execute_command 참고).
+        target_ids는 list_active_for_target과 동일하게 단일값 또는 목록을 받는다."""
+        ids = [target_ids] if isinstance(target_ids, int) else list(target_ids)
         stmt = select(func.count()).where(
             ExternalCommand.command_type == command_type,
             ExternalCommand.target_type == target_type,
-            ExternalCommand.target_id == target_id,
+            ExternalCommand.target_id.in_(ids),
             ExternalCommand.id < before_id,
             ExternalCommand.status == "UNKNOWN",
         )
         return int(self.session.execute(stmt).scalar_one()) > 0
 
     def exists_newer_command_for_target(
-        self, command_type: str, target_type: str, target_id: int, after_id: int
+        self, command_type: str, target_type: str, target_ids: Iterable[int] | int, after_id: int
     ) -> bool:
-        """같은 대상(target_type+target_id)·같은 명령종류(command_type)에 대해 이
-        명령(after_id)보다 나중에 생성된(id가 더 큰) 다른 명령이 있는지 확인한다 -
-        오래된 명령이 나중에 실행되어 최신 목표값을 덮어쓰지 않도록 실행 직전에
-        확인하는 근거다(services.product_sync_dispatch_service 참고). CANCELLED는
-        더 이상 진행되지 않을 것이 확정된 명령이라 "더 최신"으로 치지 않는다."""
+        """같은 대상(들)·같은 명령종류(command_type)에 대해 이 명령(after_id)보다
+        나중에 생성된(id가 더 큰) 다른 명령이 있는지 확인한다 - 오래된 명령이
+        나중에 실행되어 최신 목표값을 덮어쓰지 않도록 실행 직전에 확인하는
+        근거다(services.product_sync_dispatch_service 참고). CANCELLED는 더 이상
+        진행되지 않을 것이 확정된 명령이라 "더 최신"으로 치지 않는다. target_ids는
+        list_active_for_target과 동일하게 단일값 또는 목록을 받는다(서로 다른 내부
+        매핑이 같은 외부 대상을 공유하는 경우 그 전부를 하나의 대상으로 취급)."""
+        ids = [target_ids] if isinstance(target_ids, int) else list(target_ids)
         stmt = select(func.count()).where(
             ExternalCommand.command_type == command_type,
             ExternalCommand.target_type == target_type,
-            ExternalCommand.target_id == target_id,
+            ExternalCommand.target_id.in_(ids),
             ExternalCommand.id > after_id,
             ExternalCommand.status != "CANCELLED",
+        )
+        return int(self.session.execute(stmt).scalar_one()) > 0
+
+    def exists_other_running_for_targets(
+        self, target_type: str, target_ids: Iterable[int] | int, exclude_command_id: int
+    ) -> bool:
+        """같은 대상(들)에 대해 **명령종류를 가리지 않고** 지금 RUNNING인 다른 명령이
+        있는지 확인한다 - list_active_for_target류와 달리 command_type으로 좁히지
+        않는다: 재고 변경과 판매상태 변경은 취소 대상으로는 서로 독립이어야 하지만
+        (다른 종류의 대기 명령을 잘못 취소하면 안 됨), 네이버처럼 "현재 상태 조회 ->
+        변경 요청"을 하나의 채널 API로 묶어 처리하는 채널에서는 두 종류가 같은
+        외부 대상에 대해 동시에 채널로 나가면 서로의 조회 결과를 덮어쓸 위험이
+        있다(services.product_sync_dispatch_service 모듈 docstring 참고) - 그래서
+        "지금 실제로 채널을 호출 중인가"만큼은 명령종류와 무관하게 상호 배제한다."""
+        ids = [target_ids] if isinstance(target_ids, int) else list(target_ids)
+        stmt = select(func.count()).where(
+            ExternalCommand.target_type == target_type,
+            ExternalCommand.target_id.in_(ids),
+            ExternalCommand.status == "RUNNING",
+            ExternalCommand.id != exclude_command_id,
         )
         return int(self.session.execute(stmt).scalar_one()) > 0
 

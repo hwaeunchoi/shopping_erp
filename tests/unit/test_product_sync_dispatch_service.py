@@ -453,3 +453,137 @@ class TestUnsupportedConnectorCapability:
         db_session.refresh(outcome.command)
         assert outcome.command.status == "FAILED"
         assert conn.calls == []
+        # 화면에 "MarketplaceCapabilityUnsupportedError"라는 클래스명 대신, 구체적인
+        # 차단 사유(capability)가 그대로 노출되어야 사용자가 원인을 구분할 수 있다.
+        assert outcome.command.error_code == "inventory_update"
+
+
+def _sibling_mapping(db_session, platform, second_product_option, origin_product_id: str, option_id: str):
+    """platform_map(fixture)과 같은 platform_origin_product_id를 공유하지만 서로
+    다른 ProductPlatformMap 행 - 네이버가 원상품 하나에 복수 채널상품(스마트스토어/
+    윈도우 등)을 가질 수 있어 유니크 제약이 없는 상황을 재현한다."""
+    from models.product import ProductPlatformMap
+
+    sibling = ProductPlatformMap(
+        product_option_id=second_product_option.id,
+        platform_id=platform.id,
+        platform_option_id=option_id,
+        platform_origin_product_id=origin_product_id,
+    )
+    db_session.add(sibling)
+    db_session.flush()
+    return sibling
+
+
+class TestSharedExternalTargetAcrossMappings:
+    """서로 다른 내부 매핑(ProductPlatformMap)이 같은 외부 대상(네이버
+    platform_origin_product_id)을 공유하는 경우에도 동시성 제어가 그 전부를 하나의
+    대상으로 취급하는지 검증한다 - platform_option_id와 달리 platform_origin_product_id
+    에는 유니크 제약이 없다(models.product.ProductPlatformMap 참고)."""
+
+    def test_enqueue_cancels_stale_pending_command_on_sibling_mapping(
+        self, db_session, platform, platform_map, second_product_option
+    ):
+        platform_map.platform_origin_product_id = "ORIGIN-SHARED-1"
+        db_session.flush()
+        sibling = _sibling_mapping(db_session, platform, second_product_option, "ORIGIN-SHARED-1", "OPT-SIBLING-1")
+
+        svc = ProductSyncDispatchService(db_session)
+        old = svc.enqueue_inventory_update(platform_map.id, 10)
+        new = svc.enqueue_inventory_update(sibling.id, 20)  # 다른 매핑, 같은 외부 대상.
+
+        db_session.refresh(old.command)
+        assert old.command.status == "CANCELLED"
+        assert old.command.error_code == "SUPERSEDED_BY_NEWER_REQUEST"
+        assert new.command.status == "PENDING"
+
+    def test_execute_cancels_when_sibling_mapping_has_a_newer_command(
+        self, db_session, platform, platform_map, second_product_option
+    ):
+        """claim() 직후 재확인이 sibling 매핑에 생긴 더 최신 명령도 감지한다 - 다른
+        worker가 sibling 쪽을 이미 claim(RUNNING)해서 enqueue의 사전 취소를
+        우회하는 경우를 흉내낸다."""
+        platform_map.platform_origin_product_id = "ORIGIN-SHARED-2"
+        db_session.flush()
+        sibling = _sibling_mapping(db_session, platform, second_product_option, "ORIGIN-SHARED-2", "OPT-SIBLING-2")
+
+        conn = StubProductConnector()
+        svc = ProductSyncDispatchService(db_session, connector_factory=_factory(conn))
+        old = svc.enqueue_inventory_update(platform_map.id, 10)
+        old.command.status = "RUNNING"  # 다른 worker가 claim했다고 가정 - 사전 취소를 우회.
+        old.command.lease_token = "other-worker"
+        db_session.flush()
+
+        svc.enqueue_inventory_update(sibling.id, 20)  # sibling 쪽에 더 최신 명령 생성.
+
+        # old가 회수돼 다시 PENDING이 됐다고 가정(예: 죽은 worker 회수) - claim 가능해짐.
+        old.command.status = "PENDING"
+        old.command.lease_token = None
+        db_session.flush()
+
+        result = svc.execute_command(old.command.id)
+
+        assert result.command.status == "CANCELLED"
+        assert conn.calls == []  # 채널 호출 없이 취소됐다.
+
+    def test_new_inventory_command_does_not_cancel_sale_status_command_on_sibling(
+        self, db_session, platform, platform_map, second_product_option
+    ):
+        """공유 대상이어도 명령종류가 다르면(재고 vs 판매상태) 서로 취소하지 않는다."""
+        platform_map.platform_origin_product_id = "ORIGIN-SHARED-3"
+        db_session.flush()
+        sibling = _sibling_mapping(db_session, platform, second_product_option, "ORIGIN-SHARED-3", "OPT-SIBLING-3")
+
+        svc = ProductSyncDispatchService(db_session)
+        status_cmd = svc.enqueue_sale_status_update(sibling.id, SALE_STATUS_ON_SALE)
+        svc.enqueue_inventory_update(platform_map.id, 10)
+
+        db_session.refresh(status_cmd.command)
+        assert status_cmd.command.status == "PENDING"  # 다른 종류라 취소되지 않았다.
+
+
+class TestCrossTypeRunningExclusion:
+    """네이버의 "현재 상태 조회 -> 변경 요청" 같은 read-modify-write 채널 API에서,
+    재고 명령과 판매상태 명령이 같은 외부 대상에 동시에 나가 서로의 조회 결과를
+    덮어쓰지 않도록 - 명령종류가 달라도 지금 RUNNING인 다른 명령이 있으면 이번
+    실행은 미루고 PENDING으로 되돌린다."""
+
+    def test_execute_defers_when_a_different_type_command_is_running_for_same_mapping(self, db_session, platform_map):
+        conn = StubProductConnector()
+        svc = ProductSyncDispatchService(db_session, connector_factory=_factory(conn))
+        running_status_cmd = svc.enqueue_sale_status_update(platform_map.id, SALE_STATUS_ON_SALE)
+        running_status_cmd.command.status = "RUNNING"
+        running_status_cmd.command.lease_token = "other-worker"
+        db_session.flush()
+
+        inventory_cmd = svc.enqueue_inventory_update(platform_map.id, 10)
+        result = svc.execute_command(inventory_cmd.command.id)
+
+        assert result.command.status == "PENDING"  # 재대기 - 채널 호출 없음.
+        assert result.command.lease_token is None
+        assert conn.calls == []
+
+    def test_execute_proceeds_once_the_other_type_command_finishes(self, db_session, platform_map):
+        conn = StubProductConnector()
+        svc = ProductSyncDispatchService(db_session, connector_factory=_factory(conn))
+        running_status_cmd = svc.enqueue_sale_status_update(platform_map.id, SALE_STATUS_ON_SALE)
+        running_status_cmd.command.status = "SUCCESS"  # 이미 끝남 - 더 이상 RUNNING 아님.
+        db_session.flush()
+
+        inventory_cmd = svc.enqueue_inventory_update(platform_map.id, 10)
+        result = svc.execute_command(inventory_cmd.command.id)
+
+        assert result.command.status == "SUCCESS"
+        assert conn.calls == [("inventory", platform_map.platform_option_id, 10)]
+
+    def test_same_type_running_is_still_caught_by_claim_not_this_check(self, db_session, platform_map):
+        """같은 명령종류끼리는 claim()의 원자적 UPDATE 자체가 이미 동시 실행을 막는다
+        (rowcount==0 -> ProductSyncAlreadyRunningError) - 이 교차종류 검사와는 별개 경로."""
+        svc = ProductSyncDispatchService(db_session, connector_factory=_factory(StubProductConnector()))
+        outcome = svc.enqueue_inventory_update(platform_map.id, 10)
+        outcome.command.status = "RUNNING"
+        outcome.command.lease_token = "other-worker"
+        db_session.flush()
+
+        with pytest.raises(ProductSyncAlreadyRunningError):
+            svc.execute_command(outcome.command.id)

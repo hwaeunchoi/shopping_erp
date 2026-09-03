@@ -37,7 +37,33 @@ CANCELLED로 표시한다. 그래도 그 사이 다른 worker가 이미 claim(RU
 UNKNOWN 대상과의 충돌: 같은 대상에 아직 해소되지 않은 UNKNOWN 명령(더 이전에
 생성됨)이 있으면, 채널이 그 명령을 실제로 처리했는지 알 수 없는 상태이므로 새
 명령을 이번 회차에는 실행하지 않고 건너뛴다(PENDING 그대로 유지 - FAILED로
-확정하지 않는다. 운영자가 UNKNOWN을 해소하면 다음 회차에 정상 실행된다).
+확정하지 않는다. 운영자가 UNKNOWN을 해소하면 다음 회차에 정상 실행된다). stale
+RUNNING 회수(recover_stale_running)도 마찬가지로 UNKNOWN으로 보낼 뿐 "채널 요청이
+끝났다"고 간주하지 않는다 - 회수 후에도 그 대상에 대한 후속 명령은 위 UNKNOWN
+충돌 검사에 그대로 걸려 운영자가 해소하기 전까지 실행되지 않는다.
+
+같은 외부 대상을 공유하는 서로 다른 내부 매핑: platform_option_id는 (platform_id,
+platform_option_id) 유니크 제약으로 ProductPlatformMap 1건과 항상 1:1이지만,
+platform_origin_product_id(네이버 원상품번호)에는 유니크 제약이 없다 - 원상품
+하나가 스마트스토어/윈도우 등 복수 채널상품(=복수 매핑 행)을 가질 수 있도록
+의도적으로 허용했기 때문이다. 그래서 위의 모든 동시성 검사(재실행 취소/UNKNOWN
+충돌/아래 교차종류 실행중 확인)는 ProductPlatformMap.id 하나가 아니라
+_resolve_contention_target_ids()가 모은 "같은 외부 대상을 공유하는 모든 매핑 id"
+집합을 대상으로 한다 - 그렇지 않으면 서로 다른 매핑 두 개가 실제로는 같은
+원상품에 대해 동시에 서로 다른 값을 보낼 수 있다.
+
+재고 변경과 판매상태 변경의 상호 배제(같은 외부 대상에 한함): 두 명령종류는
+서로 다른 의도이므로 대기(PENDING/RETRY_WAIT) 상태의 상대방을 잘못 취소하지
+않는다(위 "오래된 명령" 취소는 command_type이 같을 때만 적용). 하지만 네이버처럼
+"현재 상태 조회 -> 변경 요청"을 하나의 채널 API로 묶어 처리하는 채널에서는, 같은
+외부 대상에 대해 재고 명령과 판매상태 명령이 동시에 채널로 나가면 한쪽이 읽은
+현재값을 다른 쪽이 그 사이 바꿔버려 서로 덮어쓸 위험이 있다(예: 재고 명령이
+"현재 상태=SALE"을 읽은 직후 판매상태 명령이 SUSPENSION으로 바꿨는데, 재고
+명령이 그 SALE 값을 그대로 실어 보내 SUSPENSION을 되돌리는 경우). 그래서
+execute_command()는 claim 이후, 명령종류를 가리지 않고 같은 외부 대상에 지금
+RUNNING인 다른 명령이 있으면 채널을 호출하지 않고 PENDING으로 되돌려(lease
+반납) 다음 회차에 다시 시도한다(exists_other_running_for_targets) - 채널 실패가
+아니므로 FAILED/RETRY_WAIT 백오프는 적용하지 않는다.
 
 ⚠️ 이 서비스는 채널까지 포함한 "정확히 한 번" 전송을 보장하지 않는다 - 로컬
 idempotency_key/lease는 "같은 명령을 두 번 만들거나 두 worker가 동시에 실행하지
@@ -45,6 +71,13 @@ idempotency_key/lease는 "같은 명령을 두 번 만들거나 두 worker가 �
 (증감이 아님) 채널 쪽에서 두 요청이 뒤바뀐 순서로 도착하면 결과가 갈릴 수 있다는
 근본적인 한계가 있다 - 위의 "오래된 명령 실행 차단"은 이 위험을 줄이지만 완전히
 없애지는 못한다(공식 문서에 버전/순서 검증 필드가 없다).
+
+⚠️ 이 서비스의 직렬화는 이 ERP가 만든 ExternalCommand끼리만 적용된다 - 채널
+판매자센터(쿠팡윈도우/네이버 스마트스토어센터) 관리자 화면에서의 수동 변경이나,
+이 ERP가 아닌 다른 프로그램(별도 연동 툴 등)이 같은 채널 API를 직접 호출하는
+경우는 이 직렬화로 전혀 막을 수 없다 - 그런 외부 변경과 이 서비스의 전송이
+겹치면 여전히 순서가 뒤바뀔 수 있다(공식 문서에 채널 쪽 버전/순서 검증 필드가
+없어 이 ERP 쪽에서 감지할 방법도 없다).
 
 실제 채널에 영향을 주는 이 서비스는 로컬 실물재고(models.inventory.Inventory)를
 자동으로 읽거나 바꾸지 않는다 - target_quantity는 호출부(API)가 운영자로부터
@@ -212,11 +245,16 @@ class ProductSyncDispatchService:
         if existing is not None:
             return ProductSyncOutcome(command=existing, already_processed=existing.status == "SUCCESS")
 
-        # 같은 대상에 다른 목표값으로 아직 실행 전(PENDING/RETRY_WAIT)인 명령이 있으면
-        # 낡은 값이 되므로 취소한다 - RUNNING(이미 claim됨)은 여기서 강제 취소하지
-        # 않는다(다른 worker가 다루는 중일 수 있어 execute_command()의 실행 직전
-        # 재확인이 최종 방어선이다).
-        for stale in self.command_repo.list_active_for_target(command_type, TARGET_TYPE, mapping.id):
+        # 같은 대상(들)에 다른 목표값으로 아직 실행 전(PENDING/RETRY_WAIT)인 같은
+        # 명령종류의 명령이 있으면 낡은 값이 되므로 취소한다 - 서로 다른 매핑이 같은
+        # 외부 대상(예: 네이버 원상품번호)을 공유하는 경우도 함께 취소 대상에
+        # 포함한다(_resolve_contention_target_ids 참고). RUNNING(이미 claim됨)은
+        # 여기서 강제 취소하지 않는다(다른 worker가 다루는 중일 수 있어
+        # execute_command()의 실행 직전 재확인이 최종 방어선이다). 다른
+        # 명령종류(재고 vs 판매상태)는 서로 독립된 의도라 취소 대상에서 제외한다
+        # (list_active_for_target이 command_type으로 이미 필터링).
+        contention_ids = self._resolve_contention_target_ids(mapping)
+        for stale in self.command_repo.list_active_for_target(command_type, TARGET_TYPE, contention_ids):
             if stale.status != "RUNNING":
                 stale.status = "CANCELLED"
                 stale.error_code = "SUPERSEDED_BY_NEWER_REQUEST"
@@ -243,6 +281,27 @@ class ProductSyncDispatchService:
         )
         return ProductSyncOutcome(command=command, already_processed=False)
 
+    # --- 동시성 제어 공통 ---
+
+    def _resolve_contention_target_ids(self, mapping: Any) -> list[int]:
+        """이 매핑과 "같은 외부 대상"을 공유하는 모든 ProductPlatformMap.id를 반환한다
+        (자기 자신 포함). platform_option_id는 (platform_id, platform_option_id) 유니크
+        제약으로 이미 매핑 1건과 1:1이라 별도 처리가 필요 없지만, 네이버의
+        platform_origin_product_id는 유니크 제약이 없다 - 원상품 하나가 스마트스토어/
+        윈도우 등 복수 채널상품(=복수 ProductPlatformMap 행)을 가질 수 있도록 의도적으로
+        허용했기 때문이다(models.product.ProductPlatformMap 참고). 그래서 같은
+        platform_origin_product_id를 공유하는 다른 매핑이 있으면 전부 "같은 외부
+        대상"으로 취급해 동시성 검사(재실행/UNKNOWN충돌/교차종류 RUNNING 확인)에
+        함께 포함시킨다 - 그렇지 않으면 서로 다른 매핑 두 개가 실제로는 같은 원상품에
+        대해 동시에 서로 다른 값을 전송할 수 있다."""
+        ids = {mapping.id}
+        if mapping.platform_origin_product_id:
+            siblings = self.mapping_repo.list_by_platform_and_origin_product_id(
+                mapping.platform_id, mapping.platform_origin_product_id
+            )
+            ids.update(m.id for m in siblings)
+        return sorted(ids)
+
     # --- 실행(execute) ---
 
     def execute_command(self, command_id: int) -> ProductSyncOutcome:
@@ -258,12 +317,20 @@ class ProductSyncDispatchService:
         if command.status == "SUCCESS":
             return ProductSyncOutcome(command=command, already_processed=True)
 
-        # UNKNOWN 대상과의 충돌 방지: 같은 대상(target_type+target_id)에 더 먼저
-        # 생성된(id가 더 작은) 미해소 UNKNOWN 명령이 있으면, 채널이 그 명령을 실제로
-        # 처리했는지 알 수 없는 채로 이번 명령을 실행하지 않는다(PENDING 유지 - FAILED
-        # 확정 아님, 운영자가 UNKNOWN을 해소하면 다음 회차에 정상 실행된다).
+        detail = self.detail_repo.get_by_command_id(command.id)
+        if detail is None:
+            raise ValueError(f"명령의 목표값 정보가 없습니다: command_id={command_id}")
+        mapping = self.mapping_repo.get_by_id(detail.product_platform_map_id)
+        if mapping is None:
+            raise ValueError(f"플랫폼 매핑을 찾을 수 없습니다: id={detail.product_platform_map_id}")
+        contention_ids = self._resolve_contention_target_ids(mapping)
+
+        # UNKNOWN 대상과의 충돌 방지: 같은 외부 대상(들)에 더 먼저 생성된(id가 더
+        # 작은) 미해소 UNKNOWN 명령이 있으면, 채널이 그 명령을 실제로 처리했는지 알
+        # 수 없는 채로 이번 명령을 실행하지 않는다(PENDING 유지 - FAILED 확정 아님,
+        # 운영자가 UNKNOWN을 해소하면 다음 회차에 정상 실행된다).
         if self.command_repo.exists_unresolved_unknown_predecessor(
-            command.command_type, command.target_type, command.target_id, command.id
+            command.command_type, command.target_type, contention_ids, command.id
         ):
             logger.info("선행 UNKNOWN 명령이 해소되지 않아 이번 회차는 건너뜁니다: command_id=%s", command_id)
             return ProductSyncOutcome(command=command, already_processed=False)
@@ -279,10 +346,10 @@ class ProductSyncDispatchService:
         self.session.refresh(command)
 
         # claim 직후, 실제 채널 호출 직전에 다시 한번 "이 명령보다 나중에 생성된 같은
-        # 대상 명령이 있는가"를 확인한다 - 있으면 이미 낡은 값이므로 전송하지 않고
-        # CANCELLED로 남긴다(오래된 명령이 최신 목표값을 늦게 덮어쓰는 것을 방지).
+        # 외부 대상 명령이 있는가"를 확인한다 - 있으면 이미 낡은 값이므로 전송하지
+        # 않고 CANCELLED로 남긴다(오래된 명령이 최신 목표값을 늦게 덮어쓰는 것을 방지).
         if self.command_repo.exists_newer_command_for_target(
-            command.command_type, command.target_type, command.target_id, command.id
+            command.command_type, command.target_type, contention_ids, command.id
         ):
             transitioned = self.command_repo.try_transition(
                 command.id, lease_token, status="CANCELLED", error_code="SUPERSEDED_BY_NEWER_REQUEST"
@@ -292,13 +359,26 @@ class ProductSyncDispatchService:
                 logger.warning("lease 소유권을 잃어 CANCELLED 기록을 건너뜁니다: command_id=%s", command.id)
             return ProductSyncOutcome(command=command, already_processed=False)
 
+        # 명령종류(재고 vs 판매상태)가 달라도, 같은 외부 대상에 대해 지금 실제로 채널
+        # 호출 중인 다른 명령이 있으면 이번 실행은 미룬다 - 네이버처럼 "현재 상태
+        # 조회 -> 변경 요청"을 한 채널 API로 묶어 처리하는 채널에서, 재고 명령과
+        # 판매상태 명령이 동시에 나가면 서로의 조회 결과를 되돌릴 위험이 있다(모듈
+        # docstring 참고). claim으로 얻은 lease는 그대로 반납(PENDING)해 다음 회차에
+        # 바로 재시도되게 한다 - 채널 실패가 아니므로 FAILED/RETRY_WAIT 백오프를
+        # 적용하지 않는다.
+        if self.command_repo.exists_other_running_for_targets(command.target_type, contention_ids, command.id):
+            transitioned = self.command_repo.try_transition(command.id, lease_token, status="PENDING", lease_token=None)
+            self.session.refresh(command)
+            if not transitioned:
+                logger.warning("lease 소유권을 잃어 재대기 반영을 건너뜁니다: command_id=%s", command.id)
+            else:
+                logger.info(
+                    "같은 외부 대상에 다른 종류의 명령이 실행 중이라 이번 회차는 재대기합니다: command_id=%s",
+                    command_id,
+                )
+            return ProductSyncOutcome(command=command, already_processed=False)
+
         try:
-            detail = self.detail_repo.get_by_command_id(command.id)
-            if detail is None:
-                raise ValueError(f"명령의 목표값 정보가 없습니다: command_id={command_id}")
-            mapping = self.mapping_repo.get_by_id(detail.product_platform_map_id)
-            if mapping is None:
-                raise ValueError(f"플랫폼 매핑을 찾을 수 없습니다: id={detail.product_platform_map_id}")
             platform = self.platform_repo.get_by_id(mapping.platform_id)
             if platform is None:
                 raise ValueError(f"플랫폼 정보를 찾을 수 없습니다: platform_id={mapping.platform_id}")
@@ -352,7 +432,11 @@ class ProductSyncDispatchService:
 
     def _mark_after_failure(self, command: ExternalCommand, lease_token: str, exc: Exception) -> None:
         kind = _classify_write_outcome(exc)
-        error_code = getattr(exc, "reason_code", None) or type(exc).__name__
+        # capability(MarketplaceCapabilityUnsupportedError)가 reason_code보다 먼저 -
+        # "옵션 구조 미지원"/"판매상태 전환 불가" 등 구체적 차단 사유를 화면에 그대로
+        # 노출하기 위함이다(모두 MarketplaceCapabilityUnsupportedError라는 클래스명
+        # 하나로 뭉뚱그려지면 사용자가 원인을 구분할 수 없다).
+        error_code = getattr(exc, "capability", None) or getattr(exc, "reason_code", None) or type(exc).__name__
         now = datetime.now(timezone.utc)
         if kind == "SAFE_RETRY" and command.attempt_count < MAX_ATTEMPTS:
             values: dict[str, Any] = {

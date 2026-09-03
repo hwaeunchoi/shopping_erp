@@ -125,6 +125,12 @@ class ProductPlatformMapOut(BaseModel):
     platform_origin_product_id: Optional[str] = None
     display_name: Optional[str]
     seller_product_code: Optional[str]
+    sibling_mapping_ids: list[int] = []
+    """이 매핑과 같은 (platform_id, platform_origin_product_id)를 공유하는 다른
+    매핑들의 id 목록(자기 자신 제외) - 네이버는 원상품 하나에 스마트스토어/윈도우 등
+    복수 채널상품이 연결될 수 있어, 이 매핑에서 판매상태를 바꾸면 목록에 있는 다른
+    매핑들의 노출 화면에도 함께 영향을 준다는 것을 화면에서 드러내기 위함이다.
+    Coupang은 platform_option_id가 1:1 유니크 제약이라 항상 빈 목록이다."""
 
 
 class ProductPlatformMapCreate(BaseModel):
@@ -330,6 +336,15 @@ def get_product_detail(product_id: int, db: Session = Depends(get_db)):
     all_images = ProductImageRepository(db).list_by_product(product_id)
     product_level_images = [i for i in all_images if i.product_option_id is None]
 
+    def _to_platform_map_out(m):
+        out = ProductPlatformMapOut.model_validate(m)
+        if m.platform_origin_product_id:
+            siblings = platform_map_repo.list_by_platform_and_origin_product_id(
+                m.platform_id, m.platform_origin_product_id
+            )
+            out.sibling_mapping_ids = sorted(s.id for s in siblings if s.id != m.id)
+        return out
+
     option_details = []
     for option in option_repo.list_by_product(product_id):
         total_quantity, last_order_date = order_repo.total_quantity_and_last_order_date(option.id)
@@ -337,9 +352,7 @@ def get_product_detail(product_id: int, db: Session = Depends(get_db)):
         option_details.append(
             ProductOptionDetailOut(
                 **ProductOptionOut.model_validate(option).model_dump(),
-                platform_maps=[
-                    ProductPlatformMapOut.model_validate(m) for m in platform_map_repo.list_by_option(option.id)
-                ],
+                platform_maps=[_to_platform_map_out(m) for m in platform_map_repo.list_by_option(option.id)],
                 images=[ProductImageOut.model_validate(i) for i in all_images if i.product_option_id == option.id],
                 stats=ProductOptionStatsOut(
                     total_quantity_sold=total_quantity,

@@ -137,6 +137,30 @@ ORIGIN_PRODUCT_GET_PATH_TMPL = "/v2/products/origin-products/{origin_product_no}
 # 차단한다(추측으로 강제 전환하지 않음).
 _NAVER_INPUTABLE_STATUS_TYPES = frozenset({"SALE", "OUTOFSTOCK", "SUSPENSION"})
 
+
+def _has_option_managed_stock(origin_product: dict[str, Any]) -> bool:
+    """이 원상품의 재고가 "원상품 전체" 단위가 아니라 "옵션(조합)별"로 관리되는지
+    확인한다(공식 OpenAPI 스펙 ExternalApiOptionInfoVo.product, 2026-09 조회 -
+    originProduct.detailAttribute.optionInfo 경로). 조합형(optionCombinations)/
+    표준형(optionStandards, standardOptionGroups) 옵션이 있거나 "옵션 재고 수량
+    관리"(useStockManagement)를 켠 상품은, 상품 전체 재고(stockQuantity)가 옵션별
+    재고의 합으로 자동 계산되며 직접 입력이 거부되거나 무시된다(공식 GitHub
+    discussion #1194/#562 확인, 2026-09 조회: "조합형 옵션 상품이거나 옵션 재고
+    관리를 활성화한 상품의 경우, 상품 재고 수량은 각 옵션 조합별 재고 수량의 총
+    합으로 자동 계산됩니다"). 단독형(optionSimple)/직접입력형(optionCustom) 옵션
+    또는 옵션 없음은 상품 전체 단위로 재고가 관리되므로 여기 해당하지 않는다.
+
+    이 ERP는 옵션 조합별 재고를 개별적으로 설정하는 기능이 없다 - True를 반환하는
+    상품은 update_inventory()가 명시적으로 차단한다(추측으로 상품 전체
+    stockQuantity를 보내지 않음)."""
+    option_info = ((origin_product.get("detailAttribute") or {}).get("optionInfo")) or {}
+    if bool(option_info.get("useStockManagement")):
+        return True
+    if option_info.get("optionCombinations"):
+        return True
+    return bool(option_info.get("optionStandards") or option_info.get("standardOptionGroups"))
+
+
 # HTTP 429(Rate Limit) 재시도 정책: Retry-After 헤더가 있으면 그 값을, 없으면
 # 1s -> 2s -> 4s -> 8s -> 16s 지수 백오프로 대기 후 재시도한다.
 RATE_LIMIT_MAX_RETRIES = 5
@@ -261,9 +285,20 @@ class NaverSmartstoreConnector(BaseMallConnector):
     def update_inventory(
         self, platform_option_id: str, quantity: int, platform_origin_product_id: Optional[str] = None
     ) -> ProductSyncActionResult:
-        """재고 수량만 전송한다(모듈 상단 PRODUCT_STATUS_PATH_TMPL 주석의 공식 스펙
-        근거 참고). change-status는 statusType이 필수라, 재고만 바꾸고 판매상태는
-        건드리지 않기 위해 먼저 현재 statusType을 조회해 그대로 함께 보낸다."""
+        """원상품(origin product) 단위 재고 수량만 전송한다(모듈 상단
+        PRODUCT_STATUS_PATH_TMPL 주석의 공식 스펙 근거 참고). change-status는
+        statusType이 필수라, 재고만 바꾸고 판매상태는 건드리지 않기 위해 먼저 현재
+        원상품 정보를 조회해 statusType은 그대로 함께 보낸다.
+
+        ⚠️ 지원 범위(중요): 이 메서드가 보내는 stockQuantity는 "원상품 전체"의
+        재고 수량이지 "개별 옵션(조합)"의 재고가 아니다. 옵션 없음/단독형/직접
+        입력형 옵션 상품은 재고가 원상품 단위로 관리되어 이 방식이 정확하지만,
+        조합형/표준형(간편) 옵션 상품이거나 "옵션 재고 수량 관리"를 사용 중인
+        상품은 원상품 stockQuantity가 옵션(조합)별 재고의 합으로 자동 계산되며
+        직접 입력이 거부되거나 무시된다(공식 GitHub discussion #1194/#562 확인,
+        2026-09 조회) - 이 ERP는 옵션 조합별 재고를 개별적으로 설정하는 기능이
+        없으므로, 그런 상품 구조로 확인되면 추측으로 원상품 stockQuantity를
+        보내지 않고 명시적으로 차단한다(_has_option_managed_stock 참고)."""
         if not platform_origin_product_id:
             # vendorItemId(channelProductNo)만으로는 이 API를 호출할 수 없다 - 원상품번호를
             # 상품동기화 때 저장해 두지 못한(과거 데이터) 매핑은 안전하게 차단한다.
@@ -273,13 +308,21 @@ class NaverSmartstoreConnector(BaseMallConnector):
             raise MarketplaceCredentialMissingError("naver")
         client_id, client_secret, seller_id = credentials
         access_token = self._fetch_access_token(client_id, client_secret, seller_id)
-        current_status = self._fetch_current_status_type(platform_origin_product_id, access_token)
+        origin_product = self._fetch_origin_product(platform_origin_product_id, access_token)
+        current_status = origin_product.get("statusType")
+        if not current_status:
+            raise MarketplaceExternalAPIError("naver", "PARSE_FAILED", False)
         if current_status not in _NAVER_INPUTABLE_STATUS_TYPES:
             # 승인대기/판매종료 등 시스템 상태 - 추측으로 SALE/SUSPENSION 중 하나로
             # 강제 전환하지 않고 명시적으로 차단한다.
             raise MarketplaceCapabilityUnsupportedError("naver", f"inventory_update_blocked_status_{current_status}")
+        if _has_option_managed_stock(origin_product):
+            # 조합형/표준형 옵션 또는 옵션 재고 관리 사용 상품 - 원상품 단위
+            # stockQuantity를 직접 설정할 수 없는 구조다(모듈 docstring 참고).
+            # 이 ERP는 옵션 조합별 재고를 다루지 않으므로 추측하지 않고 차단한다.
+            raise MarketplaceCapabilityUnsupportedError("naver", "inventory_update_unsupported_option_structure")
         return self._put_change_status(
-            platform_origin_product_id, access_token, status_type=current_status, stock_quantity=quantity
+            platform_origin_product_id, access_token, status_type=str(current_status), stock_quantity=quantity
         )
 
     def update_sale_status(
@@ -299,16 +342,20 @@ class NaverSmartstoreConnector(BaseMallConnector):
         access_token = self._fetch_access_token(client_id, client_secret, seller_id)
         return self._put_change_status(platform_origin_product_id, access_token, status_type=naver_status)
 
-    def _fetch_current_status_type(self, origin_product_no: str, access_token: str) -> str:
+    def _fetch_origin_product(self, origin_product_no: str, access_token: str) -> dict[str, Any]:
+        """원상품 조회(모듈 상단 ORIGIN_PRODUCT_GET_PATH_TMPL 주석 참고) - 응답의
+        originProduct 서브 객체를 그대로 반환한다(statusType, detailAttribute.
+        optionInfo 등을 포함 - update_inventory가 현재 판매상태 보존과 옵션 구조
+        확인에 함께 사용한다)."""
         path = ORIGIN_PRODUCT_GET_PATH_TMPL.format(origin_product_no=origin_product_no)
         response = self._request_with_retry("GET", path, headers={"Authorization": f"Bearer {access_token}"})
         raise_for_status("naver", response.status_code)
         with external_call("naver"):
             payload = response.json()
-            status_type = (payload.get("originProduct") or {}).get("statusType")
-        if not status_type:
+            origin_product = payload.get("originProduct")
+        if not origin_product:
             raise MarketplaceExternalAPIError("naver", "PARSE_FAILED", False, http_status=response.status_code)
-        return str(status_type)
+        return dict(origin_product)
 
     def _put_change_status(
         self, origin_product_no: str, access_token: str, status_type: str, stock_quantity: Optional[int] = None

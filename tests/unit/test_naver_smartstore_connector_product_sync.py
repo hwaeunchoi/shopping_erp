@@ -49,6 +49,35 @@ def _make_handler(current_status_type: str, change_status_response: dict, captur
     return handler
 
 
+def _make_handler_with_option_info(
+    current_status_type: str, option_info: dict, captured: list, allow_change_status: bool = False
+):
+    """detailAttribute.optionInfo가 포함된 원상품 응답을 반환한다(옵션 구조에 따른
+    재고 전송 차단 검증용). allow_change_status=False(기본값)일 때 change-status가
+    호출되면 AssertionError로 막는다 - 차단되어야 하는 경우를 검증하는 테스트용.
+    차단되지 않아야 하는(정상 전송) 경우를 검증할 때는 allow_change_status=True로
+    호출해 change-status도 정상 응답하도록 한다."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        if request.url.path.endswith("/oauth2/token"):
+            return httpx.Response(200, json={"access_token": "fake-token", "expires_in": 3600})
+        if request.url.path.endswith(f"/origin-products/{ORIGIN_PRODUCT_NO}"):
+            return httpx.Response(
+                200,
+                json={
+                    "originProduct": {"statusType": current_status_type, "detailAttribute": {"optionInfo": option_info}}
+                },
+            )
+        if request.url.path.endswith("/change-status"):
+            if not allow_change_status:
+                raise AssertionError(f"차단되어야 할 요청이 전송됨: {request.url.path}")
+            return httpx.Response(200, json={"code": "SUCCESS", "message": "OK"})
+        raise AssertionError(f"예상치 못한 요청: {request.url.path}")
+
+    return handler
+
+
 class TestCapabilityFlags:
     def test_inventory_and_sale_status_update_are_supported(self):
         assert NaverSmartstoreConnector.supports_inventory_update is True
@@ -163,6 +192,61 @@ class TestUpdateInventory:
 
         assert result.accepted is False
         assert result.platform_result_code == "ERROR"
+
+
+class TestUpdateInventoryBlocksOptionManagedStock:
+    """조합형/표준형 옵션 또는 옵션 재고 관리 사용 상품은 원상품 stockQuantity가
+    옵션(조합)별 재고의 합으로 자동 계산되므로(공식 GitHub discussion #1194/#562
+    확인, 2026-09 조회), 이 ERP가 추측으로 원상품 단위 값을 보내지 않고 명시적으로
+    차단하는지 검증한다. 어느 경우든 change-status(PUT)는 절대 호출되지 않는다."""
+
+    def test_blocks_when_option_combinations_present(self, db_session, platform):
+        _register_credentials(db_session, platform)
+        captured: list = []
+        handler = _make_handler_with_option_info("SALE", {"optionCombinations": [{"id": 1}]}, captured)
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.commerce.naver.com")
+        connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        with pytest.raises(MarketplaceCapabilityUnsupportedError):
+            connector.update_inventory(CHANNEL_PRODUCT_NO, 10, platform_origin_product_id=ORIGIN_PRODUCT_NO)
+        assert not any(r.method == "PUT" for r in captured)
+
+    def test_blocks_when_standard_option_groups_present(self, db_session, platform):
+        _register_credentials(db_session, platform)
+        captured: list = []
+        handler = _make_handler_with_option_info("SALE", {"standardOptionGroups": [{"groupName": "색상"}]}, captured)
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.commerce.naver.com")
+        connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        with pytest.raises(MarketplaceCapabilityUnsupportedError):
+            connector.update_inventory(CHANNEL_PRODUCT_NO, 10, platform_origin_product_id=ORIGIN_PRODUCT_NO)
+        assert not any(r.method == "PUT" for r in captured)
+
+    def test_blocks_when_use_stock_management_is_true(self, db_session, platform):
+        _register_credentials(db_session, platform)
+        captured: list = []
+        handler = _make_handler_with_option_info("SALE", {"useStockManagement": True}, captured)
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.commerce.naver.com")
+        connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        with pytest.raises(MarketplaceCapabilityUnsupportedError):
+            connector.update_inventory(CHANNEL_PRODUCT_NO, 10, platform_origin_product_id=ORIGIN_PRODUCT_NO)
+        assert not any(r.method == "PUT" for r in captured)
+
+    def test_does_not_block_simple_option_products(self, db_session, platform):
+        """단독형 옵션(optionSimple)만 있는 상품은 원상품 단위 재고 관리 대상이므로
+        차단되지 않는다."""
+        _register_credentials(db_session, platform)
+        captured: list = []
+        handler = _make_handler_with_option_info(
+            "SALE", {"optionSimple": [{"id": 1}], "useStockManagement": False}, captured, allow_change_status=True
+        )
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.commerce.naver.com")
+        connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        result = connector.update_inventory(CHANNEL_PRODUCT_NO, 10, platform_origin_product_id=ORIGIN_PRODUCT_NO)
+
+        assert result.accepted is True
 
 
 class TestUpdateSaleStatus:

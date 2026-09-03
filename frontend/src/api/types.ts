@@ -98,6 +98,7 @@ export interface ProductPlatformMap {
   platform_origin_product_id?: string | null
   display_name: string | null
   seller_product_code: string | null
+  sibling_mapping_ids: number[]
 }
 
 // 상용 ERP 확장(3단계, 첫 묶음) - 기존 채널 상품(옵션)의 재고/판매상태 전송.

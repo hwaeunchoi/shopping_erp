@@ -168,6 +168,51 @@ class TestProductDetail:
         assert len(body["images"]) == 1
         assert body["images"][0]["image_url"] == "https://img.example.com/detail.jpg"
 
+    def test_detail_exposes_sibling_mapping_ids_sharing_origin_product(
+        self, client, auth_headers, api_session_factory, seed_data
+    ):
+        """네이버는 원상품 하나에 스마트스토어/윈도우 등 복수 채널상품이 연결될 수
+        있어, 서로 다른 ProductPlatformMap 행이 같은 platform_origin_product_id를
+        공유할 수 있다(유니크 제약 없음 - platform_option_id와 다름). 이 경우
+        상품상세 화면이 그 공유 관계를 sibling_mapping_ids로 알 수 있어야
+        판매상태 변경이 다른 매핑에도 영향을 준다는 것을 화면에 보여줄 수 있다."""
+        from models.product import ProductPlatformMap
+
+        product = client.post(
+            "/api/products", json={"name": "형제매핑 테스트 상품", "category": "잡화"}, headers=auth_headers
+        ).json()
+        option_a = client.post(
+            f"/api/products/{product['id']}/options", json={"sku_code": "SIBLING-SKU-A"}, headers=auth_headers
+        ).json()
+        option_b = client.post(
+            f"/api/products/{product['id']}/options", json={"sku_code": "SIBLING-SKU-B"}, headers=auth_headers
+        ).json()
+        mapping_a = client.post(
+            f"/api/products/options/{option_a['id']}/platform-map",
+            json={"platform_id": seed_data["platform_id"], "platform_option_id": "SIBLING-EXT-A"},
+            headers=auth_headers,
+        ).json()
+        mapping_b = client.post(
+            f"/api/products/options/{option_b['id']}/platform-map",
+            json={"platform_id": seed_data["platform_id"], "platform_option_id": "SIBLING-EXT-B"},
+            headers=auth_headers,
+        ).json()
+
+        db = api_session_factory()
+        try:
+            for mid in (mapping_a["id"], mapping_b["id"]):
+                m = db.get(ProductPlatformMap, mid)
+                m.platform_origin_product_id = "ORIGIN-SHARED-1"
+            db.commit()
+        finally:
+            db.close()
+
+        detail = client.get(f"/api/products/{product['id']}/detail", headers=auth_headers).json()
+        maps_by_option = {o["sku_code"]: o["platform_maps"][0] for o in detail["options"]}
+
+        assert maps_by_option["SIBLING-SKU-A"]["sibling_mapping_ids"] == [mapping_b["id"]]
+        assert maps_by_option["SIBLING-SKU-B"]["sibling_mapping_ids"] == [mapping_a["id"]]
+
     def test_detail_missing_product_returns_404(self, client, auth_headers):
         resp = client.get("/api/products/999999/detail", headers=auth_headers)
         assert resp.status_code == 404

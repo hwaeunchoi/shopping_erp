@@ -441,6 +441,12 @@ function ProductSyncControls({ mapping }: { mapping: ProductPlatformMap }) {
           {isSubmittingQty ? '전송 중...' : '재고 전송'}
         </button>
       </form>
+      {mapping.sibling_mapping_ids.length > 0 && (
+        <p className="hint-text" style={{ color: '#b45309' }}>
+          ⚠️ 이 매핑은 같은 원상품(origin product)을 매핑 #{mapping.sibling_mapping_ids.join(', #')}과(와)
+          공유합니다 - 판매상태 변경은 해당 매핑들에도 함께 반영됩니다.
+        </p>
+      )}
       <div className="inline-form" style={{ marginBottom: 4 }}>
         <select value={saleStatus} onChange={(e) => setSaleStatus(e.target.value as SaleStatusValue)}>
           <option value="ON_SALE">판매중으로</option>
