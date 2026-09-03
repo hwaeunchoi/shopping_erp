@@ -4,10 +4,11 @@ repositories/integration_sync_repository.py
 ExternalCommand(outbox)/ExternalCommandLineResult(라인별 결과)/OrderStatusConflict 저장소.
 """
 
+import zlib
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional, cast
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
@@ -84,6 +85,54 @@ class ExternalCommandRepository:
                     ExternalCommand.updated_at < older_than,
                 )
             ).scalars()
+        )
+
+    def acquire_target_lock(self, target_type: str, target_ids: Iterable[int] | int) -> None:
+        """같은 외부 대상(target_type + target_ids 집합)에 대한 실행을 트랜잭션이
+        끝날 때(commit/rollback)까지 DB 수준에서 배타적으로 만든다(PostgreSQL
+        pg_advisory_xact_lock).
+
+        왜 필요한가: claim()의 UPDATE...WHERE는 "같은 명령 행(row)"을 두 worker가
+        동시에 선점하지 못하게 할 뿐이다. 그러나 서로 다른 명령 행이 같은 외부
+        대상을 가리키는 경우(형제 매핑, 또는 재고/판매상태 명령 쌍)의 상호 배제는
+        exists_active_for_target류의 평범한 SELECT로만 확인했는데, 이 서비스의
+        execute_command()는 claim()부터 채널 호출, 최종 상태 기록까지를 커밋 하나
+        없이 한 트랜잭션 안에서 수행한다(commit은 호출부(scheduler.jobs.
+        product_sync_dispatch_job)가 명령 처리를 마친 뒤에야 한다). READ COMMITTED
+        하에서 그 SELECT는 "다른 트랜잭션이 이미 커밋한" 변경만 본다 - 그래서 두
+        worker가 같은 외부 대상에 대해 각자 다른 명령 행을 claim()한 뒤, 서로
+        아직 커밋하지 않은 상태에서 거의 동시에 그 SELECT를 실행하면 둘 다 "다른
+        RUNNING 없음"으로 잘못 판단하고 둘 다 채널을 동시 호출할 수 있다(TOCTOU).
+
+        advisory lock은 이 공백을 메운다 - 같은 외부 대상을 가리키는 명령을 처리
+        하려는 두 번째 worker는 이 호출에서 그대로 대기하다가, 첫 worker의
+        트랜잭션이 commit/rollback되어 잠금이 자동 해제된 뒤에야 통과한다. 그
+        시점에는 첫 worker의 모든 변경(RUNNING -> SUCCESS/FAILED/UNKNOWN 등)이
+        이미 커밋되어 있으므로, 이후의 claim()/exists_* 검사가 항상 최신 상태를
+        올바르게 본다.
+
+        잠금 키: target_ids(형제 매핑을 포함해 같은 외부 대상을 공유하는 모든
+        ProductPlatformMap.id의 집합)에서 가장 작은 id를 쓴다 - 이 집합은
+        _resolve_contention_target_ids()가 어느 매핑에서 시작하든 대칭적으로
+        같은 전체 집합을 계산하므로(A의 형제에 B가 있으면 B의 형제에도 A가
+        있음), min()도 항상 동일한 값으로 수렴해 서로 다른 매핑에서 시작해도
+        같은 잠금을 다툰다. classid(첫 번째 인자)는 target_type별로 고정된
+        상수라 서로 다른 target_type의 명령끼리는 불필요하게 묶이지 않는다.
+
+        SQLite(단위테스트)에는 advisory lock이 없다 - 단위테스트는 단일
+        커넥션·순차 실행이라 이 잠금이 없어도 안전하며, 실제 동시 worker
+        보장은 격리 PostgreSQL 통합 테스트로 검증한다(이 함수는 PostgreSQL이
+        아니면 아무 것도 하지 않는다)."""
+        ids = [target_ids] if isinstance(target_ids, int) else list(target_ids)
+        if not ids:
+            return
+        bind = self.session.get_bind()
+        if bind is None or bind.dialect.name != "postgresql":
+            return
+        classid = zlib.crc32(target_type.encode("utf-8")) & 0x7FFFFFFF
+        objid = min(ids) & 0x7FFFFFFF
+        self.session.execute(
+            text("SELECT pg_advisory_xact_lock(:classid, :objid)"), {"classid": classid, "objid": objid}
         )
 
     def claim(self, command_id: int, lease_token: str) -> bool:

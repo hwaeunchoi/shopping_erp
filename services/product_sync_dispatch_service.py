@@ -65,6 +65,23 @@ RUNNING인 다른 명령이 있으면 채널을 호출하지 않고 PENDING으�
 반납) 다음 회차에 다시 시도한다(exists_other_running_for_targets) - 채널 실패가
 아니므로 FAILED/RETRY_WAIT 백오프는 적용하지 않는다.
 
+외부 대상 단위 배타 실행의 DB 수준 보장(advisory lock): 위의 UNKNOWN/최신명령/
+교차종류 실행중 확인은 전부 평범한 SELECT이고, execute_command() 전체가
+claim()부터 채널 호출·최종 상태 기록까지 커밋 하나 없이 한 트랜잭션으로
+진행된다(commit은 scheduler.jobs.product_sync_dispatch_job이 처리를 마친 뒤에야
+한다). READ COMMITTED 하에서 그런 SELECT는 다른 트랜잭션이 "이미 커밋한" 변경만
+보므로, 같은 외부 대상을 가리키는 서로 다른 명령 행 두 개를 서로 다른 worker가
+각자 claim()한 뒤 거의 동시에 그 SELECT를 실행하면 둘 다 "다른 RUNNING 없음"으로
+잘못 판단하고 둘 다 채널을 동시 호출할 수 있었다(claim()의 행 단위 UPDATE는
+"같은 명령 행"의 중복 처리만 막을 뿐, "다른 행이 같은 외부 대상을 가리키는" 경우는
+막지 못함 - 실제 동시 worker 통합 테스트로 확인된 공백). 그래서 contention_ids를
+구한 직후, 위 모든 검사보다 먼저 acquire_target_lock()으로 PostgreSQL
+pg_advisory_xact_lock을 건다 - 같은 외부 대상을 다투는 다른 worker는 이 호출에서
+대기하다가 앞선 worker의 트랜잭션이 commit/rollback되어야(그 안에서 이뤄진 모든
+상태 변화가 이미 커밋된 뒤에야) 통과하므로, 이후의 SELECT들이 항상 최신 상태를
+올바르게 본다. SQLite(단위테스트)에는 advisory lock이 없어 이 함수는 아무 것도
+하지 않는다 - 실제 동시성 보장은 격리 PostgreSQL 통합 테스트로 검증한다.
+
 ⚠️ 이 서비스는 채널까지 포함한 "정확히 한 번" 전송을 보장하지 않는다 - 로컬
 idempotency_key/lease는 "같은 명령을 두 번 만들거나 두 worker가 동시에 실행하지
 않는다"는 보장일 뿐이다. 재고/판매상태 API는 모두 "절대값을 설정"하는 방식이라
@@ -324,6 +341,16 @@ class ProductSyncDispatchService:
         if mapping is None:
             raise ValueError(f"플랫폼 매핑을 찾을 수 없습니다: id={detail.product_platform_map_id}")
         contention_ids = self._resolve_contention_target_ids(mapping)
+
+        # 이 외부 대상(들)에 대한 실행을 트랜잭션이 끝날 때(commit/rollback)까지
+        # DB 수준에서 배타적으로 만든다 - 아래의 UNKNOWN/최신명령 확인은 전부 평범한
+        # SELECT라 이 함수가 커밋 하나 없이 채널 호출까지 한 트랜잭션으로 진행하는
+        # 동안에는 다른 worker의 아직 커밋되지 않은 변경을 볼 수 없다(TOCTOU). 이
+        # 잠금이 없으면 같은 외부 대상을 가리키는 서로 다른 명령 행 두 개가 동시에
+        # 채널을 호출할 수 있다(repositories.integration_sync_repository.
+        # ExternalCommandRepository.acquire_target_lock 참고 - PostgreSQL 전용,
+        # SQLite 단위테스트에서는 아무 것도 하지 않는다).
+        self.command_repo.acquire_target_lock(command.target_type, contention_ids)
 
         # UNKNOWN 대상과의 충돌 방지: 같은 외부 대상(들)에 더 먼저 생성된(id가 더
         # 작은) 미해소 UNKNOWN 명령이 있으면, 채널이 그 명령을 실제로 처리했는지 알
