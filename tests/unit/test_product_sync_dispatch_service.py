@@ -11,7 +11,11 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from integrations.malls.base_mall_connector import SALE_STATUS_ON_SALE, SALE_STATUS_SUSPENDED, ProductSyncActionResult
-from integrations.malls.errors import MarketplaceCredentialMissingError, MarketplaceExternalAPIError
+from integrations.malls.errors import (
+    MarketplaceCapabilityUnsupportedError,
+    MarketplaceCredentialMissingError,
+    MarketplaceExternalAPIError,
+)
 from models.integration_sync import ExternalCommand, ProductSyncCommandDetail
 from services.product_sync_dispatch_service import (
     MAX_QUANTITY,
@@ -26,9 +30,10 @@ from services.product_sync_dispatch_service import (
 class StubProductConnector:
     """update_inventory()/update_sale_status()를 제어할 수 있는 스텁."""
 
-    def __init__(self, *, supports_inventory=True, supports_status=True, result=None, error=None):
+    def __init__(self, *, supports_inventory=True, supports_status=True, supports_info=True, result=None, error=None):
         self.supports_inventory_update = supports_inventory
         self.supports_sale_status_update = supports_status
+        self.supports_product_info_update = supports_info
         self._result = result or ProductSyncActionResult(accepted=True, platform_result_code="SUCCESS")
         self._error = error
         self.calls: list[tuple] = []
@@ -45,6 +50,14 @@ class StubProductConnector:
             raise self._error
         return self._result
 
+    def update_product_info(
+        self, platform_option_id, platform_origin_product_id=None, name=None, sale_price=None, description=None
+    ):
+        self.calls.append(("info", platform_option_id, name, sale_price, description))
+        if self._error:
+            raise self._error
+        return self._result
+
 
 def _factory(connector):
     return lambda connector_class, session=None, platform_id=None: connector
@@ -55,6 +68,12 @@ def _enable(monkeypatch):
     from config.settings import settings
 
     monkeypatch.setattr(settings, "product_channel_sync_enabled", True)
+    # PRODUCT_INFO_UPDATE(상용 ERP 확장 3단계 두 번째 묶음)는 별도 독립 플래그로
+    # 통제한다(services.product_sync_dispatch_service._enqueue 참고) - 이 파일의
+    # 나머지 테스트는 "기능이 켜져 있을 때"를 전제하므로 함께 켠다. 플래그가 실제로
+    # 독립적인지는 TestInfoUpdate.test_controlled_by_its_own_flag_independent_of_
+    # inventory_flag가 각각 개별적으로 다시 꺼서 검증한다.
+    monkeypatch.setattr(settings, "product_publish_enabled", True)
 
 
 class TestDisabledByDefault:
@@ -586,4 +605,110 @@ class TestCrossTypeRunningExclusion:
         db_session.flush()
 
         with pytest.raises(ProductSyncAlreadyRunningError):
+            svc.execute_command(outcome.command.id)
+
+
+class TestInfoUpdate:
+    """PRODUCT_INFO_UPDATE(상용 ERP 확장 3단계, 두 번째 묶음) - 상품명/판매가/
+    상세설명 중 실제로 바뀐 값만 전송한다. TARGET_TYPE을 재고/판매상태와 공유하므로
+    형제 매핑 확장과 교차종류 실행중 검사가 별도 구현 없이 그대로 적용된다."""
+
+    def test_requires_at_least_one_field(self, db_session, platform_map):
+        svc = ProductSyncDispatchService(db_session)
+        with pytest.raises(ValueError):
+            svc.enqueue_info_update(platform_map.id)
+        assert db_session.query(ExternalCommand).count() == 0
+
+    def test_controlled_by_its_own_flag_independent_of_inventory_flag(self, db_session, platform_map, monkeypatch):
+        """product_publish_enabled는 product_channel_sync_enabled와 별개의 독립
+        플래그다 - 재고/판매상태 플래그가 켜져 있어도(이 파일의 autouse _enable
+        픽스처) 정보수정 전용 플래그가 꺼져 있으면 여전히 차단돼야 하고, 반대로
+        정보수정 플래그만 켜고 재고 플래그를 꺼도 재고 전송은 여전히 차단돼야 한다."""
+        from config.settings import settings
+
+        monkeypatch.setattr(settings, "product_publish_enabled", False)
+        svc = ProductSyncDispatchService(db_session)
+        with pytest.raises(ProductChannelSyncDisabledError):
+            svc.enqueue_info_update(platform_map.id, name="새이름")
+
+        monkeypatch.setattr(settings, "product_publish_enabled", True)
+        monkeypatch.setattr(settings, "product_channel_sync_enabled", False)
+        with pytest.raises(ProductChannelSyncDisabledError):
+            svc.enqueue_inventory_update(platform_map.id, 10)
+        # 반대로 정보수정은 이 상태에서 정상 접수돼야 한다(플래그가 독립적이라는 증거).
+        outcome = svc.enqueue_info_update(platform_map.id, name="새이름2")
+        assert outcome.command.status == "PENDING"
+
+    def test_negative_price_is_rejected(self, db_session, platform_map):
+        svc = ProductSyncDispatchService(db_session)
+        with pytest.raises(ValueError):
+            svc.enqueue_info_update(platform_map.id, sale_price=-1)
+        assert db_session.query(ExternalCommand).count() == 0
+
+    def test_execute_sends_only_provided_fields(self, db_session, platform_map):
+        conn = StubProductConnector()
+        svc = ProductSyncDispatchService(db_session, connector_factory=_factory(conn))
+        outcome = svc.enqueue_info_update(platform_map.id, name="새 이름", sale_price=29900)
+
+        result = svc.execute_command(outcome.command.id)
+
+        assert result.command.status == "SUCCESS"
+        assert conn.calls == [("info", platform_map.platform_option_id, "새 이름", 29900, None)]
+
+    def test_unsupported_connector_is_confirmed_failed_without_call(self, db_session, platform_map):
+        conn = StubProductConnector(supports_info=False)
+        svc = ProductSyncDispatchService(db_session, connector_factory=_factory(conn))
+        outcome = svc.enqueue_info_update(platform_map.id, name="새 이름")
+
+        with pytest.raises(MarketplaceCapabilityUnsupportedError):
+            svc.execute_command(outcome.command.id)
+        db_session.refresh(outcome.command)
+        assert outcome.command.status == "FAILED"
+        assert conn.calls == []
+
+    def test_duplicate_submission_with_same_values_reuses_existing_command(self, db_session, platform_map):
+        svc = ProductSyncDispatchService(db_session, connector_factory=_factory(StubProductConnector()))
+        first = svc.enqueue_info_update(platform_map.id, name="같은이름")
+        second = svc.enqueue_info_update(platform_map.id, name="같은이름")
+        assert first.command.id == second.command.id
+        assert db_session.query(ExternalCommand).count() == 1
+
+    def test_info_update_does_not_cancel_pending_inventory_command_and_vice_versa(self, db_session, platform_map):
+        """재고 변경과 정보수정은 서로 다른 의도이므로 상대방의 대기 명령을 잘못
+        취소하면 안 된다(재고 vs 판매상태와 동일 원칙)."""
+        svc = ProductSyncDispatchService(db_session, connector_factory=_factory(StubProductConnector()))
+        inventory_cmd = svc.enqueue_inventory_update(platform_map.id, 10)
+        info_cmd = svc.enqueue_info_update(platform_map.id, name="새이름")
+
+        db_session.refresh(inventory_cmd.command)
+        db_session.refresh(info_cmd.command)
+        assert inventory_cmd.command.status == "PENDING"
+        assert info_cmd.command.status == "PENDING"
+
+    def test_info_update_backs_off_when_inventory_command_is_running_for_same_target(self, db_session, platform_map):
+        """교차종류 실행중 검사(exists_other_running_for_targets)가 재고/판매상태
+        쌍뿐 아니라 정보수정에도 그대로 적용되는지 검증한다."""
+        conn = StubProductConnector()
+        svc = ProductSyncDispatchService(db_session, connector_factory=_factory(conn))
+        running_inventory_cmd = svc.enqueue_inventory_update(platform_map.id, 10)
+        running_inventory_cmd.command.status = "RUNNING"
+        running_inventory_cmd.command.lease_token = "other-worker"
+        db_session.flush()
+
+        info_cmd = svc.enqueue_info_update(platform_map.id, name="새이름")
+        result = svc.execute_command(info_cmd.command.id)
+
+        assert result.command.status == "PENDING"
+        assert conn.calls == []
+
+    def test_command_type_mismatch_guard_still_applies(self, db_session, platform_map):
+        svc = ProductSyncDispatchService(db_session, connector_factory=_factory(StubProductConnector()))
+        outcome = svc.enqueue_info_update(platform_map.id, name="새이름")
+        from models.integration_sync import ExternalCommand as _EC
+
+        command = db_session.get(_EC, outcome.command.id)
+        command.command_type = "SOME_OTHER_TYPE"
+        db_session.flush()
+
+        with pytest.raises(ProductSyncCommandTypeMismatchError):
             svc.execute_command(outcome.command.id)

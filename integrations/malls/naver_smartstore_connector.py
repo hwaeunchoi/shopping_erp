@@ -47,6 +47,7 @@ from integrations.malls.base_mall_connector import (
     SALE_STATUS_ON_SALE,
     SALE_STATUS_SUSPENDED,
     BaseMallConnector,
+    ProductCreateResult,
     ProductSyncActionResult,
     ShipmentSubmitResult,
 )
@@ -166,12 +167,133 @@ def _has_option_managed_stock(origin_product: dict[str, Any]) -> bool:
 RATE_LIMIT_MAX_RETRIES = 5
 RATE_LIMIT_BACKOFF_BASE_SECONDS = 1.0
 
+# --- 신규 상품 등록 / 제한된 정보 수정 (상용 ERP 확장 3단계, 두 번째 묶음) ---
+# 공식 OpenAPI 스펙(commerce-api-naver/commerce-api 저장소 docs/2.0.0-RC.js, 2026-09
+# 조회 - 위 재고/판매상태 전송과 동일한 방법으로 확인)에서 확인한 등록 계약:
+#   POST /v2/products (createProduct_2.product)
+#   요청(ExternalApiCreateProductRequestVo.product, 최상위 필수: originProduct,
+#   smartstoreChannelProduct):
+#     originProduct(ExternalApiOriginProductVo.product, 필수: detailAttribute,
+#     detailContent, images, name, salePrice, statusType - 등록 시에는 statusType은
+#     SALE만 가능, leafCategoryId/stockQuantity도 등록 시 필수라고 필드 설명에 명시):
+#       {statusType:"SALE", leafCategoryId, name, images:{representativeImage:{url},
+#        optionalImages:[{url}]}, detailContent, salePrice, stockQuantity,
+#        deliveryInfo(ExternalApiDeliveryInfoVo, 필수: claimDeliveryInfo,
+#        deliveryAttributeType, deliveryFee, deliveryType),
+#        detailAttribute(ExternalApiBaseProductDetailAttributeVo, 필수:
+#        afterServiceInfo{afterServiceTelephoneNumber,afterServiceGuideContent},
+#        minorPurchasable(bool), originAreaInfo{originAreaCode 필수})}
+#     smartstoreChannelProduct(ExternalApiSmartstoreChannelProductVo, 필수:
+#       channelProductDisplayStatusType, naverShoppingRegistration)
+#   응답(ExternalApiCreateUpdateProductResponseVo.product):
+#     {originProductNo, smartstoreChannelProductNo, windowChannelProductNo} - 등록과
+#     동시에 옵션 단위 식별자(channelProductNo)까지 동기적으로 확정 반환된다(쿠팡과
+#     달리 승인 후 별도 조회가 필요 없다).
+#   상품정보제공고시(detailAttribute.productInfoProvidedNotice, ExternalApi
+#   ProductInfoProvidedNoticeVo)는 카테고리마다 다른 30여 개 하위 스키마가 있다 -
+#   이번 라운드는 그중 "기타 재화"(productInfoProvidedNoticeType="ETC",
+#   ExternalApiEtcInfoProvidedNoticeVo, 필수 8개 확인: itemName, manufacturer,
+#   modelName, qualityAssuranceStandard, compensationProcedure, troubleShootingContents,
+#   noRefundReason, returnCostReason) 하나만 스키마를 확인했다 - 그 외 유형(화장품/
+#   식품/의류 등 카테고리 전용 고시)은 스키마를 확인하지 못해 명시적으로 차단한다
+#   (추측 금지).
+#
+#   GET/PUT /v2/products/origin-products/{originProductNo}: GET 응답의 originProduct
+#   서브 객체와 PUT 요청 바디의 originProduct는 동일 스키마(ExternalApiOriginProductVo)
+#   다 - PUT은 전체교체형(update 시에도 등록과 동일한 필수 필드 목록을 요구)이라,
+#   상품명/판매가/상세설명만 바꾸려 해도 GET으로 받은 전체 객체에서 그 세 필드만
+#   바꾸고 나머지(이미지/배송/재고/상세속성 등)는 그대로 되돌려 보내야 안전하다
+#   (update_product_info 참고 - 이 방식 없이 세 필드만 담아 보내면 나머지 필드가
+#   비거나 기본값으로 리셋될 위험이 있다).
+CREATE_PRODUCT_PATH = "/v2/products"
+# ExternalApiEtcInfoProvidedNoticeVo.product 필수 필드(위 주석 참고) - draft.
+# channel_fields의 "productInfoProvidedNotice.etc.<key>" 키로 그대로 받는다.
+_NAVER_ETC_NOTICE_REQUIRED_FIELDS = (
+    "itemName",
+    "manufacturer",
+    "modelName",
+    "qualityAssuranceStandard",
+    "compensationProcedure",
+    "troubleShootingContents",
+    "noRefundReason",
+    "returnCostReason",
+)
+# ExternalApiDeliveryInfoVo.product 필수 필드.
+_NAVER_DELIVERY_INFO_REQUIRED_FIELDS = ("deliveryType", "deliveryAttributeType", "deliveryFee", "claimDeliveryInfo")
+# ExternalApiClaimDeliveryInfoVo.product 필수 필드(claimDeliveryInfo 하위).
+_NAVER_CLAIM_DELIVERY_REQUIRED_FIELDS = ("returnDeliveryFee", "exchangeDeliveryFee")
+# ExternalApiAfterServiceInfoVo.product 필수 필드.
+_NAVER_AFTER_SERVICE_REQUIRED_FIELDS = ("afterServiceTelephoneNumber", "afterServiceGuideContent")
+
+
+def _validate_naver_publish_draft(draft: dict[str, Any]) -> None:
+    """신규 등록 스냅샷이 위 공식 계약의 확인된 필수 항목을 전부 채웠는지 검사한다.
+    하나라도 비어 있으면(카테고리·제조자·원산지·인증정보·배송비·반품지·판매가격을
+    추측하거나 임의 기본값으로 채우지 않고) 채널 호출 전에 ValueError로 차단한다."""
+    missing: list[str] = []
+    if not draft.get("name"):
+        missing.append("name(상품명)")
+    if draft.get("sale_price") is None:
+        missing.append("sale_price(판매가)")
+    if not draft.get("description_html"):
+        missing.append("description_html(상세설명)")
+    if not draft.get("category_code"):
+        missing.append("category_code(leafCategoryId)")
+    image_urls = draft.get("image_urls") or []
+    if not image_urls:
+        missing.append("image_urls(대표이미지 최소 1장 필요)")
+    if draft.get("stock_quantity") is None:
+        missing.append("stock_quantity(등록 시 필수)")
+
+    cf = draft.get("channel_fields") or {}
+    if cf.get("minorPurchasable") is None:
+        missing.append("channel_fields.minorPurchasable")
+    if cf.get("naverShoppingRegistration") is None:
+        missing.append("channel_fields.naverShoppingRegistration")
+    if not cf.get("channelProductDisplayStatusType"):
+        missing.append("channel_fields.channelProductDisplayStatusType")
+
+    origin_area = cf.get("originAreaInfo") or {}
+    if not origin_area.get("originAreaCode"):
+        missing.append("channel_fields.originAreaInfo.originAreaCode")
+
+    after_service = cf.get("afterServiceInfo") or {}
+    for field in _NAVER_AFTER_SERVICE_REQUIRED_FIELDS:
+        if not after_service.get(field):
+            missing.append(f"channel_fields.afterServiceInfo.{field}")
+
+    delivery = cf.get("deliveryInfo") or {}
+    for field in ("deliveryType", "deliveryAttributeType"):
+        if not delivery.get(field):
+            missing.append(f"channel_fields.deliveryInfo.{field}")
+    delivery_fee = delivery.get("deliveryFee") or {}
+    if not delivery_fee.get("deliveryFeeType"):
+        missing.append("channel_fields.deliveryInfo.deliveryFee.deliveryFeeType")
+    claim_delivery = delivery.get("claimDeliveryInfo") or {}
+    for field in _NAVER_CLAIM_DELIVERY_REQUIRED_FIELDS:
+        if claim_delivery.get(field) is None:
+            missing.append(f"channel_fields.deliveryInfo.claimDeliveryInfo.{field}")
+
+    notice = cf.get("productInfoProvidedNotice") or {}
+    if notice.get("productInfoProvidedNoticeType") != "ETC":
+        missing.append("channel_fields.productInfoProvidedNotice.productInfoProvidedNoticeType(현재 ETC만 지원)")
+    else:
+        etc = notice.get("etc") or {}
+        for field in _NAVER_ETC_NOTICE_REQUIRED_FIELDS:
+            if not etc.get(field):
+                missing.append(f"channel_fields.productInfoProvidedNotice.etc.{field}")
+
+    if missing:
+        raise ValueError("네이버 상품 등록에 필요한 항목이 비어 있습니다(추측 금지): " + ", ".join(missing))
+
 
 class NaverSmartstoreConnector(BaseMallConnector):
     platform_code = "naver_smartstore"
     supports_shipment_submit = True
     supports_inventory_update = True
     supports_sale_status_update = True
+    supports_product_create = True
+    supports_product_info_update = True
 
     def __init__(
         self, session: Any = None, platform_id: Optional[int] = None, http_client: Optional[httpx.Client] = None
@@ -356,6 +478,149 @@ class NaverSmartstoreConnector(BaseMallConnector):
         if not origin_product:
             raise MarketplaceExternalAPIError("naver", "PARSE_FAILED", False, http_status=response.status_code)
         return dict(origin_product)
+
+    def create_product(self, draft_snapshot: dict[str, Any]) -> ProductCreateResult:
+        """옵션 조합 없는 단순 신규 상품을 등록한다(모듈 상단 CREATE_PRODUCT_PATH
+        주석의 공식 스펙 근거 참고). 등록 응답이 원상품번호+채널상품번호를 모두
+        동기적으로 돌려주므로, 성공 시 바로 ProductPlatformMap을 만들 수 있다
+        (services.product_publish_service 참고 - 쿠팡과 다른 점)."""
+        _validate_naver_publish_draft(draft_snapshot)
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("naver")
+        client_id, client_secret, seller_id = credentials
+        access_token = self._fetch_access_token(client_id, client_secret, seller_id)
+
+        cf = draft_snapshot["channel_fields"]
+        image_urls: list[str] = draft_snapshot["image_urls"]
+        images: dict[str, Any] = {"representativeImage": {"url": image_urls[0]}}
+        if len(image_urls) > 1:
+            images["optionalImages"] = [{"url": u} for u in image_urls[1:]]
+
+        origin_product = {
+            "statusType": "SALE",
+            "leafCategoryId": draft_snapshot["category_code"],
+            "name": draft_snapshot["name"],
+            "images": images,
+            "detailContent": draft_snapshot["description_html"],
+            "salePrice": int(draft_snapshot["sale_price"]),
+            "stockQuantity": int(draft_snapshot["stock_quantity"]),
+            "deliveryInfo": cf["deliveryInfo"],
+            "detailAttribute": {
+                "afterServiceInfo": cf["afterServiceInfo"],
+                "originAreaInfo": cf["originAreaInfo"],
+                "minorPurchasable": bool(cf["minorPurchasable"]),
+                "productInfoProvidedNotice": cf["productInfoProvidedNotice"],
+            },
+        }
+        body = {
+            "originProduct": origin_product,
+            "smartstoreChannelProduct": {
+                "channelProductDisplayStatusType": cf["channelProductDisplayStatusType"],
+                "naverShoppingRegistration": bool(cf["naverShoppingRegistration"]),
+            },
+        }
+        response = self._request_with_retry(
+            "POST", CREATE_PRODUCT_PATH, headers={"Authorization": f"Bearer {access_token}"}, json=body
+        )
+        raise_for_status("naver", response.status_code)
+        with external_call("naver"):
+            payload = response.json()
+            origin_product_no = payload.get("originProductNo")
+            channel_product_no = payload.get("smartstoreChannelProductNo")
+        if not origin_product_no or not channel_product_no:
+            raise MarketplaceExternalAPIError("naver", "PARSE_FAILED", False, http_status=response.status_code)
+        return ProductCreateResult(
+            accepted=True,
+            platform_result_code="SUCCESS",
+            channel_product_id=str(origin_product_no),
+            channel_option_id=str(channel_product_no),
+        )
+
+    def update_product_info(
+        self,
+        platform_option_id: str,
+        platform_origin_product_id: Optional[str],
+        name: Optional[str] = None,
+        sale_price: Optional[float] = None,
+        description: Optional[str] = None,
+    ) -> ProductSyncActionResult:
+        """상품명/판매가/상세설명 중 주어진 값만 바꾼다. PUT이 전체교체형이라
+        (모듈 상단 주석 참고) GET으로 현재 전체 값을 받아 그 세 필드만 치환하고
+        나머지(이미지/배송/재고/상세속성 등)는 그대로 되돌려 보낸다 - 안전하게
+        보존할 수 없는 필드는 없다(GET=PUT 동일 스키마이므로)."""
+        if not platform_origin_product_id:
+            raise MarketplaceCapabilityUnsupportedError("naver", "product_info_update_missing_origin_product_id")
+        if name is None and sale_price is None and description is None:
+            raise ValueError("수정할 항목(상품명/판매가/상세설명)이 하나도 없습니다.")
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("naver")
+        client_id, client_secret, seller_id = credentials
+        access_token = self._fetch_access_token(client_id, client_secret, seller_id)
+
+        current = self._fetch_full_product_for_update(platform_origin_product_id, access_token)
+        origin_product = current["originProduct"]
+        if name is not None:
+            origin_product["name"] = name
+        if sale_price is not None:
+            origin_product["salePrice"] = int(sale_price)
+        if description is not None:
+            origin_product["detailContent"] = description
+        body: dict[str, Any] = {
+            "originProduct": origin_product,
+            "smartstoreChannelProduct": current["smartstoreChannelProduct"],
+        }
+        if "windowChannelProduct" in current:
+            body["windowChannelProduct"] = current["windowChannelProduct"]
+
+        path = ORIGIN_PRODUCT_GET_PATH_TMPL.format(origin_product_no=platform_origin_product_id)
+        response = self._request_with_retry("PUT", path, headers={"Authorization": f"Bearer {access_token}"}, json=body)
+        raise_for_status("naver", response.status_code)
+        with external_call("naver"):
+            payload = response.json()
+            origin_product_no = payload.get("originProductNo")
+        accepted = bool(origin_product_no)
+        return ProductSyncActionResult(
+            accepted=accepted, platform_result_code="SUCCESS" if accepted else "PARSE_FAILED"
+        )
+
+    def fetch_registration_status(self, platform_product_id: str) -> dict[str, Any]:
+        """네이버는 등록 응답이 원상품번호+채널상품번호를 동기적으로 모두 돌려주므로
+        (create_product 참고), 이 조회는 옵션 단위 식별자 확정 목적이 아니라 화면에
+        현재 판매상태(statusType - 승인대기/판매중 등)를 보여주기 위한 것이다."""
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("naver")
+        client_id, client_secret, seller_id = credentials
+        access_token = self._fetch_access_token(client_id, client_secret, seller_id)
+        current = self._fetch_full_product_for_update(platform_product_id, access_token)
+        status_type = current["originProduct"].get("statusType")
+        return {"status_name": str(status_type) if status_type else None, "channel_option_ids": []}
+
+    def _fetch_full_product_for_update(self, origin_product_no: str, access_token: str) -> dict[str, Any]:
+        """GET 원상품 응답 전체(originProduct + smartstoreChannelProduct +
+        선택적 windowChannelProduct)를 그대로 반환한다 - PUT 전체교체 시 바꾸지
+        않는 필드를 보존하기 위해 GET 응답을 그대로 재사용한다(update_product_info
+        참고). _fetch_origin_product()는 originProduct 서브객체만 반환해(재고/
+        판매상태 전송용) 이 목적에는 부족하다."""
+        path = ORIGIN_PRODUCT_GET_PATH_TMPL.format(origin_product_no=origin_product_no)
+        response = self._request_with_retry("GET", path, headers={"Authorization": f"Bearer {access_token}"})
+        raise_for_status("naver", response.status_code)
+        with external_call("naver"):
+            payload = response.json()
+        origin_product = payload.get("originProduct")
+        smartstore_channel_product = payload.get("smartstoreChannelProduct")
+        if not origin_product or not smartstore_channel_product:
+            raise MarketplaceExternalAPIError("naver", "PARSE_FAILED", False, http_status=response.status_code)
+        result: dict[str, Any] = {
+            "originProduct": dict(origin_product),
+            "smartstoreChannelProduct": dict(smartstore_channel_product),
+        }
+        window = payload.get("windowChannelProduct")
+        if window is not None:
+            result["windowChannelProduct"] = dict(window)
+        return result
 
     def _put_change_status(
         self, origin_product_no: str, access_token: str, status_type: str, stock_quantity: Optional[int] = None

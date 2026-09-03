@@ -44,6 +44,9 @@ from integrations.malls.base_mall_connector import (
     SALE_STATUS_ON_SALE,
     SALE_STATUS_SUSPENDED,
     BaseMallConnector,
+    CategoryRequirement,
+    CategoryRequirements,
+    ProductCreateResult,
     ProductSyncActionResult,
     ShipmentSubmitResult,
 )
@@ -182,6 +185,111 @@ QUANTITY_PATH_TMPL = (
 SALES_STOP_PATH_TMPL = "/v2/providers/seller_api/apis/api/v1/marketplace/vendor-items/{vendor_item_id}/sales/stop"
 SALES_RESUME_PATH_TMPL = "/v2/providers/seller_api/apis/api/v1/marketplace/vendor-items/{vendor_item_id}/sales/resume"
 
+# --- 신규 상품 등록 (상용 ERP 확장 3단계, 두 번째 묶음) ---
+# 공식 문서(developers.coupang.com/hc/en-us/articles/360033877853-Product-Creation,
+# 2026-09 조회) 확인 사항:
+#   POST /v2/providers/seller_api/apis/api/v1/marketplace/seller-products
+#   최상위 필수: displayCategoryCode, sellerProductName, vendorId, saleStartedAt,
+#   saleEndedAt, deliveryMethod, deliveryCompanyCode, deliveryChargeType,
+#   deliveryCharge, freeShipOverAmount, deliveryChargeOnReturn, remoteAreaDeliverable,
+#   unionDeliveryType, returnCenterCode, returnChargeName, companyContactNumber,
+#   returnZipCode, returnAddress, returnAddressDetail, returnCharge,
+#   outboundShippingPlaceCode, vendorUserId, requested(bool), images(배열, 최소
+#   REPRESENTATION 1장), items(배열, 최소 1개).
+#   items[] 필수: itemName, originalPrice, salePrice, maximumBuyCount,
+#   maximumBuyForPerson, maximumBuyForPersonPeriod, outboundShippingTimeDay,
+#   unitCount, adultOnly, taxType, parallelImported, overseasPurchased, pccNeeded.
+#   images[] 필수: imageOrder, imageType(REPRESENTATION 최소 1장), cdnPath 또는
+#   vendorPath 중 하나(http://로 시작하면 쿠팡 CDN으로 자동 다운로드된다).
+#   카테고리별 필수 속성/상품정보제공고시/인증정보는 정적으로 고정돼 있지 않고
+#   카테고리마다 달라, 등록 전 "카테고리 메타정보 조회" API로 실제 조회해야 한다
+#   (fetch_category_requirements 참고) - 추측/하드코딩하지 않는다.
+#   응답: {"code","message","data":{"code":"SUCCESS"|"ERROR","message","data":
+#   <sellerProductId:Long>}} (이중 래핑 - 공식 문서 응답 예시 원문 확인). 중요:
+#   이 응답은 sellerProductId(상품 단위)만 돌려주고, ProductPlatformMap에 필요한
+#   옵션 단위 식별자(vendorItemId)는 승인 완료 후 별도 조회(Querying product API)로만
+#   확인할 수 있다 - 그래서 이 커넥터는 등록 성공 시 channel_option_id를 채우지
+#   않는다(추측 금지, services.product_publish_service 참고).
+CREATE_PRODUCT_PATH = "/v2/providers/seller_api/apis/api/v1/marketplace/seller-products"
+# 카테고리 메타정보 조회(공식 문서: developers.coupangcorp.com/hc/en-us/articles/
+# 360034035713-Category-Metadata-Query, 2026-09 조회) - attributes[]/
+# noticeCategories[].noticeCategoryDetailNames[]/certifications[] 각각의 required
+# 필드가 "MANDATORY"/"OPTIONAL"(그 외 문서상 별도 값도 있음, "MANDATORY"만 필수로
+# 취급)로 내려온다.
+CATEGORY_METADATA_PATH_TMPL = (
+    "/v2/providers/seller_api/apis/api/v1/marketplace/meta/category-related-metas/display-category-codes/{code}"
+)
+# 상품 조회(Querying product, 공식 문서 확인 - 등록/수정과 동일한 리소스 경로에 GET) -
+# 승인 완료 후 이 조회로만 vendorItemId(옵션 단위 식별자)가 확정된다.
+PRODUCT_QUERY_PATH_TMPL = "/v2/providers/seller_api/apis/api/v1/marketplace/seller-products/{seller_product_id}"
+
+#  sellerProductName은 draft.name, vendorId는 자격증명에서 채워지므로 이 목록에
+# 넣지 않는다(operator가 channel_fields에 직접 입력하는 항목만 나열).
+_COUPANG_TOP_LEVEL_REQUIRED_FIELDS = (
+    "saleStartedAt",
+    "saleEndedAt",
+    "deliveryMethod",
+    "deliveryCompanyCode",
+    "deliveryChargeType",
+    "deliveryCharge",
+    "freeShipOverAmount",
+    "deliveryChargeOnReturn",
+    "remoteAreaDeliverable",
+    "unionDeliveryType",
+    "returnCenterCode",
+    "returnChargeName",
+    "companyContactNumber",
+    "returnZipCode",
+    "returnAddress",
+    "returnAddressDetail",
+    "returnCharge",
+    "outboundShippingPlaceCode",
+    "vendorUserId",
+)
+#  salePrice/maximumBuyCount는 draft.sale_price/stock_quantity에서 채워지므로
+# (create_product에서 덮어쓴다) 이 목록에 넣지 않는다 - _validate_coupang_publish_draft
+# 가 그 두 필드는 draft 레벨에서 별도로 검사한다.
+_COUPANG_ITEM_REQUIRED_FIELDS = (
+    "itemName",
+    "originalPrice",
+    "maximumBuyForPerson",
+    "maximumBuyForPersonPeriod",
+    "outboundShippingTimeDay",
+    "unitCount",
+    "adultOnly",
+    "taxType",
+    "parallelImported",
+    "overseasPurchased",
+)
+
+
+def _validate_coupang_publish_draft(draft: dict[str, Any]) -> list[str]:
+    """공식 계약상 확인된 필수 항목이 비어 있는지 검사해 누락 목록을 반환한다(값
+    자체는 검증하지 않는다 - 카테고리별 필수 속성은 호출부가 별도로 검사한다)."""
+    missing: list[str] = []
+    if not draft.get("name"):
+        missing.append("name(sellerProductName)")
+    if draft.get("sale_price") is None:
+        missing.append("sale_price")
+    image_urls = draft.get("image_urls") or []
+    if not image_urls:
+        missing.append("image_urls(대표이미지 최소 1장 필요)")
+
+    cf = draft.get("channel_fields") or {}
+    for field in _COUPANG_TOP_LEVEL_REQUIRED_FIELDS:
+        if cf.get(field) in (None, ""):
+            missing.append(f"channel_fields.{field}")
+    if cf.get("requested") is None:
+        missing.append("channel_fields.requested")
+
+    item = cf.get("item") or {}
+    for field in _COUPANG_ITEM_REQUIRED_FIELDS:
+        if item.get(field) in (None, ""):
+            missing.append(f"channel_fields.item.{field}")
+    if draft.get("stock_quantity") is None:
+        missing.append("stock_quantity(maximumBuyCount)")
+    return missing
+
 
 class CoupangConnector(BaseMallConnector):
     platform_code = "coupang"
@@ -196,6 +304,12 @@ class CoupangConnector(BaseMallConnector):
     supports_cancellation_lookup_by_order = True
     supports_inventory_update = True
     supports_sale_status_update = True
+    # 등록 접수 + 카테고리 메타 기반 필수값 차단 + 심사상태 조회까지만 지원한다 -
+    # 등록 응답이 옵션 단위 식별자(vendorItemId)를 돌려주지 않아(모듈 상단
+    # CREATE_PRODUCT_PATH 주석 참고) ProductPlatformMap 자동 생성과 그에 따른
+    # 정보수정(update_product_info)은 이번 라운드 범위 밖이다(다음 단계로 이월) -
+    # supports_product_info_update는 base 기본값(False)을 그대로 상속한다.
+    supports_product_create = True
 
     def __init__(
         self, session: Any = None, platform_id: Optional[int] = None, http_client: Optional[httpx.Client] = None
@@ -386,6 +500,138 @@ class CoupangConnector(BaseMallConnector):
             payload = response.json()
             code = payload.get("code")
         return ProductSyncActionResult(accepted=(code == "SUCCESS"), platform_result_code=str(code))
+
+    def fetch_category_requirements(self, category_code: str) -> CategoryRequirements:
+        """카테고리 메타정보 조회(모듈 상단 CATEGORY_METADATA_PATH_TMPL 주석의 공식
+        문서 근거 참고) - 이 category_code(displayCategoryCode)로 등록 시 채널이
+        실제로 요구하는 필수 속성/상품정보제공고시/인증정보 항목을 조회한다."""
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("coupang")
+        access_key, secret_key, _vendor_id = credentials
+        path = CATEGORY_METADATA_PATH_TMPL.format(code=category_code)
+        authorization = self._authorization(access_key, secret_key, "GET", path, "")
+        response = self._request_with_retry("GET", path, headers={"Authorization": authorization})
+        raise_for_status("coupang", response.status_code)
+        with external_call("coupang"):
+            payload = response.json()
+            data = payload.get("data") or {}
+        attributes = [
+            CategoryRequirement(name=a["attributeTypeName"], mandatory=a.get("required") == "MANDATORY")
+            for a in data.get("attributes", []) or []
+            if a.get("attributeTypeName")
+        ]
+        notices = [
+            CategoryRequirement(
+                name=detail["noticeCategoryDetailName"], mandatory=detail.get("required") == "MANDATORY"
+            )
+            for category in data.get("noticeCategories", []) or []
+            for detail in category.get("noticeCategoryDetailNames", []) or []
+            if detail.get("noticeCategoryDetailName")
+        ]
+        certifications = [
+            CategoryRequirement(name=c["certificationType"], mandatory=c.get("required") == "MANDATORY")
+            for c in data.get("certifications", []) or []
+            if c.get("certificationType")
+        ]
+        return CategoryRequirements(attributes=attributes, notices=notices, certifications=certifications)
+
+    def create_product(self, draft_snapshot: dict[str, Any]) -> ProductCreateResult:
+        """옵션 조합 없는 단순 신규 상품을 등록 접수한다(모듈 상단 CREATE_PRODUCT_PATH
+        주석의 공식 스펙 근거 참고). requested=false로 접수하면(모듈 docstring 참고)
+        승인 요청 없이 저장만 된다 - channel_fields.requested를 운영자가 직접
+        결정하도록 그대로 전달한다(자동으로 승인 요청하지 않는다는 뜻은 아니다 -
+        운영자가 True를 입력하면 그대로 True로 보낸다)."""
+        category_code = draft_snapshot.get("category_code")
+        if not category_code:
+            raise ValueError("category_code(displayCategoryCode)가 비어 있습니다.")
+        core_missing = _validate_coupang_publish_draft(draft_snapshot)
+        requirements = self.fetch_category_requirements(category_code)
+        cf = draft_snapshot.get("channel_fields") or {}
+        provided_category_values = cf.get("category_attribute_values") or {}
+        category_missing = [
+            f"category_attribute_values.{name}"
+            for name in requirements.mandatory_names()
+            if name not in provided_category_values
+        ]
+        missing = core_missing + category_missing
+        if missing:
+            raise ValueError(
+                f"쿠팡 상품 등록에 필요한 항목이 비어 있습니다(카테고리={category_code}, 추측 금지): "
+                + ", ".join(missing)
+            )
+
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("coupang")
+        access_key, secret_key, vendor_id = credentials
+
+        image_urls: list[str] = draft_snapshot["image_urls"]
+        images = [{"imageOrder": 0, "imageType": "REPRESENTATION", "vendorPath": image_urls[0]}]
+        images.extend(
+            {"imageOrder": i, "imageType": "DETAIL", "vendorPath": url} for i, url in enumerate(image_urls[1:], start=1)
+        )
+        item = dict(cf["item"])
+        item["salePrice"] = int(draft_snapshot["sale_price"])
+        item["maximumBuyCount"] = int(draft_snapshot["stock_quantity"])
+        attributes = [
+            {"attributeTypeName": name, "attributeValueName": str(value)}
+            for name, value in provided_category_values.items()
+        ]
+        if attributes:
+            item["attributes"] = attributes
+        item["images"] = images
+        items = [item]
+
+        body: dict[str, Any] = {"displayCategoryCode": category_code, "sellerProductName": draft_snapshot["name"]}
+        for field in _COUPANG_TOP_LEVEL_REQUIRED_FIELDS:
+            body[field] = cf[field]
+        body["vendorId"] = vendor_id
+        body["requested"] = bool(cf["requested"])
+        body["images"] = images
+        body["items"] = items
+
+        path = CREATE_PRODUCT_PATH
+        authorization = self._authorization(access_key, secret_key, "POST", path, "")
+        response = self._request_with_retry(
+            "POST",
+            path,
+            headers={"Authorization": authorization, "Content-Type": "application/json;charset=UTF-8"},
+            json_body=body,
+        )
+        raise_for_status("coupang", response.status_code)
+        with external_call("coupang"):
+            payload = response.json()
+            inner = payload.get("data") or {}
+            code = inner.get("code")
+            seller_product_id = inner.get("data")
+        accepted = code == "SUCCESS" and seller_product_id is not None
+        return ProductCreateResult(
+            accepted=accepted,
+            platform_result_code=str(code),
+            channel_product_id=str(seller_product_id) if seller_product_id is not None else None,
+            channel_option_id=None,  # 승인 후 별도 조회 필요(모듈 docstring 참고) - 추측하지 않는다.
+        )
+
+    def fetch_registration_status(self, platform_product_id: str) -> dict[str, Any]:
+        """등록 접수된 상품(sellerProductId)의 심사/승인 상태를 조회한다(모듈 상단
+        PRODUCT_QUERY_PATH_TMPL 주석 참고). 승인이 끝나야 items[].vendorItemId가
+        채워진다 - 그 전에는 channel_option_ids를 빈 목록으로 둔다(추측 금지)."""
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("coupang")
+        access_key, secret_key, _vendor_id = credentials
+        path = PRODUCT_QUERY_PATH_TMPL.format(seller_product_id=platform_product_id)
+        authorization = self._authorization(access_key, secret_key, "GET", path, "")
+        response = self._request_with_retry("GET", path, headers={"Authorization": authorization})
+        raise_for_status("coupang", response.status_code)
+        with external_call("coupang"):
+            payload = response.json()
+            data = payload.get("data") or {}
+        items = data.get("items") or []
+        vendor_item_ids = [str(it["vendorItemId"]) for it in items if it.get("vendorItemId") is not None]
+        status_name = data.get("statusName")
+        return {"status_name": str(status_name) if status_name else None, "channel_option_ids": vendor_item_ids}
 
     # --- 실제 API 연동 ---
 

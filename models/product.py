@@ -14,7 +14,7 @@ order_items.cost_price_snapshot에 스냅샷으로 확정되어 이후 원가가
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Numeric, String, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from models.base import Base, SoftDeleteMixin, TimestampMixin, utcnow
@@ -157,6 +157,56 @@ class ProductCostHistory(Base):
     created_by: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
 
     product_option: Mapped["ProductOption"] = relationship(back_populates="cost_history")
+
+
+class ProductPublishDraft(Base, TimestampMixin):
+    """상용 ERP 확장(3단계, 두 번째 묶음) - 채널에 아직 등록되지 않은 SKU의 신규
+    등록 초안. product_platform_map은 "이미 등록된" 외부 식별자를 담는 테이블이라,
+    등록 전(외부 ID가 없는) 상태를 표현할 곳이 따로 필요해 이 테이블을 둔다.
+
+    저장 가능한 초안과 전송 가능한 완성본을 구분한다: 이 테이블의 컬럼은 전부
+    nullable이다(미입력 항목이 있어도 자유롭게 저장할 수 있다) - 실제 전송 가능
+    여부는 저장 시점이 아니라 전송 접수 시점에 커넥터가 공식 계약 기준으로
+    검증한다(카테고리·제조사·원산지·인증정보·배송비·반품지·판매가격 등을 추측하거나
+    임의 기본값으로 채우지 않는다).
+
+    channel_fields_json: 채널마다 계약이 크게 달라(배송/반품/원산지/상품정보제공고시/
+    카테고리별 필수 속성 등) 공통 컬럼으로 정규화하기보다, 공식 필드명을 키로 쓰는
+    JSON 텍스트로 저장한다 - 운영자가 입력한 값을 그대로 보존하고, 커넥터가 전송
+    직전에 그 키 목록만으로 "필수 항목이 다 채워졌는가"를 검증한다(값 자체를
+    추측하지 않는다).
+
+    (product_option_id, platform_id) 유니크 - 같은 SKU를 같은 채널에 두 번 등록
+    시도하지 않도록 초안도 하나만 존재한다(등록 성공 후에도 이 행은 이력으로
+    남긴다 - product_platform_map 매핑이 이미 있으면 재등록 자체를 커넥터가
+    차단한다)."""
+
+    __tablename__ = "product_publish_drafts"
+    __table_args__ = (UniqueConstraint("product_option_id", "platform_id", name="uq_product_publish_draft"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    product_option_id: Mapped[int] = mapped_column(ForeignKey("product_options.id"), nullable=False)
+    platform_id: Mapped[int] = mapped_column(ForeignKey("platforms.id"), nullable=False)
+    name: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    sale_price: Mapped[Optional[float]] = mapped_column(Numeric(14, 2), nullable=True)
+    description_html: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # 네이버: leafCategoryId / 쿠팡: displayCategoryCode - 의미가 달라 텍스트로만 저장.
+    category_code: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    # JSON 배열(문자열 목록) - 첫 번째가 대표이미지. 채널이 허용하는 URL만(로컬 경로/
+    # file:// 금지 - 서비스 계층에서 검증).
+    image_urls_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    stock_quantity: Mapped[Optional[int]] = mapped_column(nullable=True)
+    channel_fields_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # 이 SKU가 이미 이 채널에 등록되어 있는데(product_platform_map 존재) 초안을
+    # 실수로 다시 전송하지 않도록, 등록 성공 확인 시각을 남긴다(재등록 차단 근거).
+    registered_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # 쿠팡처럼 등록 응답이 상품단위 식별자만 반환하고 옵션단위 식별자(vendorItemId)는
+    # 승인 후 별도 조회가 필요한 채널을 위한 임시 보관 - 확인되지 않은 옵션단위
+    # 식별자를 추측해 product_platform_map에 넣지 않기 위함(모듈 docstring 참고).
+    pending_platform_product_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
+    product_option: Mapped["ProductOption"] = relationship()
+    platform: Mapped["Platform"] = relationship()  # type: ignore[name-defined]
 
 
 class UnmatchedPlatformItem(Base):

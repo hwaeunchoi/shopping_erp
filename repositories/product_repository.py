@@ -18,6 +18,7 @@ from models.product import (
     ProductImage,
     ProductOption,
     ProductPlatformMap,
+    ProductPublishDraft,
     UnmatchedPlatformItem,
 )
 from repositories.base_repository import BaseRepository
@@ -165,6 +166,17 @@ class ProductPlatformMapRepository(BaseRepository[ProductPlatformMap]):
             ProductPlatformMap.platform_id == platform_id, ProductPlatformMap.platform_product_id == platform_product_id
         )
         return list(self.session.execute(stmt).scalars().all())
+
+
+class ProductPublishDraftRepository(BaseRepository[ProductPublishDraft]):
+    def __init__(self, session: Session) -> None:
+        super().__init__(session, ProductPublishDraft)
+
+    def get_by_option_and_platform(self, product_option_id: int, platform_id: int) -> Optional[ProductPublishDraft]:
+        stmt = select(ProductPublishDraft).where(
+            ProductPublishDraft.product_option_id == product_option_id, ProductPublishDraft.platform_id == platform_id
+        )
+        return self.session.execute(stmt).scalar_one_or_none()
 
 
 class ProductImageRepository(BaseRepository[ProductImage]):

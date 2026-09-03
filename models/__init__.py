@@ -32,7 +32,14 @@ from models.platform import Platform, PlatformFeeRule  # noqa: F401
 from models.customer import Customer  # noqa: F401
 
 # 상품/공급처/재고
-from models.product import Product, ProductOption, ProductImage, ProductPlatformMap, ProductCostHistory  # noqa: F401
+from models.product import (  # noqa: F401
+    Product,
+    ProductOption,
+    ProductImage,
+    ProductPlatformMap,
+    ProductCostHistory,
+    ProductPublishDraft,
+)
 from models.supplier import Supplier, SupplierContact, ProductSupplierMap  # noqa: F401
 from models.channel_product import ChannelProduct, ChannelProductComponent  # noqa: F401
 from models.purchase_order import PurchaseOrder, PurchaseOrderItem  # noqa: F401
@@ -69,6 +76,7 @@ from models.integration_sync import (  # noqa: F401
     ExternalCommand,
     ExternalCommandLineResult,
     OrderStatusConflict,
+    ProductPublishCommandDetail,
     ProductSyncCommandDetail,
 )
 
@@ -107,6 +115,7 @@ __all__ = [
     "ProductImage",
     "ProductPlatformMap",
     "ProductCostHistory",
+    "ProductPublishDraft",
     "Supplier",
     "SupplierContact",
     "ProductSupplierMap",
@@ -149,5 +158,6 @@ __all__ = [
     "ExternalCommand",
     "ExternalCommandLineResult",
     "OrderStatusConflict",
+    "ProductPublishCommandDetail",
     "ProductSyncCommandDetail",
 ]

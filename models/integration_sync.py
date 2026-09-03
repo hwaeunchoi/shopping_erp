@@ -32,7 +32,7 @@ worker가 뒤늦게 다른 worker의 결과를 덮어쓰는 것을 막는다. �
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from models.base import Base, TimestampMixin
@@ -135,6 +135,35 @@ class ProductSyncCommandDetail(Base):
     product_platform_map_id: Mapped[int] = mapped_column(ForeignKey("product_platform_map.id"), nullable=False)
     target_quantity: Mapped[Optional[int]] = mapped_column(nullable=True)  # INVENTORY_UPDATE 전용
     target_sale_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)  # SALE_STATUS_UPDATE 전용
+    # PRODUCT_INFO_UPDATE 전용(상용 ERP 확장 3단계 두 번째 묶음) - 셋 다 Optional인
+    # 이유: 상품명/판매가/상세설명 중 실제로 바뀐 값만 채널에 보낸다(안 바뀐 필드는
+    # None으로 두어 커넥터가 "채널의 현재값을 그대로 보존"하도록 신호한다 - 전체교체형
+    # API에 빈 값/0/null로 덮어써 지우는 것을 방지).
+    target_name: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    target_sale_price: Mapped[Optional[float]] = mapped_column(Numeric(14, 2), nullable=True)
+    target_description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class ProductPublishCommandDetail(Base):
+    """ExternalCommand(command_type == PRODUCT_CREATE)의 확정된 등록 스냅샷 - 상용
+    ERP 확장(3단계, 두 번째 묶음). ProductPublishDraft는 운영자가 계속 편집할 수
+    있는 가변 초안이라, 명령 접수(enqueue) 시점의 값을 이 테이블에 얼려 둔다 -
+    이후 초안을 편집해도 이미 대기 중인 명령이 보내는 값은 바뀌지 않는다(재시도는
+    "정확히 같은 요청"의 반복이어야 한다 - services.product_sync_dispatch_service의
+    ProductSyncCommandDetail과 동일 원칙).
+
+    snapshot_json에는 ProductPublishDraft의 모든 필드(name/sale_price/
+    description_html/category_code/image_urls_json/stock_quantity/
+    channel_fields_json)를 그대로 JSON 직렬화해 담는다 - 필드가 채널마다 크게
+    달라 개별 컬럼으로 정규화하지 않는다(draft와 동일한 이유)."""
+
+    __tablename__ = "product_publish_command_details"
+    __table_args__ = (Index("uq_product_publish_command_detail", "command_id", unique=True),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    command_id: Mapped[int] = mapped_column(ForeignKey("external_commands.id"), nullable=False)
+    draft_id: Mapped[int] = mapped_column(ForeignKey("product_publish_drafts.id"), nullable=False)
+    snapshot_json: Mapped[str] = mapped_column(Text, nullable=False)
 
 
 class OrderStatusConflict(Base, TimestampMixin):

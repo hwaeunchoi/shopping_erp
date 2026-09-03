@@ -16,6 +16,7 @@ from models.integration_sync import (
     ExternalCommand,
     ExternalCommandLineResult,
     OrderStatusConflict,
+    ProductPublishCommandDetail,
     ProductSyncCommandDetail,
 )
 
@@ -347,4 +348,22 @@ class ProductSyncCommandDetailRepository:
     def get_by_command_id(self, command_id: int) -> Optional[ProductSyncCommandDetail]:
         return self.session.execute(
             select(ProductSyncCommandDetail).where(ProductSyncCommandDetail.command_id == command_id)
+        ).scalar_one_or_none()
+
+
+class ProductPublishCommandDetailRepository:
+    """ExternalCommand(command_type == PRODUCT_CREATE)의 확정된 등록 스냅샷
+    (models.integration_sync.ProductPublishCommandDetail)."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def add(self, detail: ProductPublishCommandDetail) -> ProductPublishCommandDetail:
+        self.session.add(detail)
+        self.session.flush()
+        return detail
+
+    def get_by_command_id(self, command_id: int) -> Optional[ProductPublishCommandDetail]:
+        return self.session.execute(
+            select(ProductPublishCommandDetail).where(ProductPublishCommandDetail.command_id == command_id)
         ).scalar_one_or_none()

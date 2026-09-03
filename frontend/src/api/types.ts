@@ -123,6 +123,27 @@ export interface ProductSyncExternalCommand {
   completed_at: string | null
 }
 
+// 상용 ERP 확장(3단계, 두 번째 묶음) - 옵션 조합 없는 단순 상품 신규 등록 초안.
+export interface ProductPublishDraft {
+  id: number
+  product_option_id: number
+  platform_id: number
+  name: string | null
+  sale_price: number | null
+  description_html: string | null
+  category_code: string | null
+  image_urls: string[]
+  stock_quantity: number | null
+  channel_fields: Record<string, unknown>
+  registered_at: string | null
+  pending_platform_product_id: string | null
+}
+
+export interface RegistrationStatus {
+  status_name: string | null
+  channel_option_ids: string[]
+}
+
 export interface ProductPlatformMapCreate {
   platform_id: number
   platform_option_id: string

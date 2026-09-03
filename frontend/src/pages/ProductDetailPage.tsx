@@ -13,8 +13,10 @@ import type {
   ProductOptionDetail,
   ProductOptionUpdate,
   ProductPlatformMap,
+  ProductPublishDraft,
   ProductSyncCommand,
   ProductSyncExternalCommand,
+  RegistrationStatus,
   SaleStatusValue,
 } from '../api/types'
 
@@ -376,10 +378,14 @@ const SYNC_STATUS_LABELS: Record<string, string> = {
 function ProductSyncControls({ mapping }: { mapping: ProductPlatformMap }) {
   const [quantity, setQuantity] = useState('')
   const [saleStatus, setSaleStatus] = useState<SaleStatusValue>('ON_SALE')
+  const [infoName, setInfoName] = useState('')
+  const [infoPrice, setInfoPrice] = useState('')
+  const [infoDescription, setInfoDescription] = useState('')
   const [command, setCommand] = useState<ProductSyncExternalCommand | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [isSubmittingQty, setIsSubmittingQty] = useState(false)
   const [isSubmittingStatus, setIsSubmittingStatus] = useState(false)
+  const [isSubmittingInfo, setIsSubmittingInfo] = useState(false)
 
   const pollCommand = async (commandId: number) => {
     try {
@@ -426,6 +432,35 @@ function ProductSyncControls({ mapping }: { mapping: ProductPlatformMap }) {
     }
   }
 
+  const handleUpdateInfo = async (e: FormEvent) => {
+    e.preventDefault()
+    if (!infoName && !infoPrice && !infoDescription) {
+      setError('수정할 항목(상품명/판매가/상세설명)을 하나 이상 입력하세요.')
+      return
+    }
+    if (
+      !window.confirm(
+        '입력한 항목만 채널에 전송됩니다(빈 항목은 채널의 현재값을 그대로 유지). 전송하시겠습니까?',
+      )
+    ) {
+      return
+    }
+    setError(null)
+    setIsSubmittingInfo(true)
+    try {
+      const result = await api.post<ProductSyncCommand>(`/api/products/platform-map/${mapping.id}/update-info`, {
+        name: infoName || null,
+        sale_price: infoPrice ? Number(infoPrice) : null,
+        description: infoDescription || null,
+      })
+      await pollCommand(result.command_id)
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '정보 수정 요청 중 오류가 발생했습니다.')
+    } finally {
+      setIsSubmittingInfo(false)
+    }
+  }
+
   return (
     <div>
       <p className="hint-text">채널 현재 값: 확인되지 않음(이 화면은 목표값 전송 전용)</p>
@@ -456,6 +491,264 @@ function ProductSyncControls({ mapping }: { mapping: ProductPlatformMap }) {
           {isSubmittingStatus ? '전송 중...' : '판매상태 전송'}
         </button>
       </div>
+      <form className="inline-form" onSubmit={handleUpdateInfo} style={{ marginBottom: 4, flexWrap: 'wrap' }}>
+        <input value={infoName} onChange={(e) => setInfoName(e.target.value)} placeholder="새 상품명(선택)" />
+        <input
+          type="number"
+          value={infoPrice}
+          onChange={(e) => setInfoPrice(e.target.value)}
+          placeholder="새 판매가(선택)"
+          min={0}
+        />
+        <input
+          value={infoDescription}
+          onChange={(e) => setInfoDescription(e.target.value)}
+          placeholder="새 상세설명(선택)"
+          style={{ minWidth: 200 }}
+        />
+        <button type="submit" disabled={isSubmittingInfo}>
+          {isSubmittingInfo ? '전송 중...' : '정보 수정 전송'}
+        </button>
+      </form>
+      {error && <p className="form-error">{error}</p>}
+      {command && (
+        <p>
+          명령 #{command.id}: <span className="status-badge">{SYNC_STATUS_LABELS[command.status] ?? command.status}</span>
+          {command.error_code && ` (사유: ${command.error_code})`}
+          {' '}
+          <button type="button" onClick={() => pollCommand(command.id)}>상태 새로고침</button>
+        </p>
+      )}
+    </div>
+  )
+}
+
+// 상용 ERP 확장(3단계, 두 번째 묶음) - 옵션 조합 없는 단순 상품의 신규 등록 초안
+// 입력·저장·전송 전 확인·등록 요청·명령 상태 조회를 한 화면에서 처리한다. 공통
+// 핵심 항목(상품명/판매가/상세설명/카테고리/이미지/재고)은 각각 입력란을 두고,
+// 채널마다 크게 다른 배송/반품/원산지/인증/상품정보제공고시 등은 "채널별 세부
+// 계약 정보(JSON)"로 받는다 - 실제 필수 여부 검증은 전송 시점에 커넥터가 공식
+// 계약 기준으로 한다(이 화면은 핵심 항목의 누락만 미리 표시한다).
+function ProductPublishControls({ optionId, platformId }: { optionId: number; platformId: number }) {
+  const [draft, setDraft] = useState<ProductPublishDraft | null>(null)
+  const [name, setName] = useState('')
+  const [salePrice, setSalePrice] = useState('')
+  const [descriptionHtml, setDescriptionHtml] = useState('')
+  const [categoryCode, setCategoryCode] = useState('')
+  const [imageUrls, setImageUrls] = useState('')
+  const [stockQuantity, setStockQuantity] = useState('')
+  const [channelFields, setChannelFields] = useState('{}')
+  const [command, setCommand] = useState<ProductSyncExternalCommand | null>(null)
+  const [registrationStatus, setRegistrationStatus] = useState<RegistrationStatus | null>(null)
+  const [confirmOptionId, setConfirmOptionId] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const [isSavingDraft, setIsSavingDraft] = useState(false)
+  const [isSubmitting, setIsSubmitting] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    api
+      .get<ProductPublishDraft>(`/api/products/options/${optionId}/publish-draft/${platformId}`)
+      .then((d) => {
+        if (cancelled) return
+        setDraft(d)
+        setName(d.name ?? '')
+        setSalePrice(d.sale_price?.toString() ?? '')
+        setDescriptionHtml(d.description_html ?? '')
+        setCategoryCode(d.category_code ?? '')
+        setImageUrls(d.image_urls.join(', '))
+        setStockQuantity(d.stock_quantity?.toString() ?? '')
+        setChannelFields(JSON.stringify(d.channel_fields, null, 2))
+      })
+      .catch(() => {
+        // 초안이 아직 없으면(404) 빈 폼을 그대로 둔다 - 오류로 취급하지 않는다.
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [optionId, platformId])
+
+  const missingCoreFields = [
+    !name && '상품명',
+    !salePrice && '판매가',
+    !descriptionHtml && '상세설명',
+    !categoryCode && '카테고리 코드',
+    !imageUrls.trim() && '이미지',
+    !stockQuantity && '재고수량',
+  ].filter((v): v is string => Boolean(v))
+
+  const pollCommand = async (commandId: number) => {
+    try {
+      setCommand(await api.get<ProductSyncExternalCommand>(`/api/products/sync-commands/${commandId}`))
+    } catch {
+      // 폴링 실패는 조용히 무시한다.
+    }
+  }
+
+  const handleSaveDraft = async (e: FormEvent) => {
+    e.preventDefault()
+    let parsedChannelFields: Record<string, unknown>
+    try {
+      parsedChannelFields = channelFields.trim() ? JSON.parse(channelFields) : {}
+    } catch {
+      setError('채널별 세부 계약 정보(JSON) 형식이 올바르지 않습니다.')
+      return
+    }
+    setError(null)
+    setIsSavingDraft(true)
+    try {
+      const saved = await api.post<ProductPublishDraft>(`/api/products/options/${optionId}/publish-draft`, {
+        platform_id: platformId,
+        name: name || null,
+        sale_price: salePrice ? Number(salePrice) : null,
+        description_html: descriptionHtml || null,
+        category_code: categoryCode || null,
+        image_urls: imageUrls.trim()
+          ? imageUrls
+              .split(',')
+              .map((s) => s.trim())
+              .filter(Boolean)
+          : null,
+        stock_quantity: stockQuantity ? Number(stockQuantity) : null,
+        channel_fields: parsedChannelFields,
+      })
+      setDraft(saved)
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '초안 저장 중 오류가 발생했습니다.')
+    } finally {
+      setIsSavingDraft(false)
+    }
+  }
+
+  const handleSubmit = async () => {
+    if (!draft) return
+    if (missingCoreFields.length > 0) {
+      setError(`아직 저장되지 않은 항목이 있습니다: ${missingCoreFields.join(', ')} (먼저 초안 저장을 누르세요)`)
+      return
+    }
+    if (
+      !window.confirm(
+        `'${draft.name ?? ''}' 상품을 이 초안 내용 그대로 채널에 등록 요청하시겠습니까?\n` +
+          '실제 채널 호출은 잠시 후 비동기로 처리되며, 등록 요청은 취소할 수 없습니다.',
+      )
+    ) {
+      return
+    }
+    setError(null)
+    setIsSubmitting(true)
+    try {
+      const result = await api.post<ProductSyncCommand>(`/api/products/publish-drafts/${draft.id}/submit`, {})
+      await pollCommand(result.command_id)
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '등록 요청 중 오류가 발생했습니다.')
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
+
+  const handleCheckStatus = async () => {
+    if (!draft) return
+    setError(null)
+    try {
+      setRegistrationStatus(
+        await api.get<RegistrationStatus>(`/api/products/publish-drafts/${draft.id}/registration-status`),
+      )
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '심사상태 조회 중 오류가 발생했습니다.')
+    }
+  }
+
+  const handleConfirmMapping = async () => {
+    if (!draft || !confirmOptionId) return
+    if (!window.confirm(`옵션 식별자 '${confirmOptionId}'로 매핑을 확정하시겠습니까? 확정 후에는 되돌릴 수 없습니다.`)) {
+      return
+    }
+    setError(null)
+    try {
+      await api.post(`/api/products/publish-drafts/${draft.id}/confirm-mapping`, { channel_option_id: confirmOptionId })
+      setDraft({ ...draft, pending_platform_product_id: null, registered_at: new Date().toISOString() })
+      setRegistrationStatus(null)
+      setConfirmOptionId('')
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '매핑 확정 중 오류가 발생했습니다.')
+    }
+  }
+
+  if (draft?.registered_at) {
+    return (
+      <p className="hint-text">✅ 등록 완료(매핑 생성됨) - {new Date(draft.registered_at).toLocaleString()}</p>
+    )
+  }
+
+  return (
+    <div>
+      <form className="inline-form" onSubmit={handleSaveDraft} style={{ flexWrap: 'wrap', marginBottom: 4 }}>
+        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="상품명" />
+        <input type="number" value={salePrice} onChange={(e) => setSalePrice(e.target.value)} placeholder="판매가" min={0} />
+        <input value={categoryCode} onChange={(e) => setCategoryCode(e.target.value)} placeholder="카테고리 코드" />
+        <input
+          type="number"
+          value={stockQuantity}
+          onChange={(e) => setStockQuantity(e.target.value)}
+          placeholder="등록 재고수량"
+          min={0}
+        />
+        <input
+          value={imageUrls}
+          onChange={(e) => setImageUrls(e.target.value)}
+          placeholder="이미지 URL(쉼표 구분, 첫 번째=대표, http/https만)"
+          style={{ minWidth: 280 }}
+        />
+        <textarea
+          value={descriptionHtml}
+          onChange={(e) => setDescriptionHtml(e.target.value)}
+          placeholder="상세설명(HTML)"
+          rows={2}
+          style={{ minWidth: 280 }}
+        />
+        <textarea
+          value={channelFields}
+          onChange={(e) => setChannelFields(e.target.value)}
+          placeholder="채널별 세부 계약 정보(JSON) - 배송/반품/원산지/인증/상품정보제공고시 등"
+          rows={3}
+          style={{ minWidth: 320 }}
+        />
+        <button type="submit" disabled={isSavingDraft}>
+          {isSavingDraft ? '저장 중...' : '초안 저장'}
+        </button>
+      </form>
+      {missingCoreFields.length > 0 && (
+        <p className="hint-text" style={{ color: '#b45309' }}>입력 필요: {missingCoreFields.join(', ')}</p>
+      )}
+      {draft && (
+        <div style={{ marginBottom: 4 }}>
+          <button type="button" onClick={handleSubmit} disabled={isSubmitting}>
+            {isSubmitting ? '요청 중...' : '채널에 등록 요청'}
+          </button>
+          {draft.pending_platform_product_id && (
+            <>
+              {' '}
+              <button type="button" onClick={handleCheckStatus}>심사상태 조회</button>
+              {registrationStatus && (
+                <span className="hint-text">
+                  {' '}상태: {registrationStatus.status_name ?? '확인되지 않음'}
+                  {registrationStatus.channel_option_ids.length > 0 && (
+                    <>
+                      {' '}옵션 후보: {registrationStatus.channel_option_ids.join(', ')}{' '}
+                      <input
+                        value={confirmOptionId}
+                        onChange={(e) => setConfirmOptionId(e.target.value)}
+                        placeholder="확정할 옵션 식별자"
+                      />
+                      <button type="button" onClick={handleConfirmMapping}>매핑 확정</button>
+                    </>
+                  )}
+                </span>
+              )}
+            </>
+          )}
+        </div>
+      )}
       {error && <p className="form-error">{error}</p>}
       {command && (
         <p>
@@ -633,6 +926,14 @@ function OptionSubDetail({ option, warehousePlatformId }: { option: ProductOptio
             {maps?.length === 0 && <tr><td colSpan={8}>등록된 매핑이 없습니다.</td></tr>}
           </tbody>
         </table>
+
+        <h3>신규 채널 등록(초안)</h3>
+        <p className="hint-text">
+          위 "플랫폼 매핑"은 이미 채널에 등록된 상품을 수동으로 연결하는 기능이고, 아래는 아직
+          등록되지 않은 상품을 채널에 실제로 등록 요청하는 기능이다. 대상 플랫폼 ID는 위 매핑 등록
+          폼의 "플랫폼 ID" 입력값을 그대로 사용한다(현재: {platformId}).
+        </p>
+        <ProductPublishControls key={platformId} optionId={option.id} platformId={platformId} />
 
         <h3>원가 이력</h3>
         <form className="inline-form" onSubmit={handleAddCost}>

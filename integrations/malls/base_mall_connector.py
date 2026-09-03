@@ -79,6 +79,50 @@ class ProductSyncActionResult:
     platform_result_code: Optional[str] = None  # 예: "SUCCESS" / 실패 사유 코드(짧은 문자열)
 
 
+@dataclass
+class ProductCreateResult:
+    """create_product()의 결과 - 상용 ERP 확장(3단계, 두 번째 묶음).
+
+    channel_option_id(옵션 단위 식별자)는 채널이 등록 응답에서 즉시 돌려주는
+    경우에만 채워진다(네이버: channelProductNo). 등록 응답이 상품 단위 식별자만
+    돌려주고 옵션 단위 식별자는 승인 후 별도 조회가 필요한 채널(쿠팡:
+    vendorItemId)은 이 값을 None으로 두고 channel_product_id만 채운다 - 확인되지
+    않은 식별자를 추측해 채우지 않기 위함이다. 호출부(services.
+    product_publish_service)는 channel_option_id가 있을 때만 ProductPlatformMap을
+    즉시 만든다."""
+
+    accepted: bool
+    platform_result_code: Optional[str] = None
+    channel_product_id: Optional[str] = None  # 상품 단위 식별자(네이버 originProductNo / 쿠팡 sellerProductId)
+    channel_option_id: Optional[str] = None  # 옵션 단위 식별자(네이버 channelProductNo). 쿠팡은 항상 None.
+
+
+@dataclass
+class CategoryRequirement:
+    """카테고리가 요구하는 항목 하나 - fetch_category_requirements() 결과 원소.
+    name은 채널이 실제 쓰는 공식 필드/항목명 그대로(추측/번역하지 않음)."""
+
+    name: str
+    mandatory: bool
+
+
+@dataclass
+class CategoryRequirements:
+    """fetch_category_requirements()의 결과 - 특정 카테고리 코드가 등록 시 요구하는
+    속성/상품정보제공고시/인증정보 항목을 채널 API로 실제 조회한 결과다(추측/
+    하드코딩 금지). 서비스 계층은 이 중 mandatory=True인 항목의 name이 초안의
+    channel_fields에 전부 채워져 있는지만 확인한다 - 값 자체는 검증하지 않는다
+    (값의 의미까지 검증하려면 카테고리별 스키마를 전부 하드코딩해야 하므로 이번
+    범위 밖)."""
+
+    attributes: list[CategoryRequirement]
+    notices: list[CategoryRequirement]
+    certifications: list[CategoryRequirement]
+
+    def mandatory_names(self) -> list[str]:
+        return [r.name for r in (*self.attributes, *self.notices, *self.certifications) if r.mandatory]
+
+
 # update_sale_status()의 target_status 값 - 채널 무관 내부 표현(models.integration_sync.
 # ProductSyncCommandDetail 모듈 docstring 참고). "OUTOFSTOCK/품절"은 재고 0에 따른
 # 파생 상태로 보고 여기 포함하지 않는다.
@@ -114,6 +158,11 @@ class BaseMallConnector(ABC):
     # 확장(3단계, 첫 묶음). 신규 상품 등록/전체 상품정보 수정과는 별개 capability다.
     supports_inventory_update: bool = False
     supports_sale_status_update: bool = False
+    # 신규 상품 등록 / 기존 상품의 제한된 정보 수정(상품명·판매가·상세설명) 지원
+    # 여부 - 상용 ERP 확장(3단계, 두 번째 묶음). 옵션 조합 상품 등록/옵션 구조
+    # 변경/대량 등록은 이 capability와 무관하게 이번 범위 밖(항상 미지원).
+    supports_product_create: bool = False
+    supports_product_info_update: bool = False
 
     def _marketplace_code(self) -> str:
         """오류 메시지용 안전한 채널 식별자(Secret/PII 아님). platform_code가 없으면 클래스명."""
@@ -267,6 +316,62 @@ class BaseMallConnector(ABC):
         무관 내부 값 - 모듈 상단 상수 참고). platform_origin_product_id는
         update_inventory()와 동일하게 채널에 따라 필요 여부가 다르다."""
         raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "sale_status_update")
+
+    def fetch_category_requirements(self, category_code: str) -> CategoryRequirements:
+        """이 category_code로 상품을 등록할 때 채널이 요구하는 필수 속성/상품정보
+        제공고시/인증정보 항목을 실제 채널 API로 조회한다(기본: 미지원 오류).
+
+        supports_product_create=True인 커넥터 중, 카테고리별 필수 항목이 정적으로
+        고정되지 않고 조회가 필요한 채널만 오버라이드한다(쿠팡: 카테고리 메타정보
+        조회 API). 필수 항목이 사실상 고정된 채널(네이버의 ETC 고시 템플릿 등)은
+        create_product() 내부에서 직접 검증하고 이 메서드를 쓰지 않아도 된다."""
+        raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "category_requirements_lookup")
+
+    def create_product(self, draft_snapshot: dict[str, Any]) -> ProductCreateResult:
+        """옵션 조합 없는 단순 신규 상품을 채널에 등록한다(기본: 미지원 오류).
+        supports_product_create=True인 커넥터만 오버라이드한다.
+
+        draft_snapshot은 models.integration_sync.ProductPublishCommandDetail에
+        확정 저장된, 명령 접수 시점의 스냅샷이다(호출부가 이후 초안을 편집해도
+        바뀌지 않는다) - 키: name, sale_price, description_html, category_code,
+        image_urls(list[str]), stock_quantity, channel_fields(dict, 채널별 공식
+        필드명을 키로 쓰는 나머지 필수 정보 - 배송/반품/원산지/인증/상품정보
+        제공고시 등). 이 메서드는 필수 항목이 비어 있으면(카테고리·제조자·원산지·
+        인증정보·배송비·반품지·판매가격 등을 추측하거나 임의 기본값으로 채우지
+        않고) ValueError로 명확히 차단해야 한다 - 채널 호출 자체를 하지 않는다."""
+        raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "product_create")
+
+    def update_product_info(
+        self,
+        platform_option_id: str,
+        platform_origin_product_id: Optional[str],
+        name: Optional[str] = None,
+        sale_price: Optional[float] = None,
+        description: Optional[str] = None,
+    ) -> ProductSyncActionResult:
+        """이미 등록된 채널 상품의 상품명/판매가/상세설명 중 주어진 값만 수정한다
+        (기본: 미지원 오류). supports_product_info_update=True인 커넥터만
+        오버라이드한다.
+
+        name/sale_price/description 중 None인 항목은 "바뀌지 않았다"는 뜻이다 -
+        구현체는 채널의 현재값을 그대로 보존해야 하며(빈 값/0/null로 덮어써
+        지우지 않음), 전체교체형 API라면 이 세 필드 외의 다른 필드(이미지/배송/
+        재고/옵션 등)도 채널에서 조회한 현재값을 그대로 재전송해 보존해야 한다.
+        안전하게 보존할 수 없다면(전체 응답 스키마를 신뢰할 수 없는 등) 이
+        메서드를 오버라이드하지 않고 미지원으로 남겨야 한다."""
+        raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "product_info_update")
+
+    def fetch_registration_status(self, platform_product_id: str) -> dict[str, Any]:
+        """상품 단위 식별자(channel_product_id)로 등록 심사/승인 상태를 조회한다
+        (기본: 미지원 오류). supports_product_create=True인 커넥터만 오버라이드한다.
+
+        반환: {"status_name": Optional[str], "channel_option_ids": list[str]}.
+        status_name은 채널 원본 상태 문자열을 그대로 반환한다(이 계층에서 "심사중"/
+        "완료" 등으로 임의 정규화하지 않는다 - 채널마다 상태값 집합이 다르다).
+        channel_option_ids는 승인이 끝나 옵션 단위 식별자가 확정된 경우에만 채운다
+        (그 전에는 빈 목록 - 추측 금지, ProductCreateResult.channel_option_id
+        docstring과 동일 원칙)."""
+        raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "registration_status_lookup")
 
     def fetch_products(self) -> list[dict[str, Any]]:
         """상품 목록을 정규화된 형식으로 조회한다(services.product_sync_service.

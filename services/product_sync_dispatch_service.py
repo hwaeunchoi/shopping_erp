@@ -102,6 +102,7 @@ idempotency_key/lease는 "같은 명령을 두 번 만들거나 두 worker가 �
 이번 범위 밖).
 """
 
+import hashlib
 import logging
 import uuid
 from dataclasses import dataclass
@@ -132,6 +133,13 @@ ConnectorFactory = Callable[[str, Any, Optional[int]], BaseMallConnector]
 TARGET_TYPE = "PRODUCT_PLATFORM_MAP"
 INVENTORY_UPDATE = "INVENTORY_UPDATE"
 SALE_STATUS_UPDATE = "SALE_STATUS_UPDATE"
+# 상용 ERP 확장(3단계, 두 번째 묶음) - 기존 상품의 상품명/판매가/상세설명 중 일부만
+# 수정한다. TARGET_TYPE/target_id(=product_platform_map.id)를 재고/판매상태와
+# 그대로 공유하므로, _resolve_contention_target_ids()의 형제 매핑 대상 확장과
+# exists_other_running_for_targets()의 명령종류 무관 실행중 검사가 별도 수정 없이
+# 이 명령종류에도 그대로 적용된다(같은 외부 대상을 두고 재고/판매상태/정보수정이
+# 서로 겹쳐 실행되지 않는다).
+PRODUCT_INFO_UPDATE = "PRODUCT_INFO_UPDATE"
 
 # 네이버 원상품 API가 문서로 확인한 재고수량 상한(공식 스펙: stockQuantity maximum
 # 99999999) - 쿠팡은 상한이 문서화돼 있지 않으나 ERP 쪽 안전장치로 동일하게 적용한다
@@ -213,6 +221,20 @@ def _validate_sale_status(target_status: str) -> None:
         raise ValueError(f"알 수 없는 target_status입니다: {target_status}")
 
 
+def _validate_info_update_price(sale_price: float) -> None:
+    if isinstance(sale_price, bool) or not isinstance(sale_price, (int, float)):
+        raise ValueError("판매가는 숫자여야 합니다.")
+    if sale_price < 0:
+        raise ValueError("판매가는 0 이상이어야 합니다.")
+
+
+def _info_update_target_repr(name: Optional[str], sale_price: Optional[float], description: Optional[str]) -> str:
+    """PRODUCT_INFO_UPDATE의 idempotency_key에 쓰는 목표값 표현 - description은
+    길어질 수 있어(HTML) 해시로 줄인다(같은 값이면 항상 같은 해시)."""
+    description_hash = hashlib.sha256(description.encode("utf-8")).hexdigest()[:16] if description is not None else None
+    return f"{name}|{sale_price}|{description_hash}"
+
+
 @dataclass
 class ProductSyncOutcome:
     command: ExternalCommand
@@ -232,22 +254,73 @@ class ProductSyncDispatchService:
 
     def enqueue_inventory_update(self, product_platform_map_id: int, target_quantity: int) -> ProductSyncOutcome:
         _validate_quantity(target_quantity)
-        return self._enqueue(product_platform_map_id, INVENTORY_UPDATE, target_quantity, None)
+        return self._enqueue(
+            product_platform_map_id,
+            INVENTORY_UPDATE,
+            str(target_quantity),
+            lambda command, mapping: ProductSyncCommandDetail(
+                command_id=command.id, product_platform_map_id=mapping.id, target_quantity=target_quantity
+            ),
+        )
 
     def enqueue_sale_status_update(self, product_platform_map_id: int, target_status: str) -> ProductSyncOutcome:
         _validate_sale_status(target_status)
-        return self._enqueue(product_platform_map_id, SALE_STATUS_UPDATE, None, target_status)
+        return self._enqueue(
+            product_platform_map_id,
+            SALE_STATUS_UPDATE,
+            target_status,
+            lambda command, mapping: ProductSyncCommandDetail(
+                command_id=command.id, product_platform_map_id=mapping.id, target_sale_status=target_status
+            ),
+        )
+
+    def enqueue_info_update(
+        self,
+        product_platform_map_id: int,
+        name: Optional[str] = None,
+        sale_price: Optional[float] = None,
+        description: Optional[str] = None,
+    ) -> ProductSyncOutcome:
+        """상품명/판매가/상세설명 중 실제로 바뀐 값만 넘긴다 - None인 항목은 커넥터가
+        채널의 현재값을 그대로 보존한다(models.integration_sync.ProductSyncCommandDetail
+        모듈 docstring 참고)."""
+        if name is None and sale_price is None and description is None:
+            raise ValueError("수정할 항목(상품명/판매가/상세설명)이 하나도 없습니다.")
+        if sale_price is not None:
+            _validate_info_update_price(sale_price)
+        target_repr = _info_update_target_repr(name, sale_price, description)
+        return self._enqueue(
+            product_platform_map_id,
+            PRODUCT_INFO_UPDATE,
+            target_repr,
+            lambda command, mapping: ProductSyncCommandDetail(
+                command_id=command.id,
+                product_platform_map_id=mapping.id,
+                target_name=name,
+                target_sale_price=sale_price,
+                target_description=description,
+            ),
+        )
 
     def _enqueue(
         self,
         product_platform_map_id: int,
         command_type: str,
-        target_quantity: Optional[int],
-        target_sale_status: Optional[str],
+        target_repr: str,
+        build_detail: Callable[[ExternalCommand, Any], ProductSyncCommandDetail],
     ) -> ProductSyncOutcome:
-        if not settings.product_channel_sync_enabled:
+        # PRODUCT_INFO_UPDATE(상용 ERP 확장 3단계 두 번째 묶음)는 재고/판매상태와
+        # 별개의 독립 플래그(product_publish_enabled)로 통제한다 - 하나를 켜도
+        # 다른 하나는 여전히 OFF로 남아야 한다(요구사항: "신규 등록·정보 수정은
+        # 별도 기본 OFF 플래그로 제어하고 기존 플래그도 OFF 유지").
+        flag_enabled = (
+            settings.product_publish_enabled
+            if command_type == PRODUCT_INFO_UPDATE
+            else settings.product_channel_sync_enabled
+        )
+        if not flag_enabled:
             raise ProductChannelSyncDisabledError(
-                "재고/판매상태 전송 기능이 비활성화(OFF) 상태입니다 - 실계정 검증 승인 후 활성화해야 합니다."
+                "재고/판매상태/정보수정 전송 기능이 비활성화(OFF) 상태입니다 - 실계정 검증 승인 후 활성화해야 합니다."
             )
         mapping = self.mapping_repo.get_by_id(product_platform_map_id)
         if mapping is None:
@@ -256,7 +329,6 @@ class ProductSyncDispatchService:
         if platform is None:
             raise ProductSyncMappingNotFoundError(f"플랫폼 정보를 찾을 수 없습니다: platform_id={mapping.platform_id}")
 
-        target_repr = target_quantity if command_type == INVENTORY_UPDATE else target_sale_status
         idempotency_key = f"{command_type}:{mapping.id}:{target_repr}"
         existing = self.command_repo.get_by_idempotency_key(idempotency_key)
         if existing is not None:
@@ -268,8 +340,8 @@ class ProductSyncDispatchService:
         # 포함한다(_resolve_contention_target_ids 참고). RUNNING(이미 claim됨)은
         # 여기서 강제 취소하지 않는다(다른 worker가 다루는 중일 수 있어
         # execute_command()의 실행 직전 재확인이 최종 방어선이다). 다른
-        # 명령종류(재고 vs 판매상태)는 서로 독립된 의도라 취소 대상에서 제외한다
-        # (list_active_for_target이 command_type으로 이미 필터링).
+        # 명령종류(재고 vs 판매상태 vs 정보수정)는 서로 독립된 의도라 취소 대상에서
+        # 제외한다(list_active_for_target이 command_type으로 이미 필터링).
         contention_ids = self._resolve_contention_target_ids(mapping)
         for stale in self.command_repo.list_active_for_target(command_type, TARGET_TYPE, contention_ids):
             if stale.status != "RUNNING":
@@ -288,14 +360,7 @@ class ProductSyncDispatchService:
                 trace_id=uuid.uuid4().hex,
             )
         )
-        self.detail_repo.add(
-            ProductSyncCommandDetail(
-                command_id=command.id,
-                product_platform_map_id=mapping.id,
-                target_quantity=target_quantity,
-                target_sale_status=target_sale_status,
-            )
-        )
+        self.detail_repo.add(build_detail(command, mapping))
         return ProductSyncOutcome(command=command, already_processed=False)
 
     # --- 동시성 제어 공통 ---
@@ -326,7 +391,7 @@ class ProductSyncDispatchService:
         command = self.command_repo.get_by_id(command_id)
         if command is None:
             raise ValueError(f"명령을 찾을 수 없습니다: command_id={command_id}")
-        if command.command_type not in (INVENTORY_UPDATE, SALE_STATUS_UPDATE):
+        if command.command_type not in (INVENTORY_UPDATE, SALE_STATUS_UPDATE, PRODUCT_INFO_UPDATE):
             raise ProductSyncCommandTypeMismatchError(
                 f"이 서비스가 다루지 않는 명령종류입니다: command_id={command_id}, "
                 f"command_type={command.command_type}"
@@ -445,7 +510,7 @@ class ProductSyncDispatchService:
                 quantity=detail.target_quantity,
                 platform_origin_product_id=mapping.platform_origin_product_id,
             )
-        else:
+        elif command.command_type == SALE_STATUS_UPDATE:
             if not getattr(connector, "supports_sale_status_update", False):
                 raise MarketplaceCapabilityUnsupportedError(platform_code, "sale_status_update")
             assert detail.target_sale_status is not None
@@ -453,6 +518,16 @@ class ProductSyncDispatchService:
                 platform_option_id=mapping.platform_option_id,
                 target_status=detail.target_sale_status,
                 platform_origin_product_id=mapping.platform_origin_product_id,
+            )
+        else:
+            if not getattr(connector, "supports_product_info_update", False):
+                raise MarketplaceCapabilityUnsupportedError(platform_code, "product_info_update")
+            result = connector.update_product_info(
+                platform_option_id=mapping.platform_option_id,
+                platform_origin_product_id=mapping.platform_origin_product_id,
+                name=detail.target_name,
+                sale_price=detail.target_sale_price,
+                description=detail.target_description,
             )
         if not result.accepted:
             raise ProductSyncRejectedError(platform_code, result.platform_result_code)

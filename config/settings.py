@@ -77,6 +77,17 @@ class Settings(BaseSettings):
     # 이 플래그와 무관하게 이번 묶음 범위 밖이다(docs/COMMERCIAL_ERP_ROADMAP.md 참고).
     product_channel_sync_enabled: bool = False
 
+    # 상용 ERP 확장(3단계, 두 번째 묶음) - 옵션 조합 없는 단순 상품의 신규 등록과
+    # 제한된 정보 수정(상품명/판매가/상세설명)을 자동(scheduler.jobs.
+    # product_publish_dispatch_job) + 수동(POST /api/products/.../publish-draft/
+    # submit, /api/products/platform-map/{id}/update-info) 모두 이 플래그로
+    # 통제한다. False(기본값)면 실제 채널 호출 없이 안전하게 차단된다 - 실계정
+    # 검증 승인 후 운영자가 명시적으로 켜야 한다. 옵션 조합 등록/옵션 구조 변경/
+    # 대량 등록/자동 가격결정/자동 재고배분/다른 채널 추가는 이번 묶음 범위 밖이다
+    # (docs/COMMERCIAL_ERP_ROADMAP.md 참고). 위 product_channel_sync_enabled와는
+    # 별개의 독립 플래그다 - 하나를 켜도 다른 하나는 여전히 OFF로 남는다.
+    product_publish_enabled: bool = False
+
     model_config = SettingsConfigDict(env_file=str(BASE_DIR / ".env"), env_file_encoding="utf-8", extra="ignore")
 
 
