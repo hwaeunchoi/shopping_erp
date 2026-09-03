@@ -77,16 +77,28 @@ class Settings(BaseSettings):
     # 이 플래그와 무관하게 이번 묶음 범위 밖이다(docs/COMMERCIAL_ERP_ROADMAP.md 참고).
     product_channel_sync_enabled: bool = False
 
-    # 상용 ERP 확장(3단계, 두 번째 묶음) - 옵션 조합 없는 단순 상품의 신규 등록과
-    # 제한된 정보 수정(상품명/판매가/상세설명)을 자동(scheduler.jobs.
+    # 상용 ERP 확장(3단계, 두 번째 묶음) - 옵션 조합 없는 단순 상품의 신규 등록
+    # (PRODUCT_CREATE)만 이 플래그로 통제한다. 자동(scheduler.jobs.
     # product_publish_dispatch_job) + 수동(POST /api/products/.../publish-draft/
-    # submit, /api/products/platform-map/{id}/update-info) 모두 이 플래그로
-    # 통제한다. False(기본값)면 실제 채널 호출 없이 안전하게 차단된다 - 실계정
-    # 검증 승인 후 운영자가 명시적으로 켜야 한다. 옵션 조합 등록/옵션 구조 변경/
-    # 대량 등록/자동 가격결정/자동 재고배분/다른 채널 추가는 이번 묶음 범위 밖이다
-    # (docs/COMMERCIAL_ERP_ROADMAP.md 참고). 위 product_channel_sync_enabled와는
-    # 별개의 독립 플래그다 - 하나를 켜도 다른 하나는 여전히 OFF로 남는다.
+    # submit) 모두 대상이다. False(기본값)면 실제 채널 호출 없이 안전하게
+    # 차단된다 - 실계정 검증 승인 후 운영자가 명시적으로 켜야 한다. 옵션 조합
+    # 등록/옵션 구조 변경/대량 등록/자동 가격결정/자동 재고배분/다른 채널 추가는
+    # 이번 묶음 범위 밖이다(docs/COMMERCIAL_ERP_ROADMAP.md 참고). 아래
+    # product_info_update_enabled 및 위 product_channel_sync_enabled와는 완전히
+    # 별개의 독립 플래그다 - 재고 기능을 켰다고 신규 등록까지, 신규 등록을
+    # 켰다고 정보수정까지 자동으로 허용되지 않는다(하나를 켜도 나머지 둘은
+    # 여전히 OFF로 남는다 - 켜져도 정보수정을 자동 허용해서는 안 된다는
+    # 감사 지적 반영).
     product_publish_enabled: bool = False
+
+    # 상용 ERP 확장(3단계, 두 번째 묶음) - 기존 채널 상품의 상품명/판매가/상세설명
+    # 중 일부만 수정하는 PRODUCT_INFO_UPDATE 명령만 이 플래그로 통제한다.
+    # product_channel_sync_enabled(재고/판매상태)·product_publish_enabled(신규
+    # 등록) 어느 쪽을 켜도 이 플래그는 그대로 OFF로 남는다 - 세 플래그 모두
+    # 서로 독립이다(services.product_sync_dispatch_service._enqueue,
+    # scheduler.jobs.product_sync_dispatch_job._enabled_command_types 참고).
+    # False(기본값)면 실제 채널 호출 없이 안전하게 차단된다.
+    product_info_update_enabled: bool = False
 
     model_config = SettingsConfigDict(env_file=str(BASE_DIR / ".env"), env_file_encoding="utf-8", extra="ignore")
 

@@ -68,12 +68,14 @@ def _enable(monkeypatch):
     from config.settings import settings
 
     monkeypatch.setattr(settings, "product_channel_sync_enabled", True)
-    # PRODUCT_INFO_UPDATE(상용 ERP 확장 3단계 두 번째 묶음)는 별도 독립 플래그로
-    # 통제한다(services.product_sync_dispatch_service._enqueue 참고) - 이 파일의
-    # 나머지 테스트는 "기능이 켜져 있을 때"를 전제하므로 함께 켠다. 플래그가 실제로
-    # 독립적인지는 TestInfoUpdate.test_controlled_by_its_own_flag_independent_of_
-    # inventory_flag가 각각 개별적으로 다시 꺼서 검증한다.
-    monkeypatch.setattr(settings, "product_publish_enabled", True)
+    # PRODUCT_INFO_UPDATE(상용 ERP 확장 3단계 두 번째 묶음)는 재고/판매상태 및
+    # 신규 등록(product_publish_enabled)과도 완전히 독립된 전용 플래그
+    # (product_info_update_enabled)로 통제한다(services.product_sync_dispatch_service.
+    # _enqueue 참고) - 이 파일의 나머지 테스트는 "기능이 켜져 있을 때"를 전제하므로
+    # 함께 켠다. 플래그가 실제로 독립적인지는 TestInfoUpdate.
+    # test_controlled_by_its_own_flag_independent_of_other_flags가 각각 개별적으로
+    # 다시 꺼서 검증한다.
+    monkeypatch.setattr(settings, "product_info_update_enabled", True)
 
 
 class TestDisabledByDefault:
@@ -619,19 +621,46 @@ class TestInfoUpdate:
             svc.enqueue_info_update(platform_map.id)
         assert db_session.query(ExternalCommand).count() == 0
 
-    def test_controlled_by_its_own_flag_independent_of_inventory_flag(self, db_session, platform_map, monkeypatch):
-        """product_publish_enabled는 product_channel_sync_enabled와 별개의 독립
-        플래그다 - 재고/판매상태 플래그가 켜져 있어도(이 파일의 autouse _enable
-        픽스처) 정보수정 전용 플래그가 꺼져 있으면 여전히 차단돼야 하고, 반대로
-        정보수정 플래그만 켜고 재고 플래그를 꺼도 재고 전송은 여전히 차단돼야 한다."""
+    def test_validation_error_message_is_preserved_in_error_code_not_just_class_name(self, db_session, platform_map):
+        """update_product_info()가 ValueError를 던지면(예: 커넥터의 항목별 검증
+        실패) error_code에 "ValueError"라는 클래스명만 남기지 않고 실제 메시지를
+        보존해야 한다 - 실제 클릭 검증으로 발견된 결함(화면에 "사유: ValueError"만
+        보이면 운영자가 원인을 알 수 없다)."""
+        conn = StubProductConnector(error=ValueError("배송정보가 비어 있습니다: deliveryFeeType"))
+        svc = ProductSyncDispatchService(db_session, connector_factory=_factory(conn))
+        outcome = svc.enqueue_info_update(platform_map.id, name="새이름")
+
+        with pytest.raises(ValueError):
+            svc.execute_command(outcome.command.id)
+
+        db_session.refresh(outcome.command)
+        assert outcome.command.status == "FAILED"
+        assert outcome.command.error_code == "배송정보가 비어 있습니다: deliveryFeeType"
+
+    def test_controlled_by_its_own_flag_independent_of_other_flags(self, db_session, platform_map, monkeypatch):
+        """product_info_update_enabled는 product_channel_sync_enabled(재고/판매
+        상태)·product_publish_enabled(신규 등록) 어느 쪽과도 완전히 독립된 전용
+        플래그다:
+        - 재고/판매상태 플래그가 켜져 있어도(이 파일의 autouse _enable 픽스처)
+          정보수정 전용 플래그가 꺼져 있으면 여전히 차단돼야 한다.
+        - 신규 등록 플래그를 켜는 것만으로도 정보수정이 허용되면 안 된다(감사
+          지적: "신규 등록 플래그와도 독립적으로 검증").
+        - 정보수정 플래그만 켜고 재고 플래그를 꺼도 재고 전송은 여전히 차단돼야
+          하고, 반대로 정보수정은 정상 접수돼야 한다."""
         from config.settings import settings
 
-        monkeypatch.setattr(settings, "product_publish_enabled", False)
+        monkeypatch.setattr(settings, "product_info_update_enabled", False)
         svc = ProductSyncDispatchService(db_session)
         with pytest.raises(ProductChannelSyncDisabledError):
             svc.enqueue_info_update(platform_map.id, name="새이름")
 
+        # 신규 등록 플래그를 켜는 것만으로는 정보수정이 열리지 않아야 한다.
         monkeypatch.setattr(settings, "product_publish_enabled", True)
+        with pytest.raises(ProductChannelSyncDisabledError):
+            svc.enqueue_info_update(platform_map.id, name="새이름")
+        monkeypatch.setattr(settings, "product_publish_enabled", False)
+
+        monkeypatch.setattr(settings, "product_info_update_enabled", True)
         monkeypatch.setattr(settings, "product_channel_sync_enabled", False)
         with pytest.raises(ProductChannelSyncDisabledError):
             svc.enqueue_inventory_update(platform_map.id, 10)

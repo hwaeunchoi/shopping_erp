@@ -143,6 +143,30 @@ def _classify_write_outcome(exc: Exception) -> str:
     return "UNKNOWN"
 
 
+# ExternalCommand.error_code 컬럼 폭(String(500), models.integration_sync 참고)에 맞춘다.
+_ERROR_CODE_MAX_LENGTH = 500
+
+
+def _describe_exception(exc: Exception) -> str:
+    """ExternalCommand.error_code에 담을 안전한 사유 문자열을 만든다.
+
+    capability(MarketplaceCapabilityUnsupportedError)/reason_code
+    (MarketplaceExternalAPIError 등)가 있으면 그 짧은 코드를 우선한다(기존 동작
+    유지). 둘 다 없으면(특히 ValueError - create_product()의 "필수 항목이 비어
+    있습니다: ..." 같은 항목별 안내 메시지) 클래스명 하나로 뭉뚱그리지 않고
+    실제 예외 메시지를 그대로 담는다 - 그렇지 않으면 화면에 "사유: ValueError"만
+    보여 어떤 항목이 비었는지 운영자가 알 수 없다(실제 클릭 검증으로 발견된
+    결함). 원본 응답 전문·Secret이 아니라 이 서비스가 직접 만든 검증 메시지이므로
+    노출해도 안전하다."""
+    code = getattr(exc, "capability", None) or getattr(exc, "reason_code", None)
+    if code:
+        return str(code)
+    message = str(exc)
+    if message:
+        return message[:_ERROR_CODE_MAX_LENGTH]
+    return type(exc).__name__
+
+
 def _retry_backoff(attempt_count: int) -> timedelta:
     idx = min(max(attempt_count, 1), len(RETRY_BACKOFF_MINUTES)) - 1
     return timedelta(minutes=RETRY_BACKOFF_MINUTES[idx])
@@ -387,7 +411,7 @@ class ProductPublishService:
 
     def _mark_after_failure(self, command: ExternalCommand, lease_token: str, exc: Exception) -> None:
         kind = _classify_write_outcome(exc)
-        error_code = getattr(exc, "capability", None) or getattr(exc, "reason_code", None) or type(exc).__name__
+        error_code = _describe_exception(exc)
         now = datetime.now(timezone.utc)
         if kind == "SAFE_RETRY" and command.attempt_count < MAX_ATTEMPTS:
             values: dict[str, Any] = {
@@ -463,15 +487,31 @@ class ProductPublishService:
         return connector.fetch_registration_status(draft.pending_platform_product_id)
 
     def confirm_mapping(self, draft_id: int, channel_option_id: str) -> ProductPlatformMap:
-        """운영자가 check_registration_status() 결과로 직접 확인한 옵션 단위
-        식별자로 매핑을 확정한다 - 이 서비스가 채널 응답에서 자동으로 하나를 골라
-        추측하지 않는다(모듈 docstring 참고 - 승인 후에도 어느 vendorItemId가 이
-        SKU에 대응하는지는 운영자 확인이 필요하다)."""
+        """운영자가 지정한 옵션 단위 식별자로 매핑을 확정한다 - 운영자가 화면에서
+        입력한 값을 그대로 믿지 않고, 이 자리에서 채널에 다시 조회해(재사용:
+        check_registration_status와 동일한 fetch_registration_status) 그 값이
+        실제로 이 초안의 상품(draft.pending_platform_product_id, = 이 platform_id
+        계정으로 조회)에 속한 옵션 식별자 목록에 있는지 서버에서 검증한다 - 화면의
+        "옵션 후보" 목록에 없는 값(오타·다른 상품의 ID 등)은 매핑을 만들지 않고
+        차단한다. 이 서비스가 채널 응답에서 자동으로 하나를 골라 추측하지도
+        않는다(모듈 docstring 참고 - 승인 후에도 어느 vendorItemId가 이 SKU에
+        대응하는지는 운영자가 직접 지정해야 하고, 그 지정값도 검증한다)."""
         draft = self.draft_repo.get_by_id(draft_id)
         if draft is None:
             raise ProductPublishDraftNotFoundError(f"초안을 찾을 수 없습니다: id={draft_id}")
         if not draft.pending_platform_product_id:
             raise ValueError("확정할 상품 단위 식별자가 없습니다.")
+        platform = self.platform_repo.get_by_id(draft.platform_id)
+        if platform is None:
+            raise ProductPublishDraftNotFoundError(f"플랫폼을 찾을 수 없습니다: id={draft.platform_id}")
+        connector = self.connector_factory(platform.connector_class, self.session, platform.id)
+        status_result = connector.fetch_registration_status(draft.pending_platform_product_id)
+        confirmed_option_ids = status_result.get("channel_option_ids") or []
+        if channel_option_id not in confirmed_option_ids:
+            raise ValueError(
+                "이 식별자는 채널이 이 상품(계정)에 대해 실제로 확인해 준 옵션 후보 목록에 없습니다 - "
+                "다시 조회한 확정 목록: " + (", ".join(confirmed_option_ids) if confirmed_option_ids else "(없음)")
+            )
         mapping = self.mapping_repo.add(
             ProductPlatformMap(
                 product_option_id=draft.product_option_id,

@@ -9,13 +9,15 @@ API(POST /api/products/platform-map/{id}/sync-inventory,
 enqueue_*()로 PENDING 명령만 만들고 즉시 202를 반환한다. 실제 채널 호출은 이 잡이
 주기적으로 수행한다.
 
-기본 차단: settings.product_channel_sync_enabled/product_publish_enabled가 모두
-False(둘 다 기본값)이면 이 잡은 아무 것도 하지 않고 즉시 반환한다(stale RUNNING
-회수도, due 명령 조회도, 커넥터 생성도 하지 않는다 - 외부 HTTP 요청이 0건임을
-보장한다). 두 플래그는 독립적이다 - INVENTORY_UPDATE/SALE_STATUS_UPDATE는
-product_channel_sync_enabled로, PRODUCT_INFO_UPDATE(상용 ERP 확장 3단계 두 번째
-묶음 - 상품명/판매가/상세설명 제한 수정)는 product_publish_enabled로 각각 따로
-통제한다 - 하나만 켜져 있으면 그 플래그가 통제하는 command_type만 처리한다.
+기본 차단: settings.product_channel_sync_enabled/product_info_update_enabled가
+모두 False(둘 다 기본값)이면 이 잡은 아무 것도 하지 않고 즉시 반환한다(stale
+RUNNING 회수도, due 명령 조회도, 커넥터 생성도 하지 않는다 - 외부 HTTP 요청이
+0건임을 보장한다). 두 플래그는 완전히 독립적이다 - INVENTORY_UPDATE/
+SALE_STATUS_UPDATE는 product_channel_sync_enabled로, PRODUCT_INFO_UPDATE(상용
+ERP 확장 3단계 두 번째 묶음 - 상품명/판매가/상세설명 제한 수정)는 전용 플래그
+product_info_update_enabled로 각각 따로 통제한다 - 신규 등록 전용
+product_publish_enabled와도 무관하다(신규 등록을 켰다고 정보수정까지 자동
+허용되지 않는다). 하나만 켜져 있으면 그 플래그가 통제하는 command_type만 처리한다.
 
 명령종류 분리: INVENTORY_UPDATE/SALE_STATUS_UPDATE/PRODUCT_INFO_UPDATE 세
 command_type만 다룬다 -
@@ -46,13 +48,14 @@ logger = logging.getLogger(__name__)
 
 
 def _enabled_command_types() -> tuple[str, ...]:
-    """product_channel_sync_enabled(재고/판매상태)와 product_publish_enabled
-    (정보수정)는 서로 독립된 플래그다 - 켜진 플래그가 통제하는 command_type만
-    이번 실행 대상에 포함한다."""
+    """product_channel_sync_enabled(재고/판매상태)와 product_info_update_enabled
+    (정보수정)는 서로 완전히 독립된 플래그다 - 켜진 플래그가 통제하는 command_type만
+    이번 실행 대상에 포함한다(product_publish_enabled는 이 잡이 다루지 않는
+    PRODUCT_CREATE 전용 - scheduler.jobs.product_publish_dispatch_job 참고)."""
     types: list[str] = []
     if settings.product_channel_sync_enabled:
         types.extend([INVENTORY_UPDATE, SALE_STATUS_UPDATE])
-    if settings.product_publish_enabled:
+    if settings.product_info_update_enabled:
         types.append(PRODUCT_INFO_UPDATE)
     return tuple(types)
 

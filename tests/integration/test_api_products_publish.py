@@ -19,11 +19,14 @@ from config.settings import settings
 
 @pytest.fixture(autouse=True)
 def _enable_product_publish(monkeypatch):
-    # update-info(PRODUCT_INFO_UPDATE)는 product_publish_enabled로 통제하지만,
-    # 실제 커맨드 실행부는 services.product_sync_dispatch_service를 그대로 공유한다 -
-    # 접수(enqueue) 자체는 product_publish_enabled만으로 충분하다(services.
-    # product_sync_dispatch_service._enqueue 참고 - command_type별로 다른 플래그를 본다).
+    # 신규 등록(submit)은 product_publish_enabled, 정보수정(update-info)은 완전히
+    # 독립된 별도 플래그 product_info_update_enabled로 통제한다(services.
+    # product_sync_dispatch_service._enqueue 참고 - command_type별로 다른 플래그를
+    # 본다). 이 파일의 나머지 테스트는 "두 기능 모두 켜져 있을 때"를 전제하므로
+    # 함께 켠다 - 독립성 자체는 TestUpdatePlatformMapInfo.
+    # test_publish_flag_alone_does_not_enable_info_update가 별도로 검증한다.
     monkeypatch.setattr(settings, "product_publish_enabled", True)
+    monkeypatch.setattr(settings, "product_info_update_enabled", True)
 
 
 def _create_option(client, auth_headers, sku_suffix: str) -> tuple[int, int]:
@@ -187,8 +190,22 @@ class TestUpdatePlatformMapInfo:
         assert resp.status_code == 404
 
     def test_disabled_by_default_returns_503(self, client, auth_headers, seed_data, monkeypatch):
-        monkeypatch.setattr(settings, "product_publish_enabled", False)
+        monkeypatch.setattr(settings, "product_info_update_enabled", False)
         mapping_id = self._create_mapping(client, auth_headers, seed_data, "10")
+
+        resp = client.post(
+            f"/api/products/platform-map/{mapping_id}/update-info", json={"name": "새이름"}, headers=auth_headers
+        )
+
+        assert resp.status_code == 503
+
+    def test_publish_flag_alone_does_not_enable_info_update(self, client, auth_headers, seed_data, monkeypatch):
+        """신규 등록 플래그(product_publish_enabled)만 켜져 있고 정보수정 전용
+        플래그(product_info_update_enabled)가 꺼져 있으면, 정보수정 요청은 여전히
+        차단돼야 한다(감사 지적: "신규 등록 플래그와도 독립적으로 검증")."""
+        monkeypatch.setattr(settings, "product_info_update_enabled", False)
+        monkeypatch.setattr(settings, "product_publish_enabled", True)
+        mapping_id = self._create_mapping(client, auth_headers, seed_data, "11")
 
         resp = client.post(
             f"/api/products/platform-map/{mapping_id}/update-info", json={"name": "새이름"}, headers=auth_headers

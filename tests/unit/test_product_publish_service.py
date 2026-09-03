@@ -206,6 +206,31 @@ class TestExecuteCommand:
         assert outcome.command.status == "FAILED"
         assert connector.calls == []
 
+    def test_validation_error_message_is_preserved_in_error_code_not_just_class_name(
+        self, db_session, product_option, platform
+    ):
+        """create_product()가 필수 항목 누락으로 ValueError를 던지면(예: 네이버
+        커넥터의 항목별 안내), error_code에 "ValueError"라는 클래스명만 남기지
+        않고 실제 메시지를 그대로 보존해야 한다 - 그렇지 않으면 화면에 "사유:
+        ValueError"만 보여 운영자가 어떤 항목이 비었는지 알 수 없다(실제 클릭
+        검증으로 발견된 결함)."""
+        connector = StubPublishConnector(
+            error=ValueError("네이버 상품 등록에 필요한 항목이 비어 있습니다(추측 금지): 카테고리 코드, 판매가")
+        )
+        svc = ProductPublishService(db_session, connector_factory=_factory(connector))
+        draft = svc.save_draft(product_option.id, platform.id, **_valid_snapshot_kwargs())
+        outcome = svc.enqueue_create(draft.id)
+
+        with pytest.raises(ValueError):
+            svc.execute_command(outcome.command.id)
+
+        db_session.refresh(outcome.command)
+        assert outcome.command.status == "FAILED"
+        assert (
+            outcome.command.error_code
+            == "네이버 상품 등록에 필요한 항목이 비어 있습니다(추측 금지): 카테고리 코드, 판매가"
+        )
+
     def test_timeout_ends_as_unknown_and_blocks_successor(self, db_session, product_option, platform):
         connector = StubPublishConnector(error=MarketplaceExternalAPIError("naver", "TIMEOUT", True))
         svc = ProductPublishService(db_session, connector_factory=_factory(connector))
@@ -263,6 +288,50 @@ class TestRegistrationStatusAndConfirmMapping:
         db_session.refresh(draft)
         assert draft.pending_platform_product_id is None
         assert draft.registered_at is not None
+
+    def test_confirm_mapping_rejects_option_id_not_in_channel_confirmed_list(
+        self, db_session, product_option, platform
+    ):
+        """운영자가 입력한 옵션 식별자를 그대로 믿지 않는다 - 채널이 실제로 확인해
+        준 후보 목록(channel_option_ids)에 없는 값(오타/다른 상품 ID 등)은 매핑을
+        만들지 않고 차단해야 한다."""
+        connector = StubPublishConnector(
+            result=ProductCreateResult(
+                accepted=True, platform_result_code="SUCCESS", channel_product_id="SELLER-2", channel_option_id=None
+            ),
+            registration_status={"status_name": "APPROVED", "channel_option_ids": ["VENDOR-ITEM-REAL"]},
+        )
+        svc = ProductPublishService(db_session, connector_factory=_factory(connector))
+        draft = svc.save_draft(product_option.id, platform.id, **_valid_snapshot_kwargs())
+        outcome = svc.enqueue_create(draft.id)
+        svc.execute_command(outcome.command.id)
+
+        with pytest.raises(ValueError, match="후보 목록"):
+            svc.confirm_mapping(draft.id, "VENDOR-ITEM-WRONG-OR-TYPO")
+
+        from repositories.product_repository import ProductPlatformMapRepository
+
+        assert ProductPlatformMapRepository(db_session).list_by_option(product_option.id) == []
+        db_session.refresh(draft)
+        assert draft.pending_platform_product_id == "SELLER-2"  # 확정되지 않고 그대로 보류.
+
+    def test_confirm_mapping_rejects_when_no_candidates_confirmed_yet(self, db_session, product_option, platform):
+        """아직 심사가 끝나지 않아 채널이 옵션 후보를 하나도 확인해 주지 못한
+        상태(channel_option_ids 빈 목록)면, 어떤 값을 입력해도 매핑을 만들면 안
+        된다(공식적으로 확인되지 않은 상태를 확정된 것처럼 취급하지 않는다)."""
+        connector = StubPublishConnector(
+            result=ProductCreateResult(
+                accepted=True, platform_result_code="SUCCESS", channel_product_id="SELLER-3", channel_option_id=None
+            ),
+            registration_status={"status_name": "REVIEWING", "channel_option_ids": []},
+        )
+        svc = ProductPublishService(db_session, connector_factory=_factory(connector))
+        draft = svc.save_draft(product_option.id, platform.id, **_valid_snapshot_kwargs())
+        outcome = svc.enqueue_create(draft.id)
+        svc.execute_command(outcome.command.id)
+
+        with pytest.raises(ValueError):
+            svc.confirm_mapping(draft.id, "GUESSED-ID")
 
     def test_check_status_without_pending_id_raises(self, db_session, product_option, platform):
         svc = ProductPublishService(db_session)

@@ -46,6 +46,10 @@ def _valid_channel_fields() -> dict:
         },
         "productInfoProvidedNotice": {
             "productInfoProvidedNoticeType": "ETC",
+            # 이 카테고리에 ETC 고시가 맞는지 운영자가 판매자센터에서 직접 확인했다는
+            # 명시적 확인 - 시스템이 자동으로 채우지 않는다(추측 금지, 아래
+            # TestCreateProduct.test_blocks_without_operator_category_confirmation 참고).
+            "categoryNoticeTypeConfirmedByOperator": True,
             "etc": {
                 "itemName": "테스트상품",
                 "manufacturer": "테스트제조사",
@@ -182,6 +186,35 @@ class TestCreateProduct:
         snapshot["channel_fields"]["productInfoProvidedNotice"] = {"productInfoProvidedNoticeType": "FOOD"}
 
         with pytest.raises(ValueError, match="ETC"):
+            connector.create_product(snapshot)
+        assert captured == []
+
+    def test_blocks_without_operator_category_confirmation(self, db_session, platform):
+        """ETC 하위 필드가 전부 채워져 있어도, 이 카테고리에 ETC 고시가 맞는지
+        운영자가 확인했다는 플래그가 없으면(또는 False면) 등록을 차단해야 한다 -
+        "ETC 스키마 구현"과 "이 카테고리에 ETC가 맞다는 판단"은 별개다."""
+        _register_credentials(db_session, platform)
+        captured: list = []
+        handler = _make_create_handler({}, captured)
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.commerce.naver.com")
+        connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+        snapshot = _valid_draft_snapshot()
+        del snapshot["channel_fields"]["productInfoProvidedNotice"]["categoryNoticeTypeConfirmedByOperator"]
+
+        with pytest.raises(ValueError, match="categoryNoticeTypeConfirmedByOperator"):
+            connector.create_product(snapshot)
+        assert captured == []
+
+    def test_blocks_when_operator_category_confirmation_is_false(self, db_session, platform):
+        _register_credentials(db_session, platform)
+        captured: list = []
+        handler = _make_create_handler({}, captured)
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.commerce.naver.com")
+        connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+        snapshot = _valid_draft_snapshot()
+        snapshot["channel_fields"]["productInfoProvidedNotice"]["categoryNoticeTypeConfirmedByOperator"] = False
+
+        with pytest.raises(ValueError, match="categoryNoticeTypeConfirmedByOperator"):
             connector.create_product(snapshot)
         assert captured == []
 

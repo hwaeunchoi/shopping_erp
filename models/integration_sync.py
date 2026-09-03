@@ -73,7 +73,13 @@ class ExternalCommand(Base, TimestampMixin):
     target_id: Mapped[int] = mapped_column(nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")
     retryable: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    error_code: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    # 500자 - request/response_summary와 동일 폭. 짧은 코드(RATE_LIMITED 등)뿐
+    # 아니라, capability/reason_code가 없는 예외(특히 ValueError)의 실제 검증
+    # 메시지("~필수 항목이 비어 있습니다: a, b, c")를 그대로 담기 위해 넓혀뒀다
+    # (services.product_sync_dispatch_service/product_publish_service의
+    # _describe_exception 참고 - 클래스명 하나로 뭉뚱그리면 운영자가 원인을
+    # 구분할 수 없다는, 실제 클릭 검증으로 발견된 결함의 수정).
+    error_code: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     attempt_count: Mapped[int] = mapped_column(default=0, nullable=False)
     next_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     # 안전한 요약만 저장한다 - 원본 요청/응답 전문·Secret·PII 금지(모듈 docstring 참고).

@@ -194,9 +194,17 @@ RATE_LIMIT_BACKOFF_BASE_SECONDS = 1.0
 #   이번 라운드는 그중 "기타 재화"(productInfoProvidedNoticeType="ETC",
 #   ExternalApiEtcInfoProvidedNoticeVo, 필수 8개 확인: itemName, manufacturer,
 #   modelName, qualityAssuranceStandard, compensationProcedure, troubleShootingContents,
-#   noRefundReason, returnCostReason) 하나만 스키마를 확인했다 - 그 외 유형(화장품/
-#   식품/의류 등 카테고리 전용 고시)은 스키마를 확인하지 못해 명시적으로 차단한다
-#   (추측 금지).
+#   noRefundReason, returnCostReason) 하나만 입력 스키마를 확인했다 - 그 외 유형
+#   (화장품/식품/의류 등 카테고리 전용 고시)은 스키마를 확인하지 못해 명시적으로
+#   차단한다(추측 금지).
+#   ⚠️ 범위 한정: "ETC 스키마를 구현했다"는 사실과 "이 leafCategoryId에 ETC를
+#   써도 되는지"는 별개다 - 카테고리별로 어떤 상품정보제공고시 유형이 필수인지
+#   조회하는 공식 API를 이 세션에서 확인하지 못했다(쿠팡의 카테고리 메타정보
+#   조회 같은 확인된 엔드포인트가 네이버에는 없다). 그래서 이 커넥터는 "ETC 입력
+#   형식은 지원하되, 이 카테고리에 ETC가 실제로 맞는지는 시스템이 검증할 수
+#   없다" - 운영자가 판매자센터에서 직접 확인했다는 명시적 확인(channel_fields.
+#   productInfoProvidedNotice.categoryNoticeTypeConfirmedByOperator=true)이 없으면
+#   등록 자체를 차단한다(초안 저장은 이 검사와 무관하게 항상 가능하다).
 #
 #   GET/PUT /v2/products/origin-products/{originProductNo}: GET 응답의 originProduct
 #   서브 객체와 PUT 요청 바디의 originProduct는 동일 스키마(ExternalApiOriginProductVo)
@@ -282,6 +290,21 @@ def _validate_naver_publish_draft(draft: dict[str, Any]) -> None:
         for field in _NAVER_ETC_NOTICE_REQUIRED_FIELDS:
             if not etc.get(field):
                 missing.append(f"channel_fields.productInfoProvidedNotice.etc.{field}")
+        # ETC 스키마를 "구현"한 것과, 이 leafCategoryId에 ETC를 써도 되는지("적합성")는
+        # 별개다 - 이 커넥터는 카테고리별 고시 유형 요구사항을 조회할 공식 API를
+        # 확인하지 못했으므로(네이버는 쿠팡의 카테고리 메타정보 조회 같은 확인된
+        # 엔드포인트가 없다), 시스템이 스스로 "이 카테고리는 ETC가 맞다"고 판단하지
+        # 않는다. 대신 운영자가 네이버 판매자센터에서 이 leafCategoryId의 상품정보
+        # 제공고시 유형을 직접 확인했다는 명시적 확인(true)을 요구한다 - 이 값이
+        # 없으면(또는 False면) ETC 하위 필드가 다 채워졌어도 등록을 차단한다(초안
+        # 저장은 이 검사 이전에 이미 자유롭게 가능 - services.product_publish_service.
+        # save_draft는 어떤 검증도 하지 않는다. 여기서 막는 것은 "전송(등록)"만이다).
+        if notice.get("categoryNoticeTypeConfirmedByOperator") is not True:
+            missing.append(
+                "channel_fields.productInfoProvidedNotice.categoryNoticeTypeConfirmedByOperator"
+                "(true여야 함 - 이 카테고리에 ETC 고시가 맞는지 판매자센터에서 직접 확인 필요."
+                " ETC 입력 형식은 지원하지만 카테고리 적합성은 시스템이 검증할 수 없다)"
+            )
 
     if missing:
         raise ValueError("네이버 상품 등록에 필요한 항목이 비어 있습니다(추측 금지): " + ", ".join(missing))

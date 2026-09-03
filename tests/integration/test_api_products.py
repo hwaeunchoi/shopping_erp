@@ -213,6 +213,17 @@ class TestProductDetail:
         assert maps_by_option["SIBLING-SKU-A"]["sibling_mapping_ids"] == [mapping_b["id"]]
         assert maps_by_option["SIBLING-SKU-B"]["sibling_mapping_ids"] == [mapping_a["id"]]
 
+        # frontend/src/pages/ProductDetailPage.tsx의 OptionSubDetail은 이 상품상세
+        # API가 아니라 GET /options/{id}/platform-map(목록조회)로 표를 그린다 - 그
+        # 엔드포인트가 sibling_mapping_ids를 채우지 않으면 실제 화면에서는 형제
+        # 매핑 경고가 조용히 사라진다(실제 클릭 검증으로 발견된 회귀 - 상품상세
+        # API만 고치고 이 목록조회 API를 빠뜨렸었다). 두 엔드포인트가 항상 같은
+        # 값을 반환하는지 함께 확인한다.
+        list_maps_a = client.get(f"/api/products/options/{option_a['id']}/platform-map", headers=auth_headers).json()
+        list_maps_b = client.get(f"/api/products/options/{option_b['id']}/platform-map", headers=auth_headers).json()
+        assert list_maps_a[0]["sibling_mapping_ids"] == [mapping_b["id"]]
+        assert list_maps_b[0]["sibling_mapping_ids"] == [mapping_a["id"]]
+
     def test_detail_missing_product_returns_404(self, client, auth_headers):
         resp = client.get("/api/products/999999/detail", headers=auth_headers)
         assert resp.status_code == 404

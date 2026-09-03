@@ -202,6 +202,29 @@ def _classify_write_outcome(exc: Exception) -> str:
     return "UNKNOWN"  # 예상 밖 예외 - 안전한 기본값.
 
 
+# ExternalCommand.error_code 컬럼 폭(String(500), models.integration_sync 참고)에 맞춘다.
+_ERROR_CODE_MAX_LENGTH = 500
+
+
+def _describe_exception(exc: Exception) -> str:
+    """ExternalCommand.error_code에 담을 안전한 사유 문자열을 만든다(services.
+    product_publish_service._describe_exception과 동일 원칙).
+
+    capability/reason_code가 있으면 그 짧은 코드를 우선한다. 둘 다 없으면
+    (특히 ValueError - update_product_info()의 "수정할 항목이 없습니다" 등
+    안내 메시지) 클래스명 하나로 뭉뚱그리지 않고 실제 예외 메시지를 그대로
+    담는다 - 그렇지 않으면 화면에 "사유: ValueError"만 보여 운영자가 실제
+    원인을 알 수 없다(실제 클릭 검증으로 발견된 결함). 원본 응답 전문·Secret이
+    아니라 이 서비스가 직접 만든 검증 메시지이므로 노출해도 안전하다."""
+    code = getattr(exc, "capability", None) or getattr(exc, "reason_code", None)
+    if code:
+        return str(code)
+    message = str(exc)
+    if message:
+        return message[:_ERROR_CODE_MAX_LENGTH]
+    return type(exc).__name__
+
+
 def _retry_backoff(attempt_count: int) -> timedelta:
     idx = min(max(attempt_count, 1), len(RETRY_BACKOFF_MINUTES)) - 1
     return timedelta(minutes=RETRY_BACKOFF_MINUTES[idx])
@@ -309,12 +332,14 @@ class ProductSyncDispatchService:
         target_repr: str,
         build_detail: Callable[[ExternalCommand, Any], ProductSyncCommandDetail],
     ) -> ProductSyncOutcome:
-        # PRODUCT_INFO_UPDATE(상용 ERP 확장 3단계 두 번째 묶음)는 재고/판매상태와
-        # 별개의 독립 플래그(product_publish_enabled)로 통제한다 - 하나를 켜도
-        # 다른 하나는 여전히 OFF로 남아야 한다(요구사항: "신규 등록·정보 수정은
-        # 별도 기본 OFF 플래그로 제어하고 기존 플래그도 OFF 유지").
+        # PRODUCT_INFO_UPDATE(상용 ERP 확장 3단계 두 번째 묶음)는 재고/판매상태
+        # (product_channel_sync_enabled)는 물론, 신규 등록(product_publish_enabled)
+        # 과도 완전히 독립된 전용 플래그(product_info_update_enabled)로 통제한다 -
+        # 세 플래그 중 어느 하나를 켜도 나머지 둘은 여전히 OFF로 남아야 한다(감사
+        # 지적: "재고 기능을 켰다는 이유로... 자동 허용되지 않도록" - 신규 등록
+        # 플래그를 켰다는 이유로도 마찬가지다).
         flag_enabled = (
-            settings.product_publish_enabled
+            settings.product_info_update_enabled
             if command_type == PRODUCT_INFO_UPDATE
             else settings.product_channel_sync_enabled
         )
@@ -534,11 +559,7 @@ class ProductSyncDispatchService:
 
     def _mark_after_failure(self, command: ExternalCommand, lease_token: str, exc: Exception) -> None:
         kind = _classify_write_outcome(exc)
-        # capability(MarketplaceCapabilityUnsupportedError)가 reason_code보다 먼저 -
-        # "옵션 구조 미지원"/"판매상태 전환 불가" 등 구체적 차단 사유를 화면에 그대로
-        # 노출하기 위함이다(모두 MarketplaceCapabilityUnsupportedError라는 클래스명
-        # 하나로 뭉뚱그려지면 사용자가 원인을 구분할 수 없다).
-        error_code = getattr(exc, "capability", None) or getattr(exc, "reason_code", None) or type(exc).__name__
+        error_code = _describe_exception(exc)
         now = datetime.now(timezone.utc)
         if kind == "SAFE_RETRY" and command.attempt_count < MAX_ATTEMPTS:
             values: dict[str, Any] = {

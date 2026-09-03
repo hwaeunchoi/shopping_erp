@@ -144,6 +144,20 @@ class ProductPlatformMapOut(BaseModel):
     Coupang은 platform_option_id가 1:1 유니크 제약이라 항상 빈 목록이다."""
 
 
+def _to_platform_map_out(m: Any, platform_map_repo: ProductPlatformMapRepository) -> ProductPlatformMapOut:
+    """ProductPlatformMap ORM 객체를 sibling_mapping_ids까지 채운 응답 모델로
+    변환한다 - 이 매핑을 반환하는 모든 엔드포인트(상품상세/매핑 목록조회/매핑
+    생성/매핑수정)가 이 헬퍼를 거쳐야 한다. 한 곳(예: 상품상세)에만 적용하고
+    다른 곳은 빠뜨리면, 화면이 실제로 쓰는 엔드포인트가 후자일 때 형제 매핑
+    경고가 조용히 사라진다(실사용 클릭 검증으로 발견된 결함 - 프론트가 상품상세가
+    아니라 이 목록조회 엔드포인트로 표를 그린다)."""
+    out = ProductPlatformMapOut.model_validate(m)
+    if m.platform_origin_product_id:
+        siblings = platform_map_repo.list_by_platform_and_origin_product_id(m.platform_id, m.platform_origin_product_id)
+        out.sibling_mapping_ids = sorted(s.id for s in siblings if s.id != m.id)
+    return out
+
+
 class ProductPlatformMapCreate(BaseModel):
     platform_id: int
     platform_option_id: str
@@ -347,15 +361,6 @@ def get_product_detail(product_id: int, db: Session = Depends(get_db)):
     all_images = ProductImageRepository(db).list_by_product(product_id)
     product_level_images = [i for i in all_images if i.product_option_id is None]
 
-    def _to_platform_map_out(m):
-        out = ProductPlatformMapOut.model_validate(m)
-        if m.platform_origin_product_id:
-            siblings = platform_map_repo.list_by_platform_and_origin_product_id(
-                m.platform_id, m.platform_origin_product_id
-            )
-            out.sibling_mapping_ids = sorted(s.id for s in siblings if s.id != m.id)
-        return out
-
     option_details = []
     for option in option_repo.list_by_product(product_id):
         total_quantity, last_order_date = order_repo.total_quantity_and_last_order_date(option.id)
@@ -363,7 +368,9 @@ def get_product_detail(product_id: int, db: Session = Depends(get_db)):
         option_details.append(
             ProductOptionDetailOut(
                 **ProductOptionOut.model_validate(option).model_dump(),
-                platform_maps=[_to_platform_map_out(m) for m in platform_map_repo.list_by_option(option.id)],
+                platform_maps=[
+                    _to_platform_map_out(m, platform_map_repo) for m in platform_map_repo.list_by_option(option.id)
+                ],
                 images=[ProductImageOut.model_validate(i) for i in all_images if i.product_option_id == option.id],
                 stats=ProductOptionStatsOut(
                     total_quantity_sold=total_quantity,
@@ -602,7 +609,8 @@ def delete_product_option(option_id: int, db: Session = Depends(get_db)) -> None
     "/options/{option_id}/platform-map", response_model=list[ProductPlatformMapOut], summary="SKU-플랫폼 매핑 목록 조회"
 )
 def list_platform_maps(option_id: int, db: Session = Depends(get_db)) -> list:
-    return ProductPlatformMapRepository(db).list_by_option(option_id)
+    repo = ProductPlatformMapRepository(db)
+    return [_to_platform_map_out(m, repo) for m in repo.list_by_option(option_id)]
 
 
 @router.post(
@@ -628,7 +636,7 @@ def create_platform_map(option_id: int, payload: ProductPlatformMapCreate, db: S
         payload.platform_product_id,
     )
     db.commit()
-    return mapping
+    return _to_platform_map_out(mapping, ProductPlatformMapRepository(db))
 
 
 @router.patch(
@@ -650,7 +658,7 @@ def update_platform_map(mapping_id: int, payload: ProductPlatformMapUpdate, db: 
         payload.platform_option_id,
     )
     db.commit()
-    return updated
+    return _to_platform_map_out(updated, ProductPlatformMapRepository(db))
 
 
 @router.delete(
@@ -1142,4 +1150,4 @@ def confirm_publish_mapping(
         db.rollback()
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
     db.commit()
-    return ProductPlatformMapOut.model_validate(mapping)
+    return _to_platform_map_out(mapping, ProductPlatformMapRepository(db))
