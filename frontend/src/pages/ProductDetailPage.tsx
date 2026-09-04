@@ -1233,7 +1233,7 @@ export function ProductDetailPage() {
       {optionError && <p className="form-error">{optionError}</p>}
 
       <p className="hint-text">옵션명·색상·사이즈·바코드·단가를 칸에서 바로 고친 뒤 <strong>저장</strong>을 누르세요(Enter로도 저장).</p>
-      <div className="table-scroll options-table-scroll">
+      <div className="table-scroll">
         <table className="data-table">
           <thead>
             <tr>
