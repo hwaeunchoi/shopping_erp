@@ -375,7 +375,17 @@ const SYNC_STATUS_LABELS: Record<string, string> = {
 // 없으므로(별도 조회 API 없음) 목표값 입력·전송·명령 상태 폴링만 제공하고,
 // 채널의 현재 값은 항상 "확인되지 않음"으로 고정 표기한다(0이나 최신값으로
 // 추정해 보여주지 않는다).
-function ProductSyncControls({ mapping }: { mapping: ProductPlatformMap }) {
+function ProductSyncControls({ mapping, onClose }: { mapping: ProductPlatformMap; onClose: () => void }) {
+  // 부모가 key={mapping.id}로 매핑마다 새로 마운트한다 - 다른 매핑으로 전환하면
+  // 이 아래 모든 useState(입력값·명령 상태)가 초기화되어 이전 대상의 값이
+  // 섞이지 않는다. 반대로 같은 매핑을 가리키는 채로 목록만 새로고침되면
+  // (reloadMaps) mapping.id는 그대로이므로 key가 바뀌지 않아 이 컴포넌트는
+  // 리마운트되지 않고 입력 중이던 값도 그대로 유지된다.
+  const headingRef = useRef<HTMLHeadingElement>(null)
+  useEffect(() => {
+    headingRef.current?.focus()
+  }, [])
+
   const [quantity, setQuantity] = useState('')
   const [saleStatus, setSaleStatus] = useState<SaleStatusValue>('ON_SALE')
   const [infoName, setInfoName] = useState('')
@@ -462,7 +472,19 @@ function ProductSyncControls({ mapping }: { mapping: ProductPlatformMap }) {
   }
 
   return (
-    <div>
+    <div className="option-manage-panel">
+      <div className="option-manage-panel-header">
+        <h3 ref={headingRef} tabIndex={-1}>
+          관리 중: 매핑 #{mapping.id} · 플랫폼 {mapping.platform_id} · 옵션번호 {mapping.platform_option_id}
+        </h3>
+        <button type="button" onClick={onClose}>닫기</button>
+      </div>
+      {mapping.sibling_mapping_ids.length > 0 && (
+        <p className="hint-text" style={{ color: '#b45309' }}>
+          ⚠️ 이 매핑은 같은 원상품(origin product)을 매핑 #{mapping.sibling_mapping_ids.join(', #')}과(와)
+          공유합니다 - 판매상태 변경은 해당 매핑들에도 함께 반영됩니다.
+        </p>
+      )}
       <p className="hint-text">채널 현재 값: 확인되지 않음(이 화면은 목표값 전송 전용)</p>
       <form className="inline-form" onSubmit={handleSyncInventory} style={{ marginBottom: 4 }}>
         <input
@@ -476,12 +498,6 @@ function ProductSyncControls({ mapping }: { mapping: ProductPlatformMap }) {
           {isSubmittingQty ? '전송 중...' : '재고 전송'}
         </button>
       </form>
-      {mapping.sibling_mapping_ids.length > 0 && (
-        <p className="hint-text" style={{ color: '#b45309' }}>
-          ⚠️ 이 매핑은 같은 원상품(origin product)을 매핑 #{mapping.sibling_mapping_ids.join(', #')}과(와)
-          공유합니다 - 판매상태 변경은 해당 매핑들에도 함께 반영됩니다.
-        </p>
-      )}
       <div className="inline-form" style={{ marginBottom: 4 }}>
         <select value={saleStatus} onChange={(e) => setSaleStatus(e.target.value as SaleStatusValue)}>
           <option value="ON_SALE">판매중으로</option>
@@ -869,6 +885,27 @@ function OptionSubDetail({
   const [mapError, setMapError] = useState<string | null>(null)
   const [editingMapId, setEditingMapId] = useState<number | null>(null)
 
+  // 재고/판매상태/정보수정 컨트롤(ProductSyncControls)의 관리 대상 매핑 선택 -
+  // 옵션 관리 패널과 같은 이유로 표 밖의 독립 블록으로 뺀다(표 안에 있으면
+  // 표의 auto-layout 폭 계산에 다시 갇힌다). manageMappingButtonRef는 패널을
+  // 닫을 때 포커스를 원래 "관리" 버튼으로 되돌리기 위함이다.
+  const [selectedMappingId, setSelectedMappingId] = useState<number | null>(null)
+  const manageMappingButtonRef = useRef<HTMLElement | null>(null)
+
+  const handleManageMapping = (id: number) => {
+    if (selectedMappingId === id) {
+      setSelectedMappingId(null)
+      return
+    }
+    manageMappingButtonRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    setSelectedMappingId(id)
+  }
+
+  const handleCloseMappingPanel = () => {
+    setSelectedMappingId(null)
+    manageMappingButtonRef.current?.focus()
+  }
+
   const [costPrice, setCostPrice] = useState('')
   const [effectiveFrom, setEffectiveFrom] = useState(new Date().toISOString().slice(0, 10))
   const [costError, setCostError] = useState<string | null>(null)
@@ -985,7 +1022,7 @@ function OptionSubDetail({
           <table className="data-table nested">
             <thead>
               <tr>
-                <th>ID</th><th>플랫폼ID</th><th>옵션번호</th><th>상품번호</th><th>노출상품명</th><th>판매자상품코드</th><th></th><th>재고/판매상태 전송</th>
+                <th>ID</th><th>플랫폼ID</th><th>옵션번호</th><th>상품번호</th><th>노출상품명</th><th>판매자상품코드</th><th></th><th>관리</th>
               </tr>
             </thead>
             <tbody>
@@ -1004,7 +1041,11 @@ function OptionSubDetail({
                       </button>
                       <button type="button" onClick={() => handleDeleteMap(m.id)}>삭제</button>
                     </td>
-                    <td><ProductSyncControls mapping={m} /></td>
+                    <td>
+                      <button type="button" onClick={() => handleManageMapping(m.id)}>
+                        {selectedMappingId === m.id ? '닫기' : '관리'}
+                      </button>
+                    </td>
                   </tr>
                   {editingMapId === m.id && (
                     <PlatformMapEditRow
@@ -1022,6 +1063,20 @@ function OptionSubDetail({
             </tbody>
           </table>
         </div>
+
+        {/* 반드시 .filter().map()로 렌더링한다 - `{selectedMapping && <X key={id}/>}`
+            형태(단일 조건부 슬롯에 key만 바꿔주는 방식)로도 등가로 보이지만, 다른
+            매핑으로 전환할 때(state는 정확히 갱신되는데도) 이전 key의 DOM이 정리되지
+            않고 새 key의 DOM과 함께 남는 실제 렌더링 결함이 있었다(React 19, 개발
+            빌드와 production 빌드 양쪽에서 재현됨). 이 컴포넌트의 옵션 표
+            `.map((o) => <OptionRow key={o.id} .../>)` 등 이 파일의 다른 목록들과
+            동일한 리스트 기반 재조정 방식으로 바꾸자 문제없이 동작했다 - 원인은
+            끝까지 특정하지 못했지만(React 자체 이슈로 추정) 이 패턴을 유지할 것. */}
+        {maps
+          ?.filter((m) => m.id === selectedMappingId)
+          .map((m) => (
+            <ProductSyncControls key={m.id} mapping={m} onClose={handleCloseMappingPanel} />
+          ))}
 
         <h3>신규 채널 등록(초안)</h3>
         <p className="hint-text">

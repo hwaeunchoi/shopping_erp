@@ -338,6 +338,16 @@ input, select {
 
 .option-manage-panel-header h3 {
   margin: 0;
+  /* 매핑 식별자(예: VENDOR-ITEM-8892-A)처럼 공백 없는 긴 토큰이 있으면 flex
+     아이템 기본값(min-width:auto)이 그 토큰 폭만큼 줄어들지 않아 좁은 화면에서
+     옆의 닫기 버튼을 밀어낸다 - min-width:0으로 줄어들 수 있게 하고, 그래도
+     넘치는 토큰 자체는 break-word로 줄바꿈한다(잘라서 숨기지 않는다). */
+  min-width: 0;
+  overflow-wrap: break-word;
+}
+
+.option-manage-panel-header button {
+  flex-shrink: 0;
 }
 
 .detail-grid {
