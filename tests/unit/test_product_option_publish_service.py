@@ -336,6 +336,37 @@ class TestCheckRegistrationStatusAndConfirmMapping:
         status3 = svc.check_registration_status(draft.id)
         assert status3["overall_status"] == "FULLY_MAPPED"
         assert all(i["mapped"] for i in status3["items"])
+        by_option = {i["product_option_id"]: i["channel_option_id"] for i in status3["items"]}
+        assert by_option[product_option.id] == "VI-1"
+        assert by_option[second_option_same_product.id] == "VI-2"
+
+    def test_already_mapped_item_still_shows_its_identifier_when_channel_no_longer_lists_it(
+        self, db_session, product_option, second_option_same_product, platform
+    ):
+        """실제 클릭 검증으로 발견된 결함: 이미 매핑된 SKU라도, 이번 호출의 채널
+        응답에 그 판매자 관리코드가 다시 나타나지 않으면(승인 후 조회 목록에서
+        빠지는 등) channel_option_id를 빈 값으로 보여주면 안 된다 - 매핑이 이미
+        존재한다는 사실 자체를 근거로 그 매핑에 저장된 식별자를 그대로 돌려줘야
+        한다."""
+        connector = StubOptionPublishConnector(
+            registration_status=ProductOptionRegistrationStatus(
+                status_name="APPROVED",
+                items=[ProductOptionItemResult(seller_product_code=product_option.sku_code, channel_option_id="VI-1")],
+            )
+        )
+        svc = ProductOptionPublishService(db_session, connector_factory=_factory(connector))
+        draft = _build_draft_with_two_items(svc, db_session, product_option, second_option_same_product, platform)
+        outcome = svc.enqueue_create(draft.id)
+        svc.execute_command(outcome.command.id)
+        first = svc.check_registration_status(draft.id)
+        assert first["overall_status"] == "PARTIALLY_MAPPED"
+
+        # 두 번째 호출에서는 채널 응답에 이 코드가 더 이상 없다(승인 목록 갱신 등).
+        connector._registration_status = ProductOptionRegistrationStatus(status_name="APPROVED", items=[])
+        second = svc.check_registration_status(draft.id)
+        item = next(i for i in second["items"] if i["product_option_id"] == product_option.id)
+        assert item["mapped"] is True
+        assert item["channel_option_id"] == "VI-1"
 
     def test_ambiguous_candidate_is_left_unmapped(
         self, db_session, product_option, second_option_same_product, platform

@@ -149,6 +149,53 @@ export interface RegistrationStatus {
   channel_option_ids: string[]
 }
 
+// 상용 ERP 확장(3단계, 세 번째 묶음) - 하나의 로컬 상품에 속한 여러 SKU를 채널
+// 옵션 조합 상품 하나로 묶어 등록하는 초안(models.product.
+// ProductPublishOptionGroupDraft/ProductPublishOptionGroupItemDraft 대응).
+export interface ProductOptionGroupItem {
+  id: number
+  product_option_id: number
+  option_values: string[][]
+  seller_product_code: string | null
+  sale_price: number | null
+  stock_quantity: number | null
+}
+
+export interface ProductOptionGroupDraft {
+  id: number
+  product_id: number
+  platform_id: number
+  name: string | null
+  description_html: string | null
+  category_code: string | null
+  image_urls: string[]
+  base_sale_price: number | null
+  channel_fields: Record<string, unknown>
+  channel_product_id: string | null
+  channel_option_id: string | null
+  registered_at: string | null
+  etc_notice_confirmed_by: number | null
+  etc_notice_confirmed_at: string | null
+  etc_notice_confirmed_category_code: string | null
+  etc_notice_confirmed_notice_type: string | null
+  etc_notice_confirmation_valid: boolean
+  items: ProductOptionGroupItem[]
+}
+
+export interface OptionRegistrationStatusItem {
+  product_option_id: number
+  seller_product_code: string | null
+  mapped: boolean
+  channel_option_id: string | null
+  ambiguous: boolean
+}
+
+export interface OptionRegistrationStatus {
+  channel_status_name: string | null
+  overall_status: string
+  items: OptionRegistrationStatusItem[]
+}
+
 export interface ProductPlatformMapCreate {
   platform_id: number
   platform_option_id: string

@@ -5,12 +5,15 @@ import { useApiData } from '../api/useApiData'
 import { useRecentView } from '../api/useRecentView'
 import { FavoriteStar } from '../components/FavoriteStar'
 import type {
+  OptionRegistrationStatus,
   ProductCostHistory,
   ProductDetail,
   ProductImage,
   ProductOption,
   ProductOptionCreate,
   ProductOptionDetail,
+  ProductOptionGroupDraft,
+  ProductOptionGroupItem,
   ProductOptionUpdate,
   ProductPlatformMap,
   ProductPublishDraft,
@@ -1196,6 +1199,455 @@ function ProductImages({ productId, images, onChanged }: { productId: string; im
   )
 }
 
+// 상용 ERP 확장(3단계, 세 번째 묶음) - 하나의 상품에 속한 여러 SKU를 채널 옵션
+// 조합 상품 하나로 묶어 등록한다(단일 SKU 등록인 ProductPublishControls와는
+// 별개 기능·별개 API). SKU마다 다른 값(옵션축 값/가격/재고)은 SKU별 입력
+// 필드로 받는다(원시 JSON 없이 조작 가능해야 한다는 요구사항) - 축 "이름"만
+// 상품 전체에 공통으로 한 번 입력해 모든 SKU에 함께 적용한다(네이버 조합형
+// 옵션은 SKU마다 축 순서가 같아야 하므로 이 방식이 실수를 줄인다). 배송/반품/
+// 원산지/인증/상품정보제공고시 등 채널 공통 계약 정보는 ProductPublishControls와
+// 동일하게 "채널별 세부 계약 정보(JSON)"로 받는다(카테고리별 속성 자체를
+// 추측하지 않기 위함 - 값의 의미가 채널마다 달라 개별 입력란으로 일반화할 수
+// 없다).
+type OptionGroupRowState = {
+  included: boolean
+  itemId: number | null
+  v1: string
+  v2: string
+  v3: string
+  price: string
+  stock: string
+  code: string
+}
+
+function ProductOptionGroupPublishControls({
+  productId,
+  platformId,
+  options,
+}: {
+  productId: number
+  platformId: number
+  options: ProductOptionDetail[]
+}) {
+  const [draft, setDraft] = useState<ProductOptionGroupDraft | null>(null)
+  const [name, setName] = useState('')
+  const [descriptionHtml, setDescriptionHtml] = useState('')
+  const [categoryCode, setCategoryCode] = useState('')
+  const [imageUrls, setImageUrls] = useState('')
+  const [baseSalePrice, setBaseSalePrice] = useState('')
+  const [channelFields, setChannelFields] = useState('{}')
+  const [axis1, setAxis1] = useState('옵션1')
+  const [axis2, setAxis2] = useState('')
+  const [axis3, setAxis3] = useState('')
+  const [rows, setRows] = useState<Record<number, OptionGroupRowState>>({})
+  const [error, setError] = useState<string | null>(null)
+  const [isSavingDraft, setIsSavingDraft] = useState(false)
+  const [savingRowId, setSavingRowId] = useState<number | null>(null)
+  const [isSubmitting, setIsSubmitting] = useState(false)
+  const [command, setCommand] = useState<ProductSyncExternalCommand | null>(null)
+  const [registrationStatus, setRegistrationStatus] = useState<OptionRegistrationStatus | null>(null)
+  const [confirmInputs, setConfirmInputs] = useState<Record<number, string>>({})
+
+  const emptyRow = (): OptionGroupRowState => ({
+    included: false,
+    itemId: null,
+    v1: '',
+    v2: '',
+    v3: '',
+    price: '',
+    stock: '',
+    code: '',
+  })
+
+  const applyDraft = (d: ProductOptionGroupDraft) => {
+    setDraft(d)
+    setName(d.name ?? '')
+    setDescriptionHtml(d.description_html ?? '')
+    setCategoryCode(d.category_code ?? '')
+    setImageUrls(d.image_urls.join(', '))
+    setBaseSalePrice(d.base_sale_price?.toString() ?? '')
+    setChannelFields(JSON.stringify(d.channel_fields, null, 2))
+    if (d.items.length > 0) {
+      const axes = d.items[0].option_values.map(([axisName]) => axisName)
+      setAxis1(axes[0] ?? '옵션1')
+      setAxis2(axes[1] ?? '')
+      setAxis3(axes[2] ?? '')
+    }
+    const nextRows: Record<number, OptionGroupRowState> = {}
+    for (const option of options) {
+      const item = d.items.find((i) => i.product_option_id === option.id)
+      nextRows[option.id] = item
+        ? {
+            included: true,
+            itemId: item.id,
+            v1: item.option_values[0]?.[1] ?? '',
+            v2: item.option_values[1]?.[1] ?? '',
+            v3: item.option_values[2]?.[1] ?? '',
+            price: item.sale_price?.toString() ?? '',
+            stock: item.stock_quantity?.toString() ?? '',
+            code: item.seller_product_code ?? '',
+          }
+        : emptyRow()
+    }
+    setRows(nextRows)
+  }
+
+  const loadDraft = () => {
+    api
+      .get<ProductOptionGroupDraft>(`/api/products/${productId}/option-publish-draft/${platformId}`)
+      .then(applyDraft)
+      .catch(() => {
+        // 초안이 아직 없으면(404) 빈 폼을 그대로 둔다 - 오류로 취급하지 않는다.
+        const nextRows: Record<number, OptionGroupRowState> = {}
+        for (const option of options) {
+          nextRows[option.id] = emptyRow()
+        }
+        setRows(nextRows)
+      })
+  }
+
+  useEffect(() => {
+    loadDraft()
+    setRegistrationStatus(null)
+    setCommand(null)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [productId, platformId])
+
+  const pollCommand = async (commandId: number) => {
+    try {
+      setCommand(await api.get<ProductSyncExternalCommand>(`/api/products/sync-commands/${commandId}`))
+    } catch {
+      // 폴링 실패는 조용히 무시한다.
+    }
+  }
+
+  const handleSaveGroupDraft = async (e: FormEvent) => {
+    e.preventDefault()
+    let parsedChannelFields: Record<string, unknown>
+    try {
+      parsedChannelFields = channelFields.trim() ? JSON.parse(channelFields) : {}
+    } catch {
+      setError('채널별 세부 계약 정보(JSON) 형식이 올바르지 않습니다.')
+      return
+    }
+    setError(null)
+    setIsSavingDraft(true)
+    try {
+      const saved = await api.post<ProductOptionGroupDraft>(`/api/products/${productId}/option-publish-draft`, {
+        platform_id: platformId,
+        name: name || null,
+        description_html: descriptionHtml || null,
+        category_code: categoryCode || null,
+        image_urls: imageUrls.trim()
+          ? imageUrls
+              .split(',')
+              .map((s) => s.trim())
+              .filter(Boolean)
+          : null,
+        base_sale_price: baseSalePrice ? Number(baseSalePrice) : null,
+        channel_fields: parsedChannelFields,
+      })
+      setDraft(saved)
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '초안 저장 중 오류가 발생했습니다.')
+    } finally {
+      setIsSavingDraft(false)
+    }
+  }
+
+  const updateRow = (optionId: number, patch: Partial<OptionGroupRowState>) => {
+    setRows((prev) => ({ ...prev, [optionId]: { ...(prev[optionId] ?? emptyRow()), ...patch } }))
+  }
+
+  const handleToggleRow = async (option: ProductOptionDetail) => {
+    const row = rows[option.id] ?? emptyRow()
+    if (row.included && row.itemId) {
+      if (!window.confirm(`SKU '${option.sku_code}'을(를) 이 옵션조합 초안에서 제외하시겠습니까?`)) {
+        return
+      }
+      if (!draft) return
+      try {
+        await api.del(`/api/products/option-publish-drafts/${draft.id}/items/${row.itemId}`)
+        updateRow(option.id, { ...emptyRow() })
+      } catch (err) {
+        setError(err instanceof ApiError ? err.message : '품목 제외 중 오류가 발생했습니다.')
+      }
+      return
+    }
+    updateRow(option.id, { included: !row.included })
+  }
+
+  const handleSaveRow = async (option: ProductOptionDetail) => {
+    const row = rows[option.id]
+    if (!row) return
+    if (!draft) {
+      setError('먼저 위의 상품 공통정보를 저장하세요(초안 저장).')
+      return
+    }
+    if (!row.v1.trim() || (axis2 && !row.v2.trim()) || (axis3 && !row.v3.trim())) {
+      setError(`SKU '${option.sku_code}'의 옵션값을 모두 입력하세요.`)
+      return
+    }
+    if (!row.price || !row.stock) {
+      setError(`SKU '${option.sku_code}'의 판매가/재고수량을 입력하세요.`)
+      return
+    }
+    setError(null)
+    setSavingRowId(option.id)
+    try {
+      const optionValues: string[][] = [[axis1, row.v1]]
+      if (axis2) optionValues.push([axis2, row.v2])
+      if (axis3) optionValues.push([axis3, row.v3])
+      const item = await api.post<ProductOptionGroupItem>(
+        `/api/products/option-publish-drafts/${draft.id}/items`,
+        {
+          product_option_id: option.id,
+          option_values: optionValues,
+          seller_product_code: row.code || null,
+          sale_price: Number(row.price),
+          stock_quantity: Number(row.stock),
+        },
+      )
+      updateRow(option.id, { itemId: item.id, code: item.seller_product_code ?? '' })
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '품목 저장 중 오류가 발생했습니다.')
+    } finally {
+      setSavingRowId(null)
+    }
+  }
+
+  const includedCount = Object.values(rows).filter((r) => r.included && r.itemId).length
+
+  const handleSubmit = async () => {
+    if (!draft) return
+    if (includedCount === 0) {
+      setError('등록할 SKU가 1개 이상 필요합니다 - 먼저 품목을 저장하세요.')
+      return
+    }
+    if (
+      !window.confirm(
+        `'${draft.name ?? ''}' 상품(SKU ${includedCount}개)을 이 초안 내용 그대로 채널에 옵션조합으로 등록 ` +
+          '요청하시겠습니까?\n실제 채널 호출은 잠시 후 비동기로 처리되며, 등록 요청은 취소할 수 없습니다.',
+      )
+    ) {
+      return
+    }
+    setError(null)
+    setIsSubmitting(true)
+    try {
+      const result = await api.post<ProductSyncCommand>(`/api/products/option-publish-drafts/${draft.id}/submit`, {})
+      await pollCommand(result.command_id)
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '등록 요청 중 오류가 발생했습니다.')
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
+
+  const handleCheckStatus = async () => {
+    if (!draft) return
+    setError(null)
+    try {
+      setRegistrationStatus(
+        await api.get<OptionRegistrationStatus>(`/api/products/option-publish-drafts/${draft.id}/registration-status`),
+      )
+      loadDraft() // 자동 매칭으로 매핑이 새로 확정됐을 수 있어 최신 상태를 다시 읽는다.
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '심사상태 조회 중 오류가 발생했습니다.')
+    }
+  }
+
+  const handleConfirmItemMapping = async (productOptionId: number) => {
+    if (!draft) return
+    const channelOptionId = confirmInputs[productOptionId]
+    if (!channelOptionId) return
+    if (!window.confirm(`옵션 식별자 '${channelOptionId}'로 이 SKU의 매핑을 확정하시겠습니까? 확정 후에는 되돌릴 수 없습니다.`)) {
+      return
+    }
+    setError(null)
+    try {
+      await api.post(`/api/products/option-publish-drafts/${draft.id}/confirm-item-mapping`, {
+        product_option_id: productOptionId,
+        channel_option_id: channelOptionId,
+      })
+      setConfirmInputs((prev) => ({ ...prev, [productOptionId]: '' }))
+      await handleCheckStatus()
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '매핑 확정 중 오류가 발생했습니다.')
+    }
+  }
+
+  return (
+    <div>
+      <form className="inline-form" onSubmit={handleSaveGroupDraft} style={{ flexWrap: 'wrap', marginBottom: 4 }}>
+        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="상품명" />
+        <input
+          type="number"
+          value={baseSalePrice}
+          onChange={(e) => setBaseSalePrice(e.target.value)}
+          placeholder="기준 판매가(네이버 옵션가의 기준값)"
+          min={0}
+        />
+        <input value={categoryCode} onChange={(e) => setCategoryCode(e.target.value)} placeholder="카테고리 코드" />
+        <input
+          value={imageUrls}
+          onChange={(e) => setImageUrls(e.target.value)}
+          placeholder="이미지 URL(쉼표 구분, 첫 번째=대표, http/https만)"
+          className="publish-field-md"
+        />
+        <textarea
+          value={descriptionHtml}
+          onChange={(e) => setDescriptionHtml(e.target.value)}
+          placeholder="상세설명(HTML)"
+          rows={2}
+          className="publish-field-md"
+        />
+        <textarea
+          value={channelFields}
+          onChange={(e) => setChannelFields(e.target.value)}
+          placeholder="채널별 세부 계약 정보(JSON) - 배송/반품/원산지/인증/상품정보제공고시 등"
+          rows={3}
+          className="publish-field-lg"
+        />
+        <button type="submit" disabled={isSavingDraft}>
+          {isSavingDraft ? '저장 중...' : '상품 공통정보 저장'}
+        </button>
+      </form>
+
+      <p className="hint-text">
+        옵션축 이름(최대 3개, 네이버 조합형 옵션 제한) - 모든 SKU에 공통 적용됩니다.
+      </p>
+      <div className="inline-form" style={{ flexWrap: 'wrap', marginBottom: 8 }}>
+        <input value={axis1} onChange={(e) => setAxis1(e.target.value)} placeholder="축1 이름(예: 색상)" />
+        <input value={axis2} onChange={(e) => setAxis2(e.target.value)} placeholder="축2 이름(예: 사이즈, 선택)" />
+        <input value={axis3} onChange={(e) => setAxis3(e.target.value)} placeholder="축3 이름(선택)" />
+      </div>
+
+      <p className="hint-text">SKU마다 포함 여부와 옵션값·판매가·재고수량을 입력한 뒤 각 행의 저장을 누르세요.</p>
+      {options.map((option) => {
+        const row = rows[option.id] ?? emptyRow()
+        return (
+          <div
+            key={option.id}
+            className="inline-form"
+            style={{ flexWrap: 'wrap', marginBottom: 4, padding: 6, border: '1px solid var(--border)', borderRadius: 6 }}
+          >
+            <label>
+              <input type="checkbox" checked={row.included} onChange={() => handleToggleRow(option)} /> {option.sku_code}
+            </label>
+            {row.included && (
+              <>
+                <input value={row.v1} onChange={(e) => updateRow(option.id, { v1: e.target.value })} placeholder={axis1 || '옵션값1'} />
+                {axis2 && (
+                  <input value={row.v2} onChange={(e) => updateRow(option.id, { v2: e.target.value })} placeholder={axis2} />
+                )}
+                {axis3 && (
+                  <input value={row.v3} onChange={(e) => updateRow(option.id, { v3: e.target.value })} placeholder={axis3} />
+                )}
+                <input
+                  type="number"
+                  value={row.price}
+                  onChange={(e) => updateRow(option.id, { price: e.target.value })}
+                  placeholder="판매가"
+                  min={0}
+                />
+                <input
+                  type="number"
+                  value={row.stock}
+                  onChange={(e) => updateRow(option.id, { stock: e.target.value })}
+                  placeholder="초기 재고수량"
+                  min={0}
+                />
+                <input
+                  value={row.code}
+                  onChange={(e) => updateRow(option.id, { code: e.target.value })}
+                  placeholder={`판매자 관리코드(미입력 시 SKU코드 ${option.sku_code})`}
+                  className="publish-field-sm"
+                />
+                <button type="button" onClick={() => handleSaveRow(option)} disabled={savingRowId === option.id}>
+                  {row.itemId ? '수정 저장' : '품목 저장'}
+                </button>
+                {row.itemId && <span className="hint-text">✅ 저장됨</span>}
+              </>
+            )}
+          </div>
+        )
+      })}
+
+      {error && <p className="form-error">{error}</p>}
+
+      {draft && (
+        <div style={{ marginTop: 8 }}>
+          <button type="button" onClick={handleSubmit} disabled={isSubmitting}>
+            {isSubmitting ? '요청 중...' : `채널에 옵션조합으로 등록 요청(SKU ${includedCount}개)`}
+          </button>
+          {draft.channel_product_id && (
+            <>
+              {' '}
+              <button type="button" onClick={handleCheckStatus}>심사상태·매핑 조회</button>
+            </>
+          )}
+        </div>
+      )}
+
+      {draft?.channel_product_id && (
+        <p className="hint-text">
+          접수됨 - 채널 상품ID: {draft.channel_product_id}
+          {draft.channel_option_id && ` / 채널 리스팅ID: ${draft.channel_option_id}`}
+        </p>
+      )}
+
+      {registrationStatus && (
+        <div style={{ marginTop: 4 }}>
+          <p className="hint-text">
+            채널 상태: {registrationStatus.channel_status_name ?? '확인되지 않음'} / 전체 진행:{' '}
+            {
+              {
+                PENDING_REVIEW: '심사 대기',
+                PARTIALLY_MAPPED: '일부 매핑 미확정',
+                FULLY_MAPPED: '매핑 완료',
+              }[registrationStatus.overall_status] ?? registrationStatus.overall_status
+            }
+          </p>
+          {registrationStatus.items.map((item) => (
+            <p key={item.product_option_id} className="hint-text" style={{ margin: '2px 0' }}>
+              SKU(옵션ID {item.product_option_id}, 코드 {item.seller_product_code ?? '-'}):{' '}
+              {item.mapped ? (
+                <span style={{ color: '#15803d' }}>✅ 매핑 완료(식별자 {item.channel_option_id})</span>
+              ) : item.ambiguous ? (
+                <span style={{ color: '#b45309' }}>
+                  ⚠️ 후보가 여러 개라 자동 확정할 수 없습니다 - 채널에서 직접 확인 후 수동 확정하세요.{' '}
+                  <input
+                    value={confirmInputs[item.product_option_id] ?? ''}
+                    onChange={(e) =>
+                      setConfirmInputs((prev) => ({ ...prev, [item.product_option_id]: e.target.value }))
+                    }
+                    placeholder="확정할 옵션 식별자"
+                  />
+                  <button type="button" onClick={() => handleConfirmItemMapping(item.product_option_id)}>
+                    매핑 확정
+                  </button>
+                </span>
+              ) : (
+                <span style={{ color: '#b45309' }}>❌ 아직 확인되지 않음(심사 대기 중일 수 있습니다)</span>
+              )}
+            </p>
+          ))}
+        </div>
+      )}
+
+      {command && (
+        <p>
+          명령 #{command.id}: <span className="status-badge">{SYNC_STATUS_LABELS[command.status] ?? command.status}</span>
+          {command.error_code && ` (사유: ${command.error_code})`}
+          {' '}
+          <button type="button" onClick={() => pollCommand(command.id)}>상태 새로고침</button>
+        </p>
+      )}
+    </div>
+  )
+}
+
 export function ProductDetailPage() {
   const { productId } = useParams<{ productId: string }>()
   useRecentView('PRODUCT', productId)
@@ -1357,6 +1809,22 @@ export function ProductDetailPage() {
 
       {selectedOption && (
         <OptionSubDetail key={selectedOption.id} option={selectedOption} warehousePlatformId={1} onClose={handleCloseManagePanel} />
+      )}
+
+      {product && product.options.length > 0 && (
+        <>
+          <h3>옵션조합 상품 신규 등록(여러 SKU를 채널 옵션 목록 하나로 등록)</h3>
+          <p className="hint-text">
+            아래 "신규 채널 등록(초안)"(SKU별 단일 상품 등록)과 달리, 이 상품에 속한 여러 SKU를 채널의
+            옵션 조합 상품 하나로 묶어 등록한다 - 이미 등록된 SKU가 있으면 등록 요청 시 차단된다.
+          </p>
+          <ProductOptionGroupPublishControls
+            key={product.id}
+            productId={product.id}
+            platformId={1}
+            options={product.options}
+          />
+        </>
       )}
 
       {product && <ProductImages productId={productId ?? ''} images={product.images} onChanged={reload} />}

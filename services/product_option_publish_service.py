@@ -654,12 +654,28 @@ class ProductOptionPublishService:
         status = connector.fetch_option_registration_status(draft.channel_product_id, draft.channel_option_id)
 
         items = self.item_repo.list_by_group(group_draft_id)
-        already_mapped: dict[int, bool] = {}
+        # 이미 매핑된 SKU는 그 매핑에 실제로 저장된 식별자를 그대로 되돌려준다 -
+        # 예전 호출(다른 화면 새로고침 등)에서 이미 확정된 SKU라도, 이번 호출의
+        # 채널 응답에 그 코드가 다시 나타나지 않으면(승인 후 목록에서 빠지는 등)
+        # channel_option_id를 비워 보여주면 안 되므로(실제 클릭 검증으로 발견된
+        # 결함 - "매핑 완료"인데 식별자가 빈칸으로 보임), 매핑 존재 자체를 근거로
+        # 삼는다.
+        naver_prefix = f"{_NAVER_COMBO_OPTION_ID_PREFIX}-{draft.channel_product_id}-"
+        existing_mapping_option_id: dict[int, str] = {}
         for item in items:
-            mapped = any(
-                m.platform_id == draft.platform_id for m in self.mapping_repo.list_by_option(item.product_option_id)
+            existing = next(
+                (
+                    m
+                    for m in self.mapping_repo.list_by_option(item.product_option_id)
+                    if m.platform_id == draft.platform_id
+                ),
+                None,
             )
-            already_mapped[item.product_option_id] = mapped
+            if existing is not None:
+                raw = existing.platform_option_id
+                existing_mapping_option_id[item.product_option_id] = (
+                    raw[len(naver_prefix) :] if raw.startswith(naver_prefix) else raw
+                )
 
         # seller_product_code별로 채널이 돌려준 서로 다른 channel_option_id를
         # 모아 모호성을 판정한다 - 같은 코드가 두 개 이상의 서로 다른 값으로
@@ -672,8 +688,8 @@ class ProductOptionPublishService:
         result_items: list[dict[str, Any]] = []
         for item in items:
             code = item.seller_product_code
-            mapped = already_mapped.get(item.product_option_id, False)
-            resolved_id: Optional[str] = None
+            mapped = item.product_option_id in existing_mapping_option_id
+            resolved_id: Optional[str] = existing_mapping_option_id.get(item.product_option_id)
             ambiguous = False
             if not mapped and code:
                 candidate_ids = candidates_by_code.get(code, set())
