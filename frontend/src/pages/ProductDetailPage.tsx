@@ -834,7 +834,24 @@ function ProductPublishControls({ optionId, platformId }: { optionId: number; pl
   )
 }
 
-function OptionSubDetail({ option, warehousePlatformId }: { option: ProductOptionDetail; warehousePlatformId: number }) {
+function OptionSubDetail({
+  option,
+  warehousePlatformId,
+  onClose,
+}: {
+  option: ProductOptionDetail
+  warehousePlatformId: number
+  onClose: () => void
+}) {
+  // 패널이 열릴 때(=이 컴포넌트가 새로 마운트될 때 - 부모가 key={option.id}로
+  // 옵션마다 새로 마운트하므로 옵션 전환 시에도 다시 실행된다) 키보드 포커스를
+  // 패널 제목으로 옮긴다 - 패널이 표 밖으로 분리되면서 "관리" 버튼과 DOM 위치가
+  // 멀어졌기 때문에, 자연스러운 탭 순서만으로는 포커스가 패널로 이어지지 않는다.
+  const headingRef = useRef<HTMLHeadingElement>(null)
+  useEffect(() => {
+    headingRef.current?.focus()
+  }, [])
+
   const { data: maps, reload: reloadMaps } = useApiData<ProductPlatformMap[]>(
     () => api.get(`/api/products/options/${option.id}/platform-map`),
     [option.id],
@@ -910,10 +927,13 @@ function OptionSubDetail({ option, warehousePlatformId }: { option: ProductOptio
   }
 
   return (
-    <tr className="detail-subrow">
-      <td colSpan={OPTIONS_TABLE_COLUMNS}>
-        <h3>SKU {option.sku_code} - 통계</h3>
-        <div className="table-scroll">
+    <div className="option-manage-panel">
+      <div className="option-manage-panel-header">
+        <h3 ref={headingRef} tabIndex={-1}>관리 중: SKU {option.sku_code}</h3>
+        <button type="button" onClick={onClose}>닫기</button>
+      </div>
+      <h3>통계</h3>
+      <div className="table-scroll">
           <table className="data-table nested">
             <thead>
               <tr><th>총 판매수량</th><th>최근 주문일</th><th>현재원가</th><th>현재재고</th></tr>
@@ -1040,8 +1060,7 @@ function OptionSubDetail({ option, warehousePlatformId }: { option: ProductOptio
             </tbody>
           </table>
         </div>
-      </td>
-    </tr>
+    </div>
   )
 }
 
@@ -1133,6 +1152,27 @@ export function ProductDetailPage() {
   const [optionForm, setOptionForm] = useState<ProductOptionCreate>({ sku_code: '' })
   const [optionError, setOptionError] = useState<string | null>(null)
   const [selectedOptionId, setSelectedOptionId] = useState<number | null>(null)
+  // 관리 패널이 옵션 표 밖으로 분리되면서(narrow-screen 대응) 패널을 연 "관리"
+  // 버튼과 패널이 더 이상 DOM상 붙어있지 않다 - 패널을 닫을 때(행의 토글이든
+  // 패널 자체의 닫기 버튼이든) 키보드 포커스를 원래 버튼으로 되돌리기 위해
+  // 마지막으로 패널을 연 버튼을 기억해 둔다.
+  const manageButtonRef = useRef<HTMLElement | null>(null)
+
+  const handleManage = (id: number) => {
+    if (selectedOptionId === id) {
+      setSelectedOptionId(null)
+      return
+    }
+    manageButtonRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    setSelectedOptionId(id)
+  }
+
+  const handleCloseManagePanel = () => {
+    setSelectedOptionId(null)
+    manageButtonRef.current?.focus()
+  }
+
+  const selectedOption = product?.options.find((o) => o.id === selectedOptionId) ?? null
 
   const handleCreateOption = async (e: FormEvent) => {
     e.preventDefault()
@@ -1242,25 +1282,27 @@ export function ProductDetailPage() {
           </thead>
           <tbody>
             {product?.options.map((o, index) => (
-              <Fragment key={o.id}>
-                <OptionRow
-                  option={o}
-                  index={index}
-                  total={product.options.length}
-                  onReload={reload}
-                  onMove={handleMoveOption}
-                  onToggleActive={handleToggleActive}
-                  onDelete={handleDeleteOption}
-                  onManage={(id) => setSelectedOptionId(selectedOptionId === id ? null : id)}
-                  isManaging={selectedOptionId === o.id}
-                />
-                {selectedOptionId === o.id && <OptionSubDetail option={o} warehousePlatformId={1} />}
-              </Fragment>
+              <OptionRow
+                key={o.id}
+                option={o}
+                index={index}
+                total={product.options.length}
+                onReload={reload}
+                onMove={handleMoveOption}
+                onToggleActive={handleToggleActive}
+                onDelete={handleDeleteOption}
+                onManage={handleManage}
+                isManaging={selectedOptionId === o.id}
+              />
             ))}
             {product?.options.length === 0 && <tr><td colSpan={OPTIONS_TABLE_COLUMNS}>등록된 옵션이 없습니다.</td></tr>}
           </tbody>
         </table>
       </div>
+
+      {selectedOption && (
+        <OptionSubDetail key={selectedOption.id} option={selectedOption} warehousePlatformId={1} onClose={handleCloseManagePanel} />
+      )}
 
       {product && <ProductImages productId={productId ?? ''} images={product.images} onChanged={reload} />}
     </div>
