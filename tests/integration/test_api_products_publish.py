@@ -76,6 +76,82 @@ class TestSaveAndGetDraft:
         assert resp.status_code == 404
 
 
+def _etc_channel_fields(notice_type: str = "ETC") -> dict:
+    return {
+        "productInfoProvidedNotice": {
+            "productInfoProvidedNoticeType": notice_type,
+            "categoryNoticeTypeConfirmedByOperator": False,
+            "etc": {},
+        }
+    }
+
+
+class TestConfirmEtcNotice:
+    """POST .../publish-drafts/{id}/confirm-etc-notice - 네이버 ETC 카테고리
+    적합성 "운영자 확인" 기록 API(services.product_publish_service.
+    ProductPublishService.confirm_etc_notice 참고)."""
+
+    def test_confirm_returns_confirmation_fields(self, client, auth_headers, seed_data):
+        _, option_id = _create_option(client, auth_headers, "etc-1")
+        draft_id = client.post(
+            f"/api/products/options/{option_id}/publish-draft",
+            json={
+                "platform_id": seed_data["platform_id"],
+                "category_code": "50000803",
+                "channel_fields": _etc_channel_fields(),
+            },
+            headers=auth_headers,
+        ).json()["id"]
+
+        resp = client.post(f"/api/products/publish-drafts/{draft_id}/confirm-etc-notice", headers=auth_headers)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["etc_notice_confirmed_at"] is not None
+        assert body["etc_notice_confirmed_category_code"] == "50000803"
+        assert body["etc_notice_confirmed_notice_type"] == "ETC"
+        assert body["etc_notice_confirmation_valid"] is True
+
+    def test_confirm_rejects_when_notice_type_not_etc(self, client, auth_headers, seed_data):
+        _, option_id = _create_option(client, auth_headers, "etc-2")
+        draft_id = client.post(
+            f"/api/products/options/{option_id}/publish-draft",
+            json={
+                "platform_id": seed_data["platform_id"],
+                "category_code": "50000803",
+                "channel_fields": _etc_channel_fields(notice_type="TOGETHER"),
+            },
+            headers=auth_headers,
+        ).json()["id"]
+
+        resp = client.post(f"/api/products/publish-drafts/{draft_id}/confirm-etc-notice", headers=auth_headers)
+        assert resp.status_code == 400
+
+    def test_confirm_missing_draft_returns_404(self, client, auth_headers):
+        resp = client.post("/api/products/publish-drafts/999999/confirm-etc-notice", headers=auth_headers)
+        assert resp.status_code == 404
+
+    def test_changing_category_code_invalidates_confirmation_via_api(self, client, auth_headers, seed_data):
+        _, option_id = _create_option(client, auth_headers, "etc-3")
+        draft_id = client.post(
+            f"/api/products/options/{option_id}/publish-draft",
+            json={
+                "platform_id": seed_data["platform_id"],
+                "category_code": "50000803",
+                "channel_fields": _etc_channel_fields(),
+            },
+            headers=auth_headers,
+        ).json()["id"]
+        client.post(f"/api/products/publish-drafts/{draft_id}/confirm-etc-notice", headers=auth_headers)
+
+        updated = client.post(
+            f"/api/products/options/{option_id}/publish-draft",
+            json={"platform_id": seed_data["platform_id"], "category_code": "50000999"},
+            headers=auth_headers,
+        ).json()
+        assert updated["etc_notice_confirmed_at"] is None
+        assert updated["etc_notice_confirmation_valid"] is False
+
+
 class TestSubmitDraft:
     def test_submit_returns_202_with_pending_command(self, client, auth_headers, seed_data):
         _, option_id = _create_option(client, auth_headers, "3")

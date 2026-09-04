@@ -248,6 +248,57 @@ input, select {
   background: #fafafa;
 }
 
+/* 좁은 화면에서 넓은 표(옵션/플랫폼 매핑/원가 이력 등)가 페이지 전체를 옆으로
+   밀어내지 않도록, 표 전용 래퍼 안에서만 가로 스크롤을 허용한다(표 자체를
+   overflow:hidden으로 잘라 버튼/정보를 숨기지 않는다 - 스크롤만 허용). 넓은
+   화면에서는 래퍼 폭이 이미 표보다 넉넉해 스크롤이 생기지 않으므로 기존
+   데스크톱 배치에 영향이 없다. */
+.table-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+/* 상품 상세: 신규 등록/정보수정 폼의 넓은 입력칸 - 데스크톱에서는 기존과 같은
+   최소폭을 유지하고, 768px 이하(좁은 화면)에서만 폭 제약을 풀어(0/전체폭) 한
+   입력칸이 화면 전체 폭보다 넓어져 페이지가 옆으로 밀리는 것을 막는다. */
+.publish-field-sm {
+  min-width: 200px;
+}
+
+.publish-field-md {
+  min-width: 280px;
+}
+
+.publish-field-lg {
+  min-width: 320px;
+}
+
+@media (max-width: 768px) {
+  .publish-field-sm,
+  .publish-field-md,
+  .publish-field-lg {
+    min-width: 0;
+    width: 100%;
+  }
+}
+
+/* 상품 상세 페이지 전용(다른 페이지의 .inline-form에는 영향 없음) - 일반
+   <input>은 명시적 크기가 없으면 브라우저 기본폭(~20자, 180px 안팎)을 가지며
+   flex-wrap 행에서도 그 밑으로 줄어들지 않는다(min-width:auto가 기본값이라
+   내용 크기 밑으로 shrink 불가). 그래서 사이드바(220px 고정, 페이지 공통이라
+   이번 범위 밖)를 뺀 나머지 폭이 좁아지면 이 입력칸들이 페이지 전체를 옆으로
+   밀어낸다. 768px 이하에서만 min-width를 0으로 풀어 각 입력칸이 사용 가능한
+   폭까지 줄어들 수 있게 한다 - 데스크톱(폭이 이미 충분한 경우)에는 아무
+   영향이 없다. */
+@media (max-width: 768px) {
+  .product-detail-page input,
+  .product-detail-page select,
+  .product-detail-page textarea {
+    min-width: 0;
+    max-width: 100%;
+  }
+}
+
 .clickable-row {
   cursor: pointer;
 }

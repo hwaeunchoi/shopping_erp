@@ -504,7 +504,7 @@ function ProductSyncControls({ mapping }: { mapping: ProductPlatformMap }) {
           value={infoDescription}
           onChange={(e) => setInfoDescription(e.target.value)}
           placeholder="새 상세설명(선택)"
-          style={{ minWidth: 200 }}
+          className="publish-field-sm"
         />
         <button type="submit" disabled={isSubmittingInfo}>
           {isSubmittingInfo ? '전송 중...' : '정보 수정 전송'}
@@ -544,6 +544,7 @@ function ProductPublishControls({ optionId, platformId }: { optionId: number; pl
   const [error, setError] = useState<string | null>(null)
   const [isSavingDraft, setIsSavingDraft] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const [isConfirmingEtcNotice, setIsConfirmingEtcNotice] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -674,6 +675,48 @@ function ProductPublishControls({ optionId, platformId }: { optionId: number; pl
     }
   }
 
+  // 채널별 세부 계약 정보 텍스트에서 "지금 화면에 입력된" 고시유형만 읽는다(저장
+  // 여부와 무관 - 저장 전에도 안내 문구가 맞게 보이도록). 파싱 실패 시 조용히
+  // undefined(안내 블록을 표시하지 않음) - 이 값 자체가 서버에 전송되는 것은
+  // 아니다(실제 전송값은 services.product_publish_service._draft_snapshot이
+  // 서버에 저장된 확인 기록으로부터 다시 계산한다).
+  let currentNoticeType: string | undefined
+  try {
+    const parsed = channelFields.trim() ? JSON.parse(channelFields) : {}
+    const notice = parsed?.productInfoProvidedNotice
+    if (notice && typeof notice === 'object') {
+      currentNoticeType = (notice as Record<string, unknown>).productInfoProvidedNoticeType as string | undefined
+    }
+  } catch {
+    currentNoticeType = undefined
+  }
+
+  const handleConfirmEtcNotice = async () => {
+    if (!draft) return
+    if (
+      !window.confirm(
+        `카테고리 코드 '${draft.category_code ?? ''}'에 네이버 ETC(기타 재화) 상품정보제공고시 양식을 ` +
+          '쓰는 것이 맞는지 판매자센터에서 직접 확인했습니까?\n' +
+          '이 확인은 시스템이 대신 검증한 것이 아니라 운영자 본인의 확인 기록으로 남습니다.',
+      )
+    ) {
+      return
+    }
+    setError(null)
+    setIsConfirmingEtcNotice(true)
+    try {
+      const updated = await api.post<ProductPublishDraft>(
+        `/api/products/publish-drafts/${draft.id}/confirm-etc-notice`,
+        {},
+      )
+      setDraft(updated)
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'ETC 카테고리 적합성 확인 기록 중 오류가 발생했습니다.')
+    } finally {
+      setIsConfirmingEtcNotice(false)
+    }
+  }
+
   if (draft?.registered_at) {
     return (
       <p className="hint-text">✅ 등록 완료(매핑 생성됨) - {new Date(draft.registered_at).toLocaleString()}</p>
@@ -697,21 +740,21 @@ function ProductPublishControls({ optionId, platformId }: { optionId: number; pl
           value={imageUrls}
           onChange={(e) => setImageUrls(e.target.value)}
           placeholder="이미지 URL(쉼표 구분, 첫 번째=대표, http/https만)"
-          style={{ minWidth: 280 }}
+          className="publish-field-md"
         />
         <textarea
           value={descriptionHtml}
           onChange={(e) => setDescriptionHtml(e.target.value)}
           placeholder="상세설명(HTML)"
           rows={2}
-          style={{ minWidth: 280 }}
+          className="publish-field-md"
         />
         <textarea
           value={channelFields}
           onChange={(e) => setChannelFields(e.target.value)}
           placeholder="채널별 세부 계약 정보(JSON) - 배송/반품/원산지/인증/상품정보제공고시 등"
           rows={3}
-          style={{ minWidth: 320 }}
+          className="publish-field-lg"
         />
         <button type="submit" disabled={isSavingDraft}>
           {isSavingDraft ? '저장 중...' : '초안 저장'}
@@ -719,6 +762,35 @@ function ProductPublishControls({ optionId, platformId }: { optionId: number; pl
       </form>
       {missingCoreFields.length > 0 && (
         <p className="hint-text" style={{ color: '#b45309' }}>입력 필요: {missingCoreFields.join(', ')}</p>
+      )}
+      {currentNoticeType === 'ETC' && (
+        <div className="hint-text" style={{ marginBottom: 8, padding: 8, border: '1px solid var(--border)', borderRadius: 6 }}>
+          <p style={{ margin: '0 0 4px' }}>
+            ⚠️ 이 채널은 상품정보제공고시로 <strong>ETC(기타 재화)</strong> 양식을 사용합니다. ETC 입력 형식
+            자체는 이 시스템이 지원하지만, <strong>이 카테고리에 ETC 고시가 실제로 맞는지는 공식 API로 검증할
+            방법이 없어</strong> 운영자가 네이버 판매자센터에서 직접 확인해야 합니다. 아래 확인은 그 사실을
+            기록할 뿐이며 "공식 적합성 검증 완료"를 의미하지 않습니다 - 카테고리 코드나 고시유형을 바꾸면
+            이 확인은 자동으로 무효화됩니다.
+          </p>
+          {draft?.etc_notice_confirmation_valid ? (
+            <p style={{ margin: '0 0 4px', color: '#15803d' }}>
+              ✅ 확인됨 - 사용자 #{draft.etc_notice_confirmed_by}
+              {draft.etc_notice_confirmed_at && `, ${new Date(draft.etc_notice_confirmed_at).toLocaleString()}`}
+              (카테고리 {draft.etc_notice_confirmed_category_code})
+            </p>
+          ) : draft?.etc_notice_confirmed_at ? (
+            <p style={{ margin: '0 0 4px', color: '#b45309' }}>
+              ⚠️ 이전 확인(카테고리 {draft.etc_notice_confirmed_category_code})이 카테고리/고시유형 변경으로
+              무효화되었습니다 - 다시 확인이 필요합니다.
+            </p>
+          ) : (
+            <p style={{ margin: '0 0 4px', color: '#b45309' }}>❌ 아직 확인되지 않았습니다 - 확인 전에는 등록이 차단됩니다.</p>
+          )}
+          <button type="button" onClick={handleConfirmEtcNotice} disabled={!draft || isConfirmingEtcNotice}>
+            {isConfirmingEtcNotice ? '기록 중...' : '이 카테고리에 ETC 고시가 맞음을 확인'}
+          </button>
+          {!draft && <span> (먼저 초안을 저장하세요)</span>}
+        </div>
       )}
       {draft && (
         <div style={{ marginBottom: 4 }}>
@@ -841,19 +913,21 @@ function OptionSubDetail({ option, warehousePlatformId }: { option: ProductOptio
     <tr className="detail-subrow">
       <td colSpan={OPTIONS_TABLE_COLUMNS}>
         <h3>SKU {option.sku_code} - 통계</h3>
-        <table className="data-table nested">
-          <thead>
-            <tr><th>총 판매수량</th><th>최근 주문일</th><th>현재원가</th><th>현재재고</th></tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>{option.stats.total_quantity_sold}</td>
-              <td>{option.stats.last_order_date ? new Date(option.stats.last_order_date).toLocaleDateString() : '-'}</td>
-              <td>{option.stats.current_cost_price?.toLocaleString() ?? '-'}</td>
-              <td>{option.stats.sellable_stock}</td>
-            </tr>
-          </tbody>
-        </table>
+        <div className="table-scroll">
+          <table className="data-table nested">
+            <thead>
+              <tr><th>총 판매수량</th><th>최근 주문일</th><th>현재원가</th><th>현재재고</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>{option.stats.total_quantity_sold}</td>
+                <td>{option.stats.last_order_date ? new Date(option.stats.last_order_date).toLocaleDateString() : '-'}</td>
+                <td>{option.stats.current_cost_price?.toLocaleString() ?? '-'}</td>
+                <td>{option.stats.sellable_stock}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
 
         <h3>플랫폼 매핑</h3>
         <form className="inline-form" onSubmit={handleAddMap}>
@@ -887,45 +961,47 @@ function OptionSubDetail({ option, warehousePlatformId }: { option: ProductOptio
           <button type="submit">매핑 등록</button>
         </form>
         {mapError && <p className="form-error">{mapError}</p>}
-        <table className="data-table nested">
-          <thead>
-            <tr>
-              <th>ID</th><th>플랫폼ID</th><th>옵션번호</th><th>상품번호</th><th>노출상품명</th><th>판매자상품코드</th><th></th><th>재고/판매상태 전송</th>
-            </tr>
-          </thead>
-          <tbody>
-            {maps?.map((m) => (
-              <Fragment key={m.id}>
-                <tr>
-                  <td>{m.id}</td>
-                  <td>{m.platform_id}</td>
-                  <td>{m.platform_option_id}</td>
-                  <td>{m.platform_product_id ?? '-'}</td>
-                  <td>{m.display_name ?? '-'}</td>
-                  <td>{m.seller_product_code ?? '-'}</td>
-                  <td>
-                    <button type="button" onClick={() => setEditingMapId(editingMapId === m.id ? null : m.id)}>
-                      수정
-                    </button>
-                    <button type="button" onClick={() => handleDeleteMap(m.id)}>삭제</button>
-                  </td>
-                  <td><ProductSyncControls mapping={m} /></td>
-                </tr>
-                {editingMapId === m.id && (
-                  <PlatformMapEditRow
-                    mapping={m}
-                    onCancel={() => setEditingMapId(null)}
-                    onSaved={() => {
-                      setEditingMapId(null)
-                      reloadMaps()
-                    }}
-                  />
-                )}
-              </Fragment>
-            ))}
-            {maps?.length === 0 && <tr><td colSpan={8}>등록된 매핑이 없습니다.</td></tr>}
-          </tbody>
-        </table>
+        <div className="table-scroll">
+          <table className="data-table nested">
+            <thead>
+              <tr>
+                <th>ID</th><th>플랫폼ID</th><th>옵션번호</th><th>상품번호</th><th>노출상품명</th><th>판매자상품코드</th><th></th><th>재고/판매상태 전송</th>
+              </tr>
+            </thead>
+            <tbody>
+              {maps?.map((m) => (
+                <Fragment key={m.id}>
+                  <tr>
+                    <td>{m.id}</td>
+                    <td>{m.platform_id}</td>
+                    <td>{m.platform_option_id}</td>
+                    <td>{m.platform_product_id ?? '-'}</td>
+                    <td>{m.display_name ?? '-'}</td>
+                    <td>{m.seller_product_code ?? '-'}</td>
+                    <td>
+                      <button type="button" onClick={() => setEditingMapId(editingMapId === m.id ? null : m.id)}>
+                        수정
+                      </button>
+                      <button type="button" onClick={() => handleDeleteMap(m.id)}>삭제</button>
+                    </td>
+                    <td><ProductSyncControls mapping={m} /></td>
+                  </tr>
+                  {editingMapId === m.id && (
+                    <PlatformMapEditRow
+                      mapping={m}
+                      onCancel={() => setEditingMapId(null)}
+                      onSaved={() => {
+                        setEditingMapId(null)
+                        reloadMaps()
+                      }}
+                    />
+                  )}
+                </Fragment>
+              ))}
+              {maps?.length === 0 && <tr><td colSpan={8}>등록된 매핑이 없습니다.</td></tr>}
+            </tbody>
+          </table>
+        </div>
 
         <h3>신규 채널 등록(초안)</h3>
         <p className="hint-text">
@@ -948,20 +1024,22 @@ function OptionSubDetail({ option, warehousePlatformId }: { option: ProductOptio
           <button type="submit">원가 등록</button>
         </form>
         {costError && <p className="form-error">{costError}</p>}
-        <table className="data-table nested">
-          <thead><tr><th>ID</th><th>원가</th><th>적용시작</th><th>적용종료</th></tr></thead>
-          <tbody>
-            {history?.map((h) => (
-              <tr key={h.id}>
-                <td>{h.id}</td>
-                <td>{h.cost_price.toLocaleString()}</td>
-                <td>{new Date(h.effective_from).toLocaleDateString()}</td>
-                <td>{h.effective_to ? new Date(h.effective_to).toLocaleDateString() : '적용중'}</td>
-              </tr>
-            ))}
-            {history?.length === 0 && <tr><td colSpan={4}>등록된 원가 이력이 없습니다.</td></tr>}
-          </tbody>
-        </table>
+        <div className="table-scroll">
+          <table className="data-table nested">
+            <thead><tr><th>ID</th><th>원가</th><th>적용시작</th><th>적용종료</th></tr></thead>
+            <tbody>
+              {history?.map((h) => (
+                <tr key={h.id}>
+                  <td>{h.id}</td>
+                  <td>{h.cost_price.toLocaleString()}</td>
+                  <td>{new Date(h.effective_from).toLocaleDateString()}</td>
+                  <td>{h.effective_to ? new Date(h.effective_to).toLocaleDateString() : '적용중'}</td>
+                </tr>
+              ))}
+              {history?.length === 0 && <tr><td colSpan={4}>등록된 원가 이력이 없습니다.</td></tr>}
+            </tbody>
+          </table>
+        </div>
       </td>
     </tr>
   )
@@ -1019,25 +1097,27 @@ function ProductImages({ productId, images, onChanged }: { productId: string; im
         <button type="submit">이미지 등록</button>
       </form>
       {error && <p className="form-error">{error}</p>}
-      <table className="data-table">
-        <thead><tr><th>미리보기</th><th>URL</th><th>구분</th><th></th><th></th></tr></thead>
-        <tbody>
-          {images.map((img) => (
-            <tr key={img.id}>
-              <td><img src={img.image_url} alt="" style={{ width: 60, height: 60, objectFit: 'cover' }} /></td>
-              <td>{img.image_url}</td>
-              <td>{img.is_thumbnail ? '대표이미지' : '추가이미지'}</td>
-              <td>
-                {!img.is_thumbnail && (
-                  <button type="button" onClick={() => handleSetThumbnail(img.id)}>대표로 지정</button>
-                )}
-              </td>
-              <td><button type="button" onClick={() => handleDelete(img.id)}>삭제</button></td>
-            </tr>
-          ))}
-          {images.length === 0 && <tr><td colSpan={5}>등록된 이미지가 없습니다.</td></tr>}
-        </tbody>
-      </table>
+      <div className="table-scroll">
+        <table className="data-table">
+          <thead><tr><th>미리보기</th><th>URL</th><th>구분</th><th></th><th></th></tr></thead>
+          <tbody>
+            {images.map((img) => (
+              <tr key={img.id}>
+                <td><img src={img.image_url} alt="" style={{ width: 60, height: 60, objectFit: 'cover' }} /></td>
+                <td>{img.image_url}</td>
+                <td>{img.is_thumbnail ? '대표이미지' : '추가이미지'}</td>
+                <td>
+                  {!img.is_thumbnail && (
+                    <button type="button" onClick={() => handleSetThumbnail(img.id)}>대표로 지정</button>
+                  )}
+                </td>
+                <td><button type="button" onClick={() => handleDelete(img.id)}>삭제</button></td>
+              </tr>
+            ))}
+            {images.length === 0 && <tr><td colSpan={5}>등록된 이미지가 없습니다.</td></tr>}
+          </tbody>
+        </table>
+      </div>
     </div>
   )
 }
@@ -1108,7 +1188,7 @@ export function ProductDetailPage() {
   }
 
   return (
-    <div>
+    <div className="product-detail-page">
       <p><Link to="/products">← 상품 목록으로</Link></p>
       <h2>
         상품 상세 #{productId} {productId && <FavoriteStar targetType="PRODUCT" targetId={Number(productId)} />}
@@ -1153,32 +1233,34 @@ export function ProductDetailPage() {
       {optionError && <p className="form-error">{optionError}</p>}
 
       <p className="hint-text">옵션명·색상·사이즈·바코드·단가를 칸에서 바로 고친 뒤 <strong>저장</strong>을 누르세요(Enter로도 저장).</p>
-      <table className="data-table">
-        <thead>
-          <tr>
-            <th>순서</th><th>SKU</th><th>옵션명</th><th>색상</th><th>사이즈</th><th>바코드</th><th>단가</th><th>상태</th><th>저장</th><th>판매설정</th><th>삭제/관리</th>
-          </tr>
-        </thead>
-        <tbody>
-          {product?.options.map((o, index) => (
-            <Fragment key={o.id}>
-              <OptionRow
-                option={o}
-                index={index}
-                total={product.options.length}
-                onReload={reload}
-                onMove={handleMoveOption}
-                onToggleActive={handleToggleActive}
-                onDelete={handleDeleteOption}
-                onManage={(id) => setSelectedOptionId(selectedOptionId === id ? null : id)}
-                isManaging={selectedOptionId === o.id}
-              />
-              {selectedOptionId === o.id && <OptionSubDetail option={o} warehousePlatformId={1} />}
-            </Fragment>
-          ))}
-          {product?.options.length === 0 && <tr><td colSpan={OPTIONS_TABLE_COLUMNS}>등록된 옵션이 없습니다.</td></tr>}
-        </tbody>
-      </table>
+      <div className="table-scroll options-table-scroll">
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>순서</th><th>SKU</th><th>옵션명</th><th>색상</th><th>사이즈</th><th>바코드</th><th>단가</th><th>상태</th><th>저장</th><th>판매설정</th><th>삭제/관리</th>
+            </tr>
+          </thead>
+          <tbody>
+            {product?.options.map((o, index) => (
+              <Fragment key={o.id}>
+                <OptionRow
+                  option={o}
+                  index={index}
+                  total={product.options.length}
+                  onReload={reload}
+                  onMove={handleMoveOption}
+                  onToggleActive={handleToggleActive}
+                  onDelete={handleDeleteOption}
+                  onManage={(id) => setSelectedOptionId(selectedOptionId === id ? null : id)}
+                  isManaging={selectedOptionId === o.id}
+                />
+                {selectedOptionId === o.id && <OptionSubDetail option={o} warehousePlatformId={1} />}
+              </Fragment>
+            ))}
+            {product?.options.length === 0 && <tr><td colSpan={OPTIONS_TABLE_COLUMNS}>등록된 옵션이 없습니다.</td></tr>}
+          </tbody>
+        </table>
+      </div>
 
       {product && <ProductImages productId={productId ?? ''} images={product.images} onChanged={reload} />}
     </div>

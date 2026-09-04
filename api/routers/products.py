@@ -991,9 +991,27 @@ class ProductPublishDraftOut(BaseModel):
     channel_fields: dict[str, Any] = {}
     registered_at: Optional[datetime] = None
     pending_platform_product_id: Optional[str] = None
+    # 네이버 ETC 카테고리 적합성 확인 기록(공식 검증이 아니라 운영자 확인 기록 -
+    # services.product_publish_service.ProductPublishService.confirm_etc_notice
+    # 참고). etc_notice_confirmation_valid는 확인 시점의 category_code/고시유형이
+    # 지금 값과 여전히 같은지까지 반영한 값이다 - 카테고리/고시유형이 바뀌면
+    # 확인 기록 자체는 남아 있어도(감사 목적) 이 값은 False가 된다.
+    etc_notice_confirmed_by: Optional[int] = None
+    etc_notice_confirmed_at: Optional[datetime] = None
+    etc_notice_confirmed_category_code: Optional[str] = None
+    etc_notice_confirmed_notice_type: Optional[str] = None
+    etc_notice_confirmation_valid: bool = False
 
     @classmethod
     def from_draft(cls, draft: Any) -> "ProductPublishDraftOut":
+        channel_fields = json.loads(draft.channel_fields_json) if draft.channel_fields_json else {}
+        notice = channel_fields.get("productInfoProvidedNotice") if isinstance(channel_fields, dict) else None
+        current_notice_type = notice.get("productInfoProvidedNoticeType") if isinstance(notice, dict) else None
+        confirmation_valid = (
+            draft.etc_notice_confirmed_at is not None
+            and draft.etc_notice_confirmed_category_code == draft.category_code
+            and draft.etc_notice_confirmed_notice_type == current_notice_type
+        )
         return cls(
             id=draft.id,
             product_option_id=draft.product_option_id,
@@ -1004,9 +1022,14 @@ class ProductPublishDraftOut(BaseModel):
             category_code=draft.category_code,
             image_urls=json.loads(draft.image_urls_json) if draft.image_urls_json else [],
             stock_quantity=draft.stock_quantity,
-            channel_fields=json.loads(draft.channel_fields_json) if draft.channel_fields_json else {},
+            channel_fields=channel_fields,
             registered_at=draft.registered_at,
             pending_platform_product_id=draft.pending_platform_product_id,
+            etc_notice_confirmed_by=draft.etc_notice_confirmed_by,
+            etc_notice_confirmed_at=draft.etc_notice_confirmed_at,
+            etc_notice_confirmed_category_code=draft.etc_notice_confirmed_category_code,
+            etc_notice_confirmed_notice_type=draft.etc_notice_confirmed_notice_type,
+            etc_notice_confirmation_valid=confirmation_valid,
         )
 
 
@@ -1057,6 +1080,35 @@ def get_publish_draft(option_id: int, platform_id: int, db: Session = Depends(ge
     draft = ProductPublishDraftRepository(db).get_by_option_and_platform(option_id, platform_id)
     if draft is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="초안이 없습니다.")
+    return ProductPublishDraftOut.from_draft(draft)
+
+
+@router.post(
+    "/publish-drafts/{draft_id}/confirm-etc-notice",
+    response_model=ProductPublishDraftOut,
+    summary="네이버 ETC 카테고리 적합성 확인 기록",
+    description="이 카테고리에 ETC(기타 재화) 상품정보제공고시 양식을 쓰는 것이 맞는지 판매자센터에서 "
+    "직접 확인했다는 사실을 기록한다 - 이 API 자체가 공식 적합성을 검증하는 것은 아니다(공식으로 "
+    "검증할 API가 없다 - integrations.malls.naver_smartstore_connector 모듈 docstring 참고). "
+    "현재 채널별 세부 계약 정보의 고시유형이 ETC가 아니면 거부한다. 이후 카테고리 코드나 고시유형이 "
+    "바뀌면 이 확인은 자동으로 무효화되며 다시 확인해야 한다.",
+    responses={
+        404: {"description": "초안을 찾을 수 없습니다."},
+        400: {"description": "카테고리 코드가 없거나 현재 고시유형이 ETC가 아닙니다."},
+    },
+)
+def confirm_publish_etc_notice(
+    draft_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+) -> ProductPublishDraftOut:
+    service = ProductPublishService(db)
+    try:
+        draft = service.confirm_etc_notice(draft_id, confirmed_by=current_user.id)
+    except ProductPublishDraftNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except ValueError as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    db.commit()
     return ProductPublishDraftOut.from_draft(draft)
 
 

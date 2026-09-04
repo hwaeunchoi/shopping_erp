@@ -137,6 +137,11 @@ export interface ProductPublishDraft {
   channel_fields: Record<string, unknown>
   registered_at: string | null
   pending_platform_product_id: string | null
+  etc_notice_confirmed_by: number | null
+  etc_notice_confirmed_at: string | null
+  etc_notice_confirmed_category_code: string | null
+  etc_notice_confirmed_notice_type: string | null
+  etc_notice_confirmation_valid: boolean
 }
 
 export interface RegistrationStatus {

@@ -68,6 +68,7 @@ from integrations.malls.errors import (
     MarketplaceCredentialMissingError,
     MarketplaceError,
     MarketplaceExternalAPIError,
+    MarketplaceValidationError,
 )
 from models.integration_sync import ExternalCommand, ProductPublishCommandDetail
 from models.product import ProductPlatformMap, ProductPublishDraft
@@ -151,20 +152,32 @@ def _describe_exception(exc: Exception) -> str:
     """ExternalCommand.error_code에 담을 안전한 사유 문자열을 만든다.
 
     capability(MarketplaceCapabilityUnsupportedError)/reason_code
-    (MarketplaceExternalAPIError 등)가 있으면 그 짧은 코드를 우선한다(기존 동작
-    유지). 둘 다 없으면(특히 ValueError - create_product()의 "필수 항목이 비어
-    있습니다: ..." 같은 항목별 안내 메시지) 클래스명 하나로 뭉뚱그리지 않고
-    실제 예외 메시지를 그대로 담는다 - 그렇지 않으면 화면에 "사유: ValueError"만
-    보여 어떤 항목이 비었는지 운영자가 알 수 없다(실제 클릭 검증으로 발견된
-    결함). 원본 응답 전문·Secret이 아니라 이 서비스가 직접 만든 검증 메시지이므로
-    노출해도 안전하다."""
+    (MarketplaceExternalAPIError·ProductPublishRejectedError 등)가 있으면 그
+    짧은 코드를 우선한다(기존 동작 유지 - 이 두 속성은 이 서비스가 직접 짧고
+    안전한 값만 넣는다). MarketplaceCredentialMissingError는 marketplace_code로
+    직접 정적 문구를 다시 만든다(str(exc)를 신뢰하지 않음 - 그 클래스가 나중에
+    바뀌어도 이 함수의 안전성이 그 클래스 구현에 의존하지 않도록).
+
+    그 외에는 화이트리스트에 있는 타입(MarketplaceValidationError - 이
+    모듈/커넥터가 필드명·정적 문구로만 만든 검증 오류 전용 타입)만 실제 메시지를
+    그대로 담는다 - 그렇지 않으면(특히 create_product()의 "필수 항목이 비어
+    있습니다: ..." 같은 항목별 안내) 화면에 "사유: ValueError"만 보여 어떤
+    항목이 비었는지 운영자가 알 수 없다(실제 클릭 검증으로 발견된 결함).
+
+    그 외 모든 예외(SQLAlchemy 오류·커넥터 버그·예상 못한 라이브러리 예외 등
+    - bare ValueError 포함)는 str(exc)에 원본 응답 본문·요청 URL·Secret이 섞여
+    있을 수 있으므로 절대 그대로 노출하지 않고, 클래스명만 담은 안정적인 일반
+    오류 코드로 대체한다. 500자 절단은 노출 범위를 줄일 뿐 안전 여부를 결정하지
+    않는다 - 그래서 안전하다고 확인된 타입만 화이트리스트로 통과시킨다."""
     code = getattr(exc, "capability", None) or getattr(exc, "reason_code", None)
     if code:
-        return str(code)
-    message = str(exc)
-    if message:
-        return message[:_ERROR_CODE_MAX_LENGTH]
-    return type(exc).__name__
+        return str(code)[:_ERROR_CODE_MAX_LENGTH]
+    if isinstance(exc, MarketplaceCredentialMissingError):
+        return f"{exc.marketplace_code}: 쇼핑몰 연결정보가 없거나 사용할 수 없습니다."[:_ERROR_CODE_MAX_LENGTH]
+    if isinstance(exc, MarketplaceValidationError):
+        message = str(exc)
+        return message[:_ERROR_CODE_MAX_LENGTH] if message else type(exc).__name__
+    return f"INTERNAL_ERROR:{type(exc).__name__}"
 
 
 def _retry_backoff(attempt_count: int) -> timedelta:
@@ -175,7 +188,21 @@ def _retry_backoff(attempt_count: int) -> timedelta:
 def _validate_image_urls(image_urls: list[str]) -> None:
     for url in image_urls:
         if not isinstance(url, str) or not url.lower().startswith(ALLOWED_IMAGE_URL_SCHEMES):
-            raise ValueError(f"허용되지 않는 이미지 경로입니다(http/https URL만 허용): {url}")
+            raise MarketplaceValidationError(f"허용되지 않는 이미지 경로입니다(http/https URL만 허용): {url}")
+
+
+def _notice_type_from_channel_fields_json(channel_fields_json: Optional[str]) -> Optional[str]:
+    """channel_fields_json에서 productInfoProvidedNotice.productInfoProvidedNoticeType만
+    안전하게 꺼낸다(형식이 예상과 다르면 조용히 None - 이 함수는 검증이 아니라
+    ETC 확인 무효화 판단/스냅샷 계산에만 쓰인다)."""
+    if not channel_fields_json:
+        return None
+    try:
+        channel_fields = json.loads(channel_fields_json)
+    except (ValueError, TypeError):
+        return None
+    notice = channel_fields.get("productInfoProvidedNotice") if isinstance(channel_fields, dict) else None
+    return notice.get("productInfoProvidedNoticeType") if isinstance(notice, dict) else None
 
 
 @dataclass
@@ -241,11 +268,69 @@ class ProductPublishService:
             draft.stock_quantity = stock_quantity
         if channel_fields is not None:
             draft.channel_fields_json = json.dumps(channel_fields, ensure_ascii=False)
+        # 확인 대상 카테고리·고시유형이 바뀌면 이전 네이버 ETC 카테고리 적합성
+        # 확인은 무효화한다(integrations.malls.naver_smartstore_connector 모듈
+        # docstring/confirm_etc_notice 참고) - 확인 시점 스냅샷(category_code/
+        # notice_type)과 지금 값이 다르면 확인 기록을 전부 지운다. 아무 것도
+        # 바뀌지 않았으면(이번 호출이 다른 필드만 수정) 값이 그대로 같아
+        # 지워지지 않는다.
+        if draft.etc_notice_confirmed_at is not None:
+            current_notice_type = _notice_type_from_channel_fields_json(draft.channel_fields_json)
+            if (
+                draft.etc_notice_confirmed_category_code != draft.category_code
+                or draft.etc_notice_confirmed_notice_type != current_notice_type
+            ):
+                draft.etc_notice_confirmed_by = None
+                draft.etc_notice_confirmed_at = None
+                draft.etc_notice_confirmed_category_code = None
+                draft.etc_notice_confirmed_notice_type = None
+        self.session.flush()
+        return draft
+
+    def confirm_etc_notice(self, draft_id: int, confirmed_by: int) -> ProductPublishDraft:
+        """운영자가 화면에서 "이 카테고리에 네이버 ETC(기타 재화) 상품정보제공고시
+        양식을 쓰는 게 맞는지 판매자센터에서 직접 확인했다"는 사실을 명시적으로
+        기록한다(integrations.malls.naver_smartstore_connector 모듈 docstring
+        참고) - 이 확인은 공식 API가 검증한 결과가 아니라 운영자 확인 기록일
+        뿐이다("공식 적합성 검증 완료"를 의미하지 않는다). 원시 channel_fields
+        JSON에 categoryNoticeTypeConfirmedByOperator를 직접 써넣는 방식에
+        의존하지 않도록, 이 서비스가 감사 가능한 확인 기록(확인자/시각/대상
+        카테고리·고시유형)만 신뢰의 근거로 삼는다 - _draft_snapshot()이 전송
+        스냅샷을 만들 때 이 기록으로부터 실제 값을 다시 계산해 원시 JSON 값을
+        덮어쓴다(그래서 이 확인 없이 JSON에 직접 true를 써도 우회할 수 없다)."""
+        draft = self.draft_repo.get_by_id(draft_id)
+        if draft is None:
+            raise ProductPublishDraftNotFoundError(f"초안을 찾을 수 없습니다: id={draft_id}")
+        if not draft.category_code:
+            raise ValueError("카테고리 코드가 없습니다 - 먼저 카테고리 코드를 입력하고 저장하세요.")
+        notice_type = _notice_type_from_channel_fields_json(draft.channel_fields_json)
+        if notice_type != "ETC":
+            raise ValueError(
+                "현재 상품정보제공고시 유형이 ETC가 아니라서 이 확인이 적용되지 않습니다"
+                f"(channel_fields.productInfoProvidedNotice.productInfoProvidedNoticeType={notice_type!r})."
+            )
+        draft.etc_notice_confirmed_by = confirmed_by
+        draft.etc_notice_confirmed_at = datetime.now(timezone.utc)
+        draft.etc_notice_confirmed_category_code = draft.category_code
+        draft.etc_notice_confirmed_notice_type = notice_type
         self.session.flush()
         return draft
 
     @staticmethod
     def _draft_snapshot(draft: ProductPublishDraft) -> dict[str, Any]:
+        channel_fields = json.loads(draft.channel_fields_json) if draft.channel_fields_json else {}
+        notice = channel_fields.get("productInfoProvidedNotice") if isinstance(channel_fields, dict) else None
+        if isinstance(notice, dict) and notice.get("productInfoProvidedNoticeType") == "ETC":
+            # 운영자가 화면에서 명시적으로 확인한 감사 가능한 기록만 신뢰한다 -
+            # 원시 JSON에 이 키를 직접 true로 써넣어도(수동 조작·복사) 여기서
+            # confirm_etc_notice()가 남긴 실제 확인 기록으로 다시 계산해
+            # 덮어쓴다(모듈 docstring 참고 - 원시 JSON 플래그만으로는 우회할
+            # 수 없다).
+            notice["categoryNoticeTypeConfirmedByOperator"] = (
+                draft.etc_notice_confirmed_at is not None
+                and draft.etc_notice_confirmed_category_code == draft.category_code
+                and draft.etc_notice_confirmed_notice_type == "ETC"
+            )
         return {
             "name": draft.name,
             "sale_price": float(draft.sale_price) if draft.sale_price is not None else None,
@@ -253,7 +338,7 @@ class ProductPublishService:
             "category_code": draft.category_code,
             "image_urls": json.loads(draft.image_urls_json) if draft.image_urls_json else [],
             "stock_quantity": draft.stock_quantity,
-            "channel_fields": json.loads(draft.channel_fields_json) if draft.channel_fields_json else {},
+            "channel_fields": channel_fields,
         }
 
     # --- 접수(enqueue) ---
@@ -364,7 +449,7 @@ class ProductPublishService:
         try:
             platform = self.platform_repo.get_by_id(command.platform_id)
             if platform is None:
-                raise ValueError(f"플랫폼 정보를 찾을 수 없습니다: platform_id={command.platform_id}")
+                raise MarketplaceValidationError(f"플랫폼 정보를 찾을 수 없습니다: platform_id={command.platform_id}")
             connector = self.connector_factory(platform.connector_class, self.session, platform.id)
             if not getattr(connector, "supports_product_create", False):
                 raise MarketplaceCapabilityUnsupportedError(platform.code, "product_create")

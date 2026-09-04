@@ -55,6 +55,7 @@ from integrations.malls.errors import (
     MarketplaceCapabilityUnsupportedError,
     MarketplaceCredentialMissingError,
     MarketplaceExternalAPIError,
+    MarketplaceValidationError,
     external_call,
     raise_for_status,
 )
@@ -307,7 +308,9 @@ def _validate_naver_publish_draft(draft: dict[str, Any]) -> None:
             )
 
     if missing:
-        raise ValueError("네이버 상품 등록에 필요한 항목이 비어 있습니다(추측 금지): " + ", ".join(missing))
+        raise MarketplaceValidationError(
+            "네이버 상품 등록에 필요한 항목이 비어 있습니다(추측 금지): " + ", ".join(missing)
+        )
 
 
 class NaverSmartstoreConnector(BaseMallConnector):
@@ -479,7 +482,7 @@ class NaverSmartstoreConnector(BaseMallConnector):
             raise MarketplaceCapabilityUnsupportedError("naver", "sale_status_update_missing_origin_product_id")
         naver_status = _SALE_STATUS_TO_NAVER.get(target_status)
         if naver_status is None:
-            raise ValueError(f"알 수 없는 target_status입니다: {target_status}")
+            raise MarketplaceValidationError(f"알 수 없는 target_status입니다: {target_status}")
         credentials = self._get_credentials()
         if credentials is None:
             raise MarketplaceCredentialMissingError("naver")
@@ -575,7 +578,7 @@ class NaverSmartstoreConnector(BaseMallConnector):
         if not platform_origin_product_id:
             raise MarketplaceCapabilityUnsupportedError("naver", "product_info_update_missing_origin_product_id")
         if name is None and sale_price is None and description is None:
-            raise ValueError("수정할 항목(상품명/판매가/상세설명)이 하나도 없습니다.")
+            raise MarketplaceValidationError("수정할 항목(상품명/판매가/상세설명)이 하나도 없습니다.")
         credentials = self._get_credentials()
         if credentials is None:
             raise MarketplaceCredentialMissingError("naver")

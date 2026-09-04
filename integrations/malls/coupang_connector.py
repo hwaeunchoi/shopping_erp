@@ -54,6 +54,7 @@ from integrations.malls.errors import (
     MarketplaceCapabilityUnsupportedError,
     MarketplaceCredentialMissingError,
     MarketplaceExternalAPIError,
+    MarketplaceValidationError,
     external_call,
     raise_for_status,
 )
@@ -487,7 +488,7 @@ class CoupangConnector(BaseMallConnector):
         elif target_status == SALE_STATUS_SUSPENDED:
             path = SALES_STOP_PATH_TMPL.format(vendor_item_id=platform_option_id)
         else:
-            raise ValueError(f"알 수 없는 target_status입니다: {target_status}")
+            raise MarketplaceValidationError(f"알 수 없는 target_status입니다: {target_status}")
         return self._call_product_action(path, access_key, secret_key)
 
     def _call_product_action(self, path: str, access_key: str, secret_key: str) -> ProductSyncActionResult:
@@ -544,7 +545,7 @@ class CoupangConnector(BaseMallConnector):
         운영자가 True를 입력하면 그대로 True로 보낸다)."""
         category_code = draft_snapshot.get("category_code")
         if not category_code:
-            raise ValueError("category_code(displayCategoryCode)가 비어 있습니다.")
+            raise MarketplaceValidationError("category_code(displayCategoryCode)가 비어 있습니다.")
         core_missing = _validate_coupang_publish_draft(draft_snapshot)
         requirements = self.fetch_category_requirements(category_code)
         cf = draft_snapshot.get("channel_fields") or {}
@@ -556,7 +557,7 @@ class CoupangConnector(BaseMallConnector):
         ]
         missing = core_missing + category_missing
         if missing:
-            raise ValueError(
+            raise MarketplaceValidationError(
                 f"쿠팡 상품 등록에 필요한 항목이 비어 있습니다(카테고리={category_code}, 추측 금지): "
                 + ", ".join(missing)
             )

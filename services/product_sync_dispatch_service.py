@@ -119,6 +119,7 @@ from integrations.malls.errors import (
     MarketplaceCredentialMissingError,
     MarketplaceError,
     MarketplaceExternalAPIError,
+    MarketplaceValidationError,
 )
 from models.extra import AuditLog
 from models.integration_sync import ExternalCommand, ProductSyncCommandDetail
@@ -208,21 +209,25 @@ _ERROR_CODE_MAX_LENGTH = 500
 
 def _describe_exception(exc: Exception) -> str:
     """ExternalCommand.error_code에 담을 안전한 사유 문자열을 만든다(services.
-    product_publish_service._describe_exception과 동일 원칙).
-
-    capability/reason_code가 있으면 그 짧은 코드를 우선한다. 둘 다 없으면
-    (특히 ValueError - update_product_info()의 "수정할 항목이 없습니다" 등
-    안내 메시지) 클래스명 하나로 뭉뚱그리지 않고 실제 예외 메시지를 그대로
-    담는다 - 그렇지 않으면 화면에 "사유: ValueError"만 보여 운영자가 실제
-    원인을 알 수 없다(실제 클릭 검증으로 발견된 결함). 원본 응답 전문·Secret이
-    아니라 이 서비스가 직접 만든 검증 메시지이므로 노출해도 안전하다."""
+    product_publish_service._describe_exception과 동일 원칙 - 화이트리스트
+    기반: capability/reason_code가 있으면 그 짧은 코드를 우선하고,
+    MarketplaceCredentialMissingError는 marketplace_code로 정적 문구를 다시
+    만들고, MarketplaceValidationError(이 모듈/커넥터가 필드명·정적 문구로만
+    만든 검증 오류 전용 타입 - 예: update_product_info()의 "수정할 항목이
+    없습니다")만 실제 메시지를 그대로 담는다. 그 외 모든 예외(SQLAlchemy
+    오류·커넥터 버그·예상 못한 라이브러리 예외 등 - bare ValueError 포함)는
+    str(exc)에 원본 응답 본문·요청 URL·Secret이 섞여 있을 수 있으므로 절대
+    그대로 노출하지 않고, 클래스명만 담은 안정적인 일반 오류 코드로 대체한다.
+    500자 절단은 노출 범위를 줄일 뿐 안전 여부를 결정하지 않는다."""
     code = getattr(exc, "capability", None) or getattr(exc, "reason_code", None)
     if code:
-        return str(code)
-    message = str(exc)
-    if message:
-        return message[:_ERROR_CODE_MAX_LENGTH]
-    return type(exc).__name__
+        return str(code)[:_ERROR_CODE_MAX_LENGTH]
+    if isinstance(exc, MarketplaceCredentialMissingError):
+        return f"{exc.marketplace_code}: 쇼핑몰 연결정보가 없거나 사용할 수 없습니다."[:_ERROR_CODE_MAX_LENGTH]
+    if isinstance(exc, MarketplaceValidationError):
+        message = str(exc)
+        return message[:_ERROR_CODE_MAX_LENGTH] if message else type(exc).__name__
+    return f"INTERNAL_ERROR:{type(exc).__name__}"
 
 
 def _retry_backoff(attempt_count: int) -> timedelta:
@@ -498,7 +503,7 @@ class ProductSyncDispatchService:
         try:
             platform = self.platform_repo.get_by_id(mapping.platform_id)
             if platform is None:
-                raise ValueError(f"플랫폼 정보를 찾을 수 없습니다: platform_id={mapping.platform_id}")
+                raise MarketplaceValidationError(f"플랫폼 정보를 찾을 수 없습니다: platform_id={mapping.platform_id}")
             connector = self.connector_factory(platform.connector_class, self.session, platform.id)
             self._dispatch(connector, platform.code, command, mapping, detail)
         except Exception as e:  # noqa: BLE001 - 분류 후 안전하게 기록하고 다시 던진다.

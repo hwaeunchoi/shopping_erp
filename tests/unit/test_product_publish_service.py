@@ -9,7 +9,11 @@ ProductPublishService: 상용 ERP 확장(3단계, 두 번째 묶음) - 신규 �
 import pytest
 
 from integrations.malls.base_mall_connector import ProductCreateResult
-from integrations.malls.errors import MarketplaceCapabilityUnsupportedError, MarketplaceExternalAPIError
+from integrations.malls.errors import (
+    MarketplaceCapabilityUnsupportedError,
+    MarketplaceExternalAPIError,
+    MarketplaceValidationError,
+)
 from models.integration_sync import ExternalCommand
 from models.product import ProductPlatformMap
 from repositories.product_repository import ProductPlatformMapRepository
@@ -27,12 +31,13 @@ class StubPublishConnector:
 
     supports_product_create = True
 
-    def __init__(self, *, result=None, error=None, registration_status=None):
+    def __init__(self, *, result=None, error=None, registration_status=None, status_check_error=None):
         self._result = result or ProductCreateResult(
             accepted=True, platform_result_code="SUCCESS", channel_product_id="EXT-P-1", channel_option_id="EXT-O-1"
         )
         self._error = error
         self._registration_status = registration_status or {"status_name": "APPROVED", "channel_option_ids": []}
+        self._status_check_error = status_check_error
         self.calls: list = []
 
     def create_product(self, draft_snapshot):
@@ -42,6 +47,8 @@ class StubPublishConnector:
         return self._result
 
     def fetch_registration_status(self, platform_product_id):
+        if self._status_check_error:
+            raise self._status_check_error
         return self._registration_status
 
 
@@ -209,13 +216,17 @@ class TestExecuteCommand:
     def test_validation_error_message_is_preserved_in_error_code_not_just_class_name(
         self, db_session, product_option, platform
     ):
-        """create_product()가 필수 항목 누락으로 ValueError를 던지면(예: 네이버
-        커넥터의 항목별 안내), error_code에 "ValueError"라는 클래스명만 남기지
-        않고 실제 메시지를 그대로 보존해야 한다 - 그렇지 않으면 화면에 "사유:
-        ValueError"만 보여 운영자가 어떤 항목이 비었는지 알 수 없다(실제 클릭
-        검증으로 발견된 결함)."""
+        """create_product()가 필수 항목 누락으로 MarketplaceValidationError를
+        던지면(예: 네이버 커넥터의 항목별 안내 - 이 타입은 필드명·정적 문구만
+        담도록 이 코드베이스가 직접 관리하는, 노출해도 안전하다고 확인된 타입),
+        error_code에 "ValueError"라는 클래스명만 남기지 않고 실제 메시지를
+        그대로 보존해야 한다 - 그렇지 않으면 화면에 "사유: ValueError"만 보여
+        운영자가 어떤 항목이 비었는지 알 수 없다(실제 클릭 검증으로 발견된
+        결함)."""
         connector = StubPublishConnector(
-            error=ValueError("네이버 상품 등록에 필요한 항목이 비어 있습니다(추측 금지): 카테고리 코드, 판매가")
+            error=MarketplaceValidationError(
+                "네이버 상품 등록에 필요한 항목이 비어 있습니다(추측 금지): 카테고리 코드, 판매가"
+            )
         )
         svc = ProductPublishService(db_session, connector_factory=_factory(connector))
         draft = svc.save_draft(product_option.id, platform.id, **_valid_snapshot_kwargs())
@@ -230,6 +241,36 @@ class TestExecuteCommand:
             outcome.command.error_code
             == "네이버 상품 등록에 필요한 항목이 비어 있습니다(추측 금지): 카테고리 코드, 판매가"
         )
+
+    def test_unrecognized_exception_message_is_not_leaked_into_error_code(self, db_session, product_option, platform):
+        """create_product()가 우리가 안전하다고 표시하지 않은 예외(bare
+        ValueError 포함 - 커넥터 버그나 예상 못한 라이브러리 오류를 흉내낸다)를
+        던지면, 그 예외의 원본 메시지(합성 Secret/URL 쿼리/응답 본문을 담고
+        있다고 가정)가 error_code에 그대로 저장되면 안 된다 - 500자 절단은
+        보호 수단이 아니다(원문이 500자 미만이면 그대로 노출될 것이기 때문).
+        안전하다고 확인된 타입(MarketplaceValidationError 등)만 화이트리스트를
+        통과한다."""
+        synthetic_secret_payload = (
+            "internal call failed: url=https://api.example-mall.test/v2/products?"
+            "access_token=SECRET_TOKEN_ABC123&vendor_id=SENSITIVE_VENDOR_9 "
+            'response_body={"authorization":"Bearer sk_live_synthetic_0001"}'
+        )
+        connector = StubPublishConnector(error=ValueError(synthetic_secret_payload))
+        svc = ProductPublishService(db_session, connector_factory=_factory(connector))
+        draft = svc.save_draft(product_option.id, platform.id, **_valid_snapshot_kwargs())
+        outcome = svc.enqueue_create(draft.id)
+
+        with pytest.raises(ValueError):
+            svc.execute_command(outcome.command.id)
+
+        db_session.refresh(outcome.command)
+        assert outcome.command.status == "FAILED"
+        assert outcome.command.error_code is not None
+        assert "SECRET_TOKEN_ABC123" not in outcome.command.error_code
+        assert "sk_live_synthetic_0001" not in outcome.command.error_code
+        assert "SENSITIVE_VENDOR_9" not in outcome.command.error_code
+        assert "example-mall.test" not in outcome.command.error_code
+        assert outcome.command.error_code == "INTERNAL_ERROR:ValueError"
 
     def test_timeout_ends_as_unknown_and_blocks_successor(self, db_session, product_option, platform):
         connector = StubPublishConnector(error=MarketplaceExternalAPIError("naver", "TIMEOUT", True))
@@ -315,6 +356,35 @@ class TestRegistrationStatusAndConfirmMapping:
         db_session.refresh(draft)
         assert draft.pending_platform_product_id == "SELLER-2"  # 확정되지 않고 그대로 보류.
 
+    def test_confirm_mapping_blocks_when_status_check_fails(self, db_session, product_option, platform):
+        """확정 직전 재조회(fetch_registration_status)가 실패하면(자격증명 문제,
+        외부 API 오류 등) 그 예외를 그대로 전파해야 한다 - 조회 실패를 "후보
+        없음"이나 "실패했지만 일단 확정"으로 조용히 넘기지 않고, 매핑도 만들지
+        않는다(실제 클릭 검증: '쇼핑몰 연결정보를 확인해 주세요' 오류가 뜨고
+        매핑 확정 UI 자체가 나타나지 않음을 확인)."""
+        from integrations.malls.errors import MarketplaceCredentialMissingError
+
+        connector = StubPublishConnector(
+            result=ProductCreateResult(
+                accepted=True, platform_result_code="SUCCESS", channel_product_id="SELLER-4", channel_option_id=None
+            ),
+            status_check_error=MarketplaceCredentialMissingError("coupang"),
+        )
+        svc = ProductPublishService(db_session, connector_factory=_factory(connector))
+        draft = svc.save_draft(product_option.id, platform.id, **_valid_snapshot_kwargs())
+        outcome = svc.enqueue_create(draft.id)
+        svc.execute_command(outcome.command.id)
+
+        with pytest.raises(MarketplaceCredentialMissingError):
+            svc.confirm_mapping(draft.id, "ANY-CANDIDATE")
+
+        from repositories.product_repository import ProductPlatformMapRepository
+
+        assert ProductPlatformMapRepository(db_session).list_by_option(product_option.id) == []
+        db_session.refresh(draft)
+        assert draft.pending_platform_product_id == "SELLER-4"
+        assert draft.registered_at is None
+
     def test_confirm_mapping_rejects_when_no_candidates_confirmed_yet(self, db_session, product_option, platform):
         """아직 심사가 끝나지 않아 채널이 옵션 후보를 하나도 확인해 주지 못한
         상태(channel_option_ids 빈 목록)면, 어떤 값을 입력해도 매핑을 만들면 안
@@ -343,3 +413,137 @@ class TestRegistrationStatusAndConfirmMapping:
         svc = ProductPublishService(db_session)
         with pytest.raises(ProductPublishDraftNotFoundError):
             svc.check_registration_status(999999)
+
+
+def _make_user(db_session, username="etc-confirmer"):
+    from models.user import Role, User
+
+    role = Role(name=f"role-{username}")
+    db_session.add(role)
+    db_session.flush()
+    user = User(username=username, password_hash="x", name="테스터", role_id=role.id, is_active=True)
+    db_session.add(user)
+    db_session.flush()
+    return user.id
+
+
+class TestConfirmEtcNotice:
+    """네이버 ETC 카테고리 적합성 "운영자 확인" 감사 기록(confirm_etc_notice) -
+    integrations.malls.naver_smartstore_connector 모듈 docstring 참고: 이 확인은
+    공식 API가 검증한 결과가 아니라 운영자 확인 기록일 뿐이고, 원시 channel_fields
+    JSON에 categoryNoticeTypeConfirmedByOperator를 직접 써넣는 방식만으로는 우회할
+    수 없어야 한다."""
+
+    @staticmethod
+    def _etc_channel_fields(notice_type: str = "ETC", *, raw_confirmed_flag: bool = False) -> dict:
+        return {
+            "productInfoProvidedNotice": {
+                "productInfoProvidedNoticeType": notice_type,
+                "categoryNoticeTypeConfirmedByOperator": raw_confirmed_flag,
+                "etc": {},
+            }
+        }
+
+    def test_confirm_records_confirmer_and_timestamp(self, db_session, product_option, platform):
+        user_id = _make_user(db_session)
+        svc = ProductPublishService(db_session)
+        draft = svc.save_draft(
+            product_option.id, platform.id, category_code="50000803", channel_fields=self._etc_channel_fields()
+        )
+        confirmed = svc.confirm_etc_notice(draft.id, confirmed_by=user_id)
+        assert confirmed.etc_notice_confirmed_by == user_id
+        assert confirmed.etc_notice_confirmed_at is not None
+        assert confirmed.etc_notice_confirmed_category_code == "50000803"
+        assert confirmed.etc_notice_confirmed_notice_type == "ETC"
+
+    def test_confirm_rejects_when_notice_type_is_not_etc(self, db_session, product_option, platform):
+        user_id = _make_user(db_session)
+        svc = ProductPublishService(db_session)
+        draft = svc.save_draft(
+            product_option.id,
+            platform.id,
+            category_code="50000803",
+            channel_fields=self._etc_channel_fields(notice_type="TOGETHER"),
+        )
+        with pytest.raises(ValueError, match="ETC"):
+            svc.confirm_etc_notice(draft.id, confirmed_by=user_id)
+
+    def test_confirm_rejects_when_category_code_missing(self, db_session, product_option, platform):
+        user_id = _make_user(db_session)
+        svc = ProductPublishService(db_session)
+        draft = svc.save_draft(product_option.id, platform.id, channel_fields=self._etc_channel_fields())
+        with pytest.raises(ValueError, match="카테고리"):
+            svc.confirm_etc_notice(draft.id, confirmed_by=user_id)
+
+    def test_confirm_draft_not_found(self, db_session):
+        user_id = _make_user(db_session)
+        svc = ProductPublishService(db_session)
+        with pytest.raises(ProductPublishDraftNotFoundError):
+            svc.confirm_etc_notice(999999, confirmed_by=user_id)
+
+    def test_changing_category_code_invalidates_prior_confirmation(self, db_session, product_option, platform):
+        user_id = _make_user(db_session)
+        svc = ProductPublishService(db_session)
+        draft = svc.save_draft(
+            product_option.id, platform.id, category_code="50000803", channel_fields=self._etc_channel_fields()
+        )
+        svc.confirm_etc_notice(draft.id, confirmed_by=user_id)
+
+        svc.save_draft(product_option.id, platform.id, category_code="50000999")
+
+        db_session.refresh(draft)
+        assert draft.etc_notice_confirmed_at is None
+        assert draft.etc_notice_confirmed_by is None
+        assert draft.etc_notice_confirmed_category_code is None
+        assert draft.etc_notice_confirmed_notice_type is None
+
+    def test_changing_notice_type_invalidates_prior_confirmation(self, db_session, product_option, platform):
+        user_id = _make_user(db_session)
+        svc = ProductPublishService(db_session)
+        draft = svc.save_draft(
+            product_option.id, platform.id, category_code="50000803", channel_fields=self._etc_channel_fields()
+        )
+        svc.confirm_etc_notice(draft.id, confirmed_by=user_id)
+
+        svc.save_draft(product_option.id, platform.id, channel_fields=self._etc_channel_fields(notice_type="TOGETHER"))
+
+        db_session.refresh(draft)
+        assert draft.etc_notice_confirmed_at is None
+
+    def test_unrelated_field_save_does_not_invalidate_confirmation(self, db_session, product_option, platform):
+        user_id = _make_user(db_session)
+        svc = ProductPublishService(db_session)
+        draft = svc.save_draft(
+            product_option.id, platform.id, category_code="50000803", channel_fields=self._etc_channel_fields()
+        )
+        svc.confirm_etc_notice(draft.id, confirmed_by=user_id)
+
+        svc.save_draft(product_option.id, platform.id, name="이름만 변경")
+
+        db_session.refresh(draft)
+        assert draft.etc_notice_confirmed_at is not None
+
+    def test_snapshot_reflects_tracked_confirmation_not_raw_json_flag(self, db_session, product_option, platform):
+        """원시 channel_fields JSON에 categoryNoticeTypeConfirmedByOperator를
+        True로 직접 써넣어도(운영자가 화면의 확인 절차를 거치지 않고 JSON
+        텍스트만 수정한 경우), confirm_etc_notice()를 호출하지 않았다면
+        _draft_snapshot()이 만드는 실제 전송값은 False로 덮어써야 한다(우회
+        차단) - 반대로 confirm_etc_notice()를 호출했다면 raw JSON이 False라고
+        써 있어도 True로 계산돼야 한다(추적 기록이 유일한 근거)."""
+        user_id = _make_user(db_session)
+        svc = ProductPublishService(db_session)
+        draft = svc.save_draft(
+            product_option.id,
+            platform.id,
+            category_code="50000803",
+            channel_fields=self._etc_channel_fields(raw_confirmed_flag=True),
+        )
+        snapshot = svc._draft_snapshot(draft)
+        assert snapshot["channel_fields"]["productInfoProvidedNotice"]["categoryNoticeTypeConfirmedByOperator"] is False
+
+        svc.confirm_etc_notice(draft.id, confirmed_by=user_id)
+        draft2 = svc.save_draft(
+            product_option.id, platform.id, channel_fields=self._etc_channel_fields(raw_confirmed_flag=False)
+        )
+        snapshot2 = svc._draft_snapshot(draft2)
+        assert snapshot2["channel_fields"]["productInfoProvidedNotice"]["categoryNoticeTypeConfirmedByOperator"] is True

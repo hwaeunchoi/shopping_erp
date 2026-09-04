@@ -15,6 +15,7 @@ from integrations.malls.errors import (
     MarketplaceCapabilityUnsupportedError,
     MarketplaceCredentialMissingError,
     MarketplaceExternalAPIError,
+    MarketplaceValidationError,
 )
 from models.integration_sync import ExternalCommand, ProductSyncCommandDetail
 from services.product_sync_dispatch_service import (
@@ -622,11 +623,12 @@ class TestInfoUpdate:
         assert db_session.query(ExternalCommand).count() == 0
 
     def test_validation_error_message_is_preserved_in_error_code_not_just_class_name(self, db_session, platform_map):
-        """update_product_info()가 ValueError를 던지면(예: 커넥터의 항목별 검증
-        실패) error_code에 "ValueError"라는 클래스명만 남기지 않고 실제 메시지를
-        보존해야 한다 - 실제 클릭 검증으로 발견된 결함(화면에 "사유: ValueError"만
-        보이면 운영자가 원인을 알 수 없다)."""
-        conn = StubProductConnector(error=ValueError("배송정보가 비어 있습니다: deliveryFeeType"))
+        """update_product_info()가 MarketplaceValidationError를 던지면(예:
+        커넥터의 항목별 검증 실패 - 이 타입은 필드명·정적 문구만 담도록 관리되는,
+        노출해도 안전하다고 확인된 타입) error_code에 "ValueError"라는 클래스명만
+        남기지 않고 실제 메시지를 보존해야 한다 - 실제 클릭 검증으로 발견된
+        결함(화면에 "사유: ValueError"만 보이면 운영자가 원인을 알 수 없다)."""
+        conn = StubProductConnector(error=MarketplaceValidationError("배송정보가 비어 있습니다: deliveryFeeType"))
         svc = ProductSyncDispatchService(db_session, connector_factory=_factory(conn))
         outcome = svc.enqueue_info_update(platform_map.id, name="새이름")
 
@@ -636,6 +638,31 @@ class TestInfoUpdate:
         db_session.refresh(outcome.command)
         assert outcome.command.status == "FAILED"
         assert outcome.command.error_code == "배송정보가 비어 있습니다: deliveryFeeType"
+
+    def test_unrecognized_exception_message_is_not_leaked_into_error_code(self, db_session, platform_map):
+        """커넥터가 우리가 안전하다고 표시하지 않은 예외(bare ValueError 포함 -
+        커넥터 버그나 예상 못한 라이브러리 오류를 흉내낸다)를 던지면, 합성
+        Secret/URL 쿼리/응답 본문을 담은 원본 메시지가 error_code에 그대로
+        저장되면 안 된다 - 안전하다고 확인된 타입(MarketplaceValidationError 등)
+        만 화이트리스트를 통과한다."""
+        synthetic_secret_payload = (
+            "internal call failed: url=https://api.example-mall.test/v2/sync?"
+            'access_token=SECRET_TOKEN_XYZ789 response_body={"authorization":"Bearer sk_live_synthetic_0002"}'
+        )
+        conn = StubProductConnector(error=ValueError(synthetic_secret_payload))
+        svc = ProductSyncDispatchService(db_session, connector_factory=_factory(conn))
+        outcome = svc.enqueue_info_update(platform_map.id, name="새이름")
+
+        with pytest.raises(ValueError):
+            svc.execute_command(outcome.command.id)
+
+        db_session.refresh(outcome.command)
+        assert outcome.command.status == "FAILED"
+        assert outcome.command.error_code is not None
+        assert "SECRET_TOKEN_XYZ789" not in outcome.command.error_code
+        assert "sk_live_synthetic_0002" not in outcome.command.error_code
+        assert "example-mall.test" not in outcome.command.error_code
+        assert outcome.command.error_code == "INTERNAL_ERROR:ValueError"
 
     def test_controlled_by_its_own_flag_independent_of_other_flags(self, db_session, platform_map, monkeypatch):
         """product_info_update_enabled는 product_channel_sync_enabled(재고/판매

@@ -46,6 +46,21 @@ class MarketplaceCapabilityUnsupportedError(MarketplaceError):
         super().__init__(f"{marketplace_code}: '{capability}' 기능은 아직 지원하지 않습니다.")
 
 
+class MarketplaceValidationError(MarketplaceError, ValueError):
+    """이 모듈/연동 커넥터가 필드명·정적 문구만으로 직접 구성한, 노출해도 안전한
+    검증 오류 전용 타입이다.
+
+    services.product_publish_service/product_sync_dispatch_service의
+    _describe_exception()은 이 타입의 메시지만 ExternalCommand.error_code에
+    그대로 담는다(그 외 ValueError를 포함한 다른 모든 예외는 str(exc)를 신뢰하지
+    않고 일반 오류 코드로 대체한다) - "우리가 의도적으로 안전하게 작성한 메시지"와
+    "예상치 못한 예외(라이브러리 내부 오류·버그 등)의 원문"을 타입으로 구분해,
+    후자가 실수로 안전하다고 오인되어 DB/API/로그에 그대로 남는 것을 막기
+    위함이다. 이 타입을 사용하는 쪽은 메시지에 필드명/정적 문구/이미 운영자에게
+    공개된 값(예: 채널이 확인해 준 옵션 후보 id)만 담아야 한다 - 원본 응답
+    본문·요청 URL·Secret·PII는 여전히 금지(모듈 docstring 참고)."""
+
+
 class MarketplaceExternalAPIError(MarketplaceError):
     """외부 API 호출 실패(인증 거부/HTTP 오류/timeout/연결 실패/응답 파싱 실패 등).
 

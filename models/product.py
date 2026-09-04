@@ -205,6 +205,22 @@ class ProductPublishDraft(Base, TimestampMixin):
     # 식별자를 추측해 product_platform_map에 넣지 않기 위함(모듈 docstring 참고).
     pending_platform_product_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
 
+    # 네이버 ETC(기타 재화) 상품정보제공고시 카테고리 적합성 확인 기록 - integrations.
+    # malls.naver_smartstore_connector 모듈 docstring 참고: "ETC 스키마 구현"과
+    # "이 카테고리에 ETC가 맞는지"는 별개이고, 공식으로 검증할 API가 없어 운영자의
+    # 명시적 확인만 신뢰한다. channel_fields_json 안의 원시 JSON 플래그를 그대로
+    # 믿지 않고(운영자가 직접 텍스트로 true를 써넣을 수 있어 우회 위험이 있다)
+    # 이 감사 가능한 컬럼들만 신뢰의 근거로 삼는다(services.product_publish_service.
+    # ProductPublishService._draft_snapshot이 전송 직전 스냅샷에 실제로 주입할 값을
+    # 이 컬럼들로부터 다시 계산한다). 확인 대상 category_code/notice_type을 확인
+    # 시점 값으로 스냅샷해 두어, 이후 카테고리나 고시유형이 바뀌면(save_draft가
+    # 감지해 이 네 컬럼을 전부 지운다) 예전 확인이 새 값에 자동으로 적용되지
+    # 않는다.
+    etc_notice_confirmed_by: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    etc_notice_confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    etc_notice_confirmed_category_code: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    etc_notice_confirmed_notice_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
     product_option: Mapped["ProductOption"] = relationship()
     platform: Mapped["Platform"] = relationship()  # type: ignore[name-defined]
 
