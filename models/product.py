@@ -254,3 +254,104 @@ class UnmatchedPlatformItem(Base):
 
     platform: Mapped["Platform"] = relationship()  # type: ignore[name-defined]
     matched_option: Mapped[Optional["ProductOption"]] = relationship()
+
+
+class ProductPublishOptionGroupDraft(Base, TimestampMixin):
+    """상용 ERP 확장(3단계, 세 번째 묶음) - 하나의 로컬 상품(Product)에 속한 여러
+    SKU(ProductOption)를 하나의 채널 상품 + 옵션 목록으로 묶어 신규 등록하는 초안.
+    ProductPublishDraft(옵션 조합 없는 단일 SKU 등록)와는 별개 테이블이다 - 옵션
+    조합 등록은 계약 자체가 다르다(네이버 optionCombinations/쿠팡 items 다중 원소 -
+    integrations.malls.naver_smartstore_connector.create_product_with_options,
+    integrations.malls.coupang_connector.create_product_with_options 모듈 주석 참고).
+    같은 SKU를 두 방식으로 동시에 등록하지 않도록, enqueue 시점에 대상 SKU 각각의
+    기존 ProductPlatformMap 존재 여부로 교차 차단한다(services.
+    product_option_publish_service.ProductOptionPublishService.enqueue_create 참고).
+
+    (product_id, platform_id) 유니크 - 상품 하나당 채널별 옵션조합 등록 초안은
+    하나만 존재한다. 품목 구성은 ProductPublishOptionGroupItemDraft로 표현한다.
+
+    base_sale_price: 채널의 "상품 기준 판매가"(네이버 originProduct.salePrice) -
+    네이버는 옵션별 가격(item.sale_price)이 이 값에 대한 추가금이라 반드시
+    필요하다(공식 스펙 확인, ExternalApiOptionCombinationVo.product.price 설명
+    "옵션가", "미입력 시 0원" - 절대가가 아니라 델타다). 쿠팡은 옵션(item)마다
+    salePrice가 그 자체로 절대 판매가라 이 필드를 쓰지 않는다(두 채널의 "옵션
+    가격" 개념이 다르므로 같은 숫자를 그대로 전송하지 않는다 - 커넥터가 채널별로
+    변환한다).
+
+    channel_product_id/channel_option_id: 등록 성공 시 확정되는 "상품 전체" 공유
+    식별자(네이버: originProductNo/smartstoreChannelProductNo, 쿠팡:
+    sellerProductId/None(쿠팡은 옵션 단위 상위의 별도 채널상품ID 개념이 없다)) -
+    옵션(SKU) 단위 식별자가 아니다(옵션 조합 상품은 채널상품 하나에 여러 SKU가
+    속해 이 값을 공유한다 - 공식 등록 응답 스키마 확인, ExternalApi
+    CreateUpdateProductResponseVo.product에 옵션 단위 필드가 없음). 옵션 단위
+    확정은 SKU마다 ProductPlatformMap 매핑을 생성하는 것으로 표현한다(품목마다
+    따로 진행 - 일부만 확정돼도 상품 전체를 다시 등록하지 않는다)."""
+
+    __tablename__ = "product_publish_option_group_drafts"
+    __table_args__ = (UniqueConstraint("product_id", "platform_id", name="uq_product_publish_option_group_draft"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), nullable=False)
+    platform_id: Mapped[int] = mapped_column(ForeignKey("platforms.id"), nullable=False)
+    name: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    description_html: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    category_code: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    image_urls_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    base_sale_price: Mapped[Optional[float]] = mapped_column(Numeric(14, 2), nullable=True)
+    channel_fields_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    channel_product_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    channel_option_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    registered_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    # 네이버 ETC 상품정보제공고시 확인 기록 - models.product.ProductPublishDraft와
+    # 완전히 동일한 원칙(무효화 규칙 포함, services.product_option_publish_service.
+    # ProductOptionPublishService.save_group_draft 참고).
+    etc_notice_confirmed_by: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    etc_notice_confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    etc_notice_confirmed_category_code: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    etc_notice_confirmed_notice_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
+    product: Mapped["Product"] = relationship()
+    platform: Mapped["Platform"] = relationship()  # type: ignore[name-defined]
+    items: Mapped[list["ProductPublishOptionGroupItemDraft"]] = relationship(
+        back_populates="group_draft", cascade="all, delete-orphan"
+    )
+
+
+class ProductPublishOptionGroupItemDraft(Base, TimestampMixin):
+    """ProductPublishOptionGroupDraft에 속한 SKU 1개 - 옵션값(축)·개별 판매가·초기
+    수량·판매자 관리코드를 담는다.
+
+    option_values_json: 순서가 있는 [["축이름","값"], ...] 목록(JSON 배열의 배열) -
+    네이버 조합형 옵션(optionCombinations[].optionName1..3)은 등록 순서가 곧 축
+    순서이고 최대 3축까지만 허용된다(공식 스펙 확인, ExternalApiOptionInfoVo.
+    product.optionCombinations 설명: "최대 등록 가능한 옵션 개수는 조합형은
+    3개") - 이 순서를 커넥터가 그대로 optionName1/2/3에 대응시킨다. 쿠팡은 순서
+    없이 items[].attributes(attributeTypeName/attributeValueName)로 변환되고,
+    축 이름은 카테고리 메타정보가 실제로 요구하는 attributeTypeName과 일치해야
+    한다(추측하지 않고 fetch_category_requirements로 조회해 검증한다).
+
+    seller_product_code: 미입력 시 서비스가 저장 시점에 이 SKU의 ProductOption.
+    sku_code로 채운다(전역 유니크 - 채널 등록 후 응답에서 이 SKU를 확실히
+    되찾는 유일한 근거. 네이버는 sellerManagerCode로, 쿠팡은 externalVendorSku로
+    그대로 전송하고, 되돌아온 값과 정확히 일치하는 것만 매핑한다 - 응답 배열
+    순서나 상품명 유사도로 추정하지 않는다).
+
+    (group_draft_id, product_option_id) 유니크 - 같은 초안에 같은 SKU를 두 번
+    추가하지 않는다(= 같은 조합에 같은 SKU 중복 금지)."""
+
+    __tablename__ = "product_publish_option_group_item_drafts"
+    __table_args__ = (
+        UniqueConstraint("group_draft_id", "product_option_id", name="uq_product_publish_option_group_item"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    group_draft_id: Mapped[int] = mapped_column(ForeignKey("product_publish_option_group_drafts.id"), nullable=False)
+    product_option_id: Mapped[int] = mapped_column(ForeignKey("product_options.id"), nullable=False)
+    option_values_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    seller_product_code: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    sale_price: Mapped[Optional[float]] = mapped_column(Numeric(14, 2), nullable=True)
+    stock_quantity: Mapped[Optional[int]] = mapped_column(nullable=True)
+
+    group_draft: Mapped["ProductPublishOptionGroupDraft"] = relationship(back_populates="items")
+    product_option: Mapped["ProductOption"] = relationship()

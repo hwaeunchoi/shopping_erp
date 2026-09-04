@@ -25,8 +25,18 @@ from repositories.product_repository import (
     ProductOptionRepository,
     ProductPlatformMapRepository,
     ProductPublishDraftRepository,
+    ProductPublishOptionGroupDraftRepository,
+    ProductPublishOptionGroupItemDraftRepository,
     ProductRepository,
     UnmatchedPlatformItemRepository,
+)
+from services.product_option_publish_service import TARGET_TYPE as PRODUCT_OPTION_PUBLISH_TARGET_TYPE
+from services.product_option_publish_service import (
+    ProductOptionPublishAlreadyRegisteredError,
+    ProductOptionPublishDisabledError,
+    ProductOptionPublishDraftNotFoundError,
+    ProductOptionPublishItemNotFoundError,
+    ProductOptionPublishService,
 )
 from services.product_publish_service import TARGET_TYPE as PRODUCT_PUBLISH_TARGET_TYPE
 from services.product_publish_service import (
@@ -44,7 +54,11 @@ from services.product_sync_dispatch_service import (
 )
 from services.product_sync_service import ProductSyncService
 
-_PRODUCT_COMMAND_TARGET_TYPES = {PRODUCT_SYNC_TARGET_TYPE, PRODUCT_PUBLISH_TARGET_TYPE}
+_PRODUCT_COMMAND_TARGET_TYPES = {
+    PRODUCT_SYNC_TARGET_TYPE,
+    PRODUCT_PUBLISH_TARGET_TYPE,
+    PRODUCT_OPTION_PUBLISH_TARGET_TYPE,
+}
 
 router = APIRouter(
     prefix="/api/products", tags=["products"], dependencies=[Depends(require_permission("PRODUCT_MANAGE"))]
@@ -905,11 +919,12 @@ def resolve_product_sync_command(
     existing = ExternalCommandRepository(db).get_by_id(command_id)
     if existing is None or existing.target_type not in _PRODUCT_COMMAND_TARGET_TYPES:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="명령을 찾을 수 없습니다.")
-    resolver = (
-        ProductPublishService(db)
-        if existing.target_type == PRODUCT_PUBLISH_TARGET_TYPE
-        else ProductSyncDispatchService(db)
-    )
+    if existing.target_type == PRODUCT_PUBLISH_TARGET_TYPE:
+        resolver: Any = ProductPublishService(db)
+    elif existing.target_type == PRODUCT_OPTION_PUBLISH_TARGET_TYPE:
+        resolver = ProductOptionPublishService(db)
+    else:
+        resolver = ProductSyncDispatchService(db)
     try:
         resolved = resolver.resolve_unknown_command(command_id, payload.resolution, resolved_by=current_user.id)
     except ValueError as e:
@@ -1197,6 +1212,335 @@ def confirm_publish_mapping(
     try:
         mapping = service.confirm_mapping(draft_id, payload.channel_option_id)
     except ProductPublishDraftNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except ValueError as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    db.commit()
+    return _to_platform_map_out(mapping, ProductPlatformMapRepository(db))
+
+
+# --- 옵션조합 상품 등록 (상용 ERP 확장 3단계, 세 번째 묶음) ---
+
+
+class ProductOptionGroupDraftRequest(BaseModel):
+    platform_id: int
+    name: Optional[str] = None
+    description_html: Optional[str] = None
+    category_code: Optional[str] = None
+    image_urls: Optional[list[str]] = None
+    base_sale_price: Optional[float] = None
+    channel_fields: Optional[dict[str, Any]] = None
+
+
+class ProductOptionGroupItemOut(BaseModel):
+    id: int
+    product_option_id: int
+    option_values: list[list[str]] = []
+    seller_product_code: Optional[str] = None
+    sale_price: Optional[float] = None
+    stock_quantity: Optional[int] = None
+
+    @classmethod
+    def from_item(cls, item: Any) -> "ProductOptionGroupItemOut":
+        return cls(
+            id=item.id,
+            product_option_id=item.product_option_id,
+            option_values=json.loads(item.option_values_json) if item.option_values_json else [],
+            seller_product_code=item.seller_product_code,
+            sale_price=float(item.sale_price) if item.sale_price is not None else None,
+            stock_quantity=item.stock_quantity,
+        )
+
+
+class ProductOptionGroupDraftOut(BaseModel):
+    id: int
+    product_id: int
+    platform_id: int
+    name: Optional[str] = None
+    description_html: Optional[str] = None
+    category_code: Optional[str] = None
+    image_urls: list[str] = []
+    base_sale_price: Optional[float] = None
+    channel_fields: dict[str, Any] = {}
+    channel_product_id: Optional[str] = None
+    channel_option_id: Optional[str] = None
+    registered_at: Optional[datetime] = None
+    etc_notice_confirmed_by: Optional[int] = None
+    etc_notice_confirmed_at: Optional[datetime] = None
+    etc_notice_confirmed_category_code: Optional[str] = None
+    etc_notice_confirmed_notice_type: Optional[str] = None
+    etc_notice_confirmation_valid: bool = False
+    items: list[ProductOptionGroupItemOut] = []
+
+    @classmethod
+    def from_draft(cls, draft: Any, items: list[Any]) -> "ProductOptionGroupDraftOut":
+        channel_fields = json.loads(draft.channel_fields_json) if draft.channel_fields_json else {}
+        notice = channel_fields.get("productInfoProvidedNotice") if isinstance(channel_fields, dict) else None
+        current_notice_type = notice.get("productInfoProvidedNoticeType") if isinstance(notice, dict) else None
+        confirmation_valid = (
+            draft.etc_notice_confirmed_at is not None
+            and draft.etc_notice_confirmed_category_code == draft.category_code
+            and draft.etc_notice_confirmed_notice_type == current_notice_type
+        )
+        return cls(
+            id=draft.id,
+            product_id=draft.product_id,
+            platform_id=draft.platform_id,
+            name=draft.name,
+            description_html=draft.description_html,
+            category_code=draft.category_code,
+            image_urls=json.loads(draft.image_urls_json) if draft.image_urls_json else [],
+            base_sale_price=float(draft.base_sale_price) if draft.base_sale_price is not None else None,
+            channel_fields=channel_fields,
+            channel_product_id=draft.channel_product_id,
+            channel_option_id=draft.channel_option_id,
+            registered_at=draft.registered_at,
+            etc_notice_confirmed_by=draft.etc_notice_confirmed_by,
+            etc_notice_confirmed_at=draft.etc_notice_confirmed_at,
+            etc_notice_confirmed_category_code=draft.etc_notice_confirmed_category_code,
+            etc_notice_confirmed_notice_type=draft.etc_notice_confirmed_notice_type,
+            etc_notice_confirmation_valid=confirmation_valid,
+            items=[ProductOptionGroupItemOut.from_item(i) for i in items],
+        )
+
+
+@router.post(
+    "/{product_id}/option-publish-draft",
+    response_model=ProductOptionGroupDraftOut,
+    summary="옵션조합 상품 등록 초안 저장(상품 레벨)",
+    description="하나의 로컬 상품에 속한 여러 SKU를 채널 옵션 조합 상품 하나로 묶어 등록하기 위한 "
+    "상품 레벨(공통) 초안을 저장한다 - 미입력 항목이 있어도 자유롭게 저장할 수 있다. 품목(SKU)별 "
+    "값은 POST .../items로 별도 추가한다.",
+    responses={
+        404: {"description": "상품 또는 플랫폼을 찾을 수 없습니다."},
+        400: {"description": "이미지 URL이 유효하지 않습니다."},
+    },
+)
+def save_option_publish_draft(
+    product_id: int, payload: ProductOptionGroupDraftRequest, db: Session = Depends(get_db)
+) -> ProductOptionGroupDraftOut:
+    service = ProductOptionPublishService(db)
+    try:
+        draft = service.save_group_draft(
+            product_id,
+            payload.platform_id,
+            name=payload.name,
+            description_html=payload.description_html,
+            category_code=payload.category_code,
+            image_urls=payload.image_urls,
+            base_sale_price=payload.base_sale_price,
+            channel_fields=payload.channel_fields,
+        )
+    except ProductOptionPublishDraftNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except ValueError as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    db.commit()
+    items = ProductPublishOptionGroupItemDraftRepository(db).list_by_group(draft.id)
+    return ProductOptionGroupDraftOut.from_draft(draft, items)
+
+
+@router.get(
+    "/{product_id}/option-publish-draft/{platform_id}",
+    response_model=ProductOptionGroupDraftOut,
+    summary="옵션조합 상품 등록 초안 조회",
+    responses={404: {"description": "초안이 없습니다."}},
+)
+def get_option_publish_draft(
+    product_id: int, platform_id: int, db: Session = Depends(get_db)
+) -> ProductOptionGroupDraftOut:
+    draft = ProductPublishOptionGroupDraftRepository(db).get_by_product_and_platform(product_id, platform_id)
+    if draft is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="초안이 없습니다.")
+    items = ProductPublishOptionGroupItemDraftRepository(db).list_by_group(draft.id)
+    return ProductOptionGroupDraftOut.from_draft(draft, items)
+
+
+@router.post(
+    "/option-publish-drafts/{draft_id}/confirm-etc-notice",
+    response_model=ProductOptionGroupDraftOut,
+    summary="네이버 ETC 카테고리 적합성 확인 기록(옵션조합 초안)",
+    description="services.product_publish_service.ProductPublishService.confirm_etc_notice와 동일한 "
+    "원칙이다 - 이 API 자체가 공식 적합성을 검증하는 것은 아니다.",
+    responses={
+        404: {"description": "초안을 찾을 수 없습니다."},
+        400: {"description": "카테고리 코드가 없거나 현재 고시유형이 ETC가 아닙니다."},
+    },
+)
+def confirm_option_publish_etc_notice(
+    draft_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+) -> ProductOptionGroupDraftOut:
+    service = ProductOptionPublishService(db)
+    try:
+        draft = service.confirm_etc_notice(draft_id, confirmed_by=current_user.id)
+    except ProductOptionPublishDraftNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except ValueError as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    db.commit()
+    items = ProductPublishOptionGroupItemDraftRepository(db).list_by_group(draft.id)
+    return ProductOptionGroupDraftOut.from_draft(draft, items)
+
+
+class ProductOptionGroupItemRequest(BaseModel):
+    product_option_id: int
+    option_values: Optional[list[list[str]]] = None
+    seller_product_code: Optional[str] = None
+    sale_price: Optional[float] = None
+    stock_quantity: Optional[int] = None
+
+
+@router.post(
+    "/option-publish-drafts/{draft_id}/items",
+    response_model=ProductOptionGroupItemOut,
+    summary="옵션조합 상품 등록 초안에 SKU(품목) 추가/수정",
+    description="이 초안이 속한 상품의 SKU만 추가할 수 있다. seller_product_code를 입력하지 않으면 "
+    "이 SKU의 자체 채번 코드(sku_code)를 그대로 쓴다(채널 등록 후 응답에서 이 SKU를 되찾는 근거).",
+    responses={
+        404: {"description": "초안 또는 옵션을 찾을 수 없습니다."},
+        400: {"description": "이 SKU는 이 초안의 상품에 속하지 않습니다."},
+    },
+)
+def save_option_publish_item(
+    draft_id: int, payload: ProductOptionGroupItemRequest, db: Session = Depends(get_db)
+) -> ProductOptionGroupItemOut:
+    service = ProductOptionPublishService(db)
+    try:
+        item = service.save_item(
+            draft_id,
+            payload.product_option_id,
+            option_values=payload.option_values,
+            seller_product_code=payload.seller_product_code,
+            sale_price=payload.sale_price,
+            stock_quantity=payload.stock_quantity,
+        )
+    except ProductOptionPublishDraftNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except ValueError as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    db.commit()
+    return ProductOptionGroupItemOut.from_item(item)
+
+
+@router.delete(
+    "/option-publish-drafts/{draft_id}/items/{item_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="옵션조합 상품 등록 초안에서 SKU(품목) 제거",
+    responses={404: {"description": "품목을 찾을 수 없습니다."}},
+)
+def delete_option_publish_item(draft_id: int, item_id: int, db: Session = Depends(get_db)) -> None:
+    service = ProductOptionPublishService(db)
+    try:
+        service.delete_item(draft_id, item_id)
+    except ProductOptionPublishItemNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    db.commit()
+
+
+@router.post(
+    "/option-publish-drafts/{draft_id}/submit",
+    response_model=ProductSyncCommandOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="옵션조합 상품 등록 요청(비동기)",
+    description="초안(상품 공통값 + 전체 품목)을 확정 스냅샷으로 접수한다 - 이 API는 실제 채널 "
+    "호출을 하지 않고 명령만 접수한다(202). 실제 등록은 스케줄러의 "
+    "product_option_publish_dispatch_job이 수행하며, 처리 결과는 GET /api/products/"
+    "sync-commands/{command_id}로 폴링해 확인해야 한다.",
+    responses={
+        404: {"description": "초안을 찾을 수 없습니다."},
+        409: {"description": "이미 이 채널에 등록된 SKU가 있습니다."},
+        503: {"description": "옵션조합 상품 등록 기능이 비활성화(OFF) 상태입니다(실계정 검증 승인 전)."},
+    },
+)
+def submit_option_publish_draft(draft_id: int, db: Session = Depends(get_db)) -> ProductSyncCommandOut:
+    service = ProductOptionPublishService(db)
+    try:
+        outcome = service.enqueue_create(draft_id)
+    except ProductOptionPublishDisabledError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)) from e
+    except ProductOptionPublishDraftNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except ProductOptionPublishAlreadyRegisteredError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    db.commit()
+    return ProductSyncCommandOut(
+        command_id=outcome.command.id,
+        status=outcome.command.status,
+        already_processed=outcome.already_processed,
+        error_code=outcome.command.error_code,
+    )
+
+
+class OptionRegistrationStatusItemOut(BaseModel):
+    product_option_id: int
+    seller_product_code: Optional[str] = None
+    mapped: bool
+    channel_option_id: Optional[str] = None
+    ambiguous: bool = False
+
+
+class OptionRegistrationStatusOut(BaseModel):
+    channel_status_name: Optional[str] = None
+    overall_status: str
+    items: list[OptionRegistrationStatusItemOut] = []
+
+
+@router.get(
+    "/option-publish-drafts/{draft_id}/registration-status",
+    response_model=OptionRegistrationStatusOut,
+    summary="옵션조합 상품의 채널 심사/승인 상태 및 품목별 매핑 조회",
+    description="채널에 재조회해 우리가 등록 시 보낸 판매자 관리코드와 정확히 일치하는 품목만 "
+    "자동으로 매핑을 확정한다(배열 순서/이름 유사도로 추정하지 않는다). 모호하거나(ambiguous) "
+    "응답에 없는 품목은 매핑 미확정으로 남고, POST .../confirm-item-mapping으로 운영자가 직접 "
+    "확정할 수 있다. overall_status: PENDING_REVIEW(0건 확정)/PARTIALLY_MAPPED(일부)/"
+    "FULLY_MAPPED(전부 확정 - 이때만 등록 완료로 표시해야 한다).",
+    responses={
+        400: {"description": "등록 접수된 상품 단위 식별자가 없습니다."},
+        404: {"description": "초안을 찾을 수 없습니다."},
+    },
+)
+def get_option_publish_registration_status(draft_id: int, db: Session = Depends(get_db)) -> OptionRegistrationStatusOut:
+    service = ProductOptionPublishService(db)
+    try:
+        result = service.check_registration_status(draft_id)
+    except ProductOptionPublishDraftNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    db.commit()  # 자동 매칭으로 새로 생성된 매핑을 확정한다.
+    return OptionRegistrationStatusOut(**result)
+
+
+class ConfirmOptionItemMappingRequest(BaseModel):
+    product_option_id: int
+    channel_option_id: str
+
+
+@router.post(
+    "/option-publish-drafts/{draft_id}/confirm-item-mapping",
+    response_model=ProductPlatformMapOut,
+    summary="옵션조합 상품의 SKU 1개에 대해 승인된 옵션 단위 식별자로 매핑 확정",
+    description="GET .../registration-status로 확인한 옵션 단위 식별자를 운영자가 직접 지정해 이 "
+    "SKU 하나의 플랫폼 매핑을 만든다 - 이 API가 채널 응답에서 자동으로 하나를 골라 추측하지 않고, "
+    "지정값이 실제로 이 SKU의 판매자 관리코드에 대응하는 후보인지 매번 서버에 재확인한다.",
+    responses={
+        400: {"description": "확정할 수 없는 식별자이거나 이미 매핑이 존재합니다."},
+        404: {"description": "초안 또는 품목을 찾을 수 없습니다."},
+    },
+)
+def confirm_option_publish_item_mapping(
+    draft_id: int, payload: ConfirmOptionItemMappingRequest, db: Session = Depends(get_db)
+) -> ProductPlatformMapOut:
+    service = ProductOptionPublishService(db)
+    try:
+        mapping = service.confirm_item_mapping(draft_id, payload.product_option_id, payload.channel_option_id)
+    except (ProductOptionPublishDraftNotFoundError, ProductOptionPublishItemNotFoundError) as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
     except ValueError as e:
         db.rollback()

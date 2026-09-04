@@ -51,7 +51,7 @@ fetch_settlement_details() 반환 항목(상용 ERP 확장 2단계 - 정산 회�
 
 import random
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -95,6 +95,53 @@ class ProductCreateResult:
     platform_result_code: Optional[str] = None
     channel_product_id: Optional[str] = None  # 상품 단위 식별자(네이버 originProductNo / 쿠팡 sellerProductId)
     channel_option_id: Optional[str] = None  # 옵션 단위 식별자(네이버 channelProductNo). 쿠팡은 항상 None.
+
+
+@dataclass
+class ProductOptionItemResult:
+    """create_product_with_options()/fetch_option_registration_status()의 품목(SKU)
+    1개 단위 결과 - 상용 ERP 확장(3단계, 세 번째 묶음). 항상 seller_product_code
+    (등록 시 우리가 전송한, 전역 유니크한 판매자 관리코드/판매자상품코드)로
+    식별한다 - 응답 배열의 순서나 상품명 유사도로 식별하지 않는다(services.
+    product_option_publish_service 모듈 docstring 참고)."""
+
+    seller_product_code: str
+    channel_option_id: Optional[str] = None  # 확정된 옵션 단위 식별자(네이버: 조합 id, 쿠팡: vendorItemId)
+
+
+@dataclass
+class ProductOptionsCreateResult:
+    """create_product_with_options()의 결과 - 옵션 조합 상품 등록(상용 ERP 확장
+    3단계, 세 번째 묶음). ProductCreateResult와 달리 옵션(SKU)이 여럿이라 "상품
+    전체가 공유하는" 식별자와 품목별 결과를 분리한다.
+
+    channel_option_id는 ProductCreateResult와 동일하게 상품 전체가 공유하는 채널
+    리스팅 식별자다(옵션 단위가 아니다 - 네이버: smartstoreChannelProductNo, 쿠팡은
+    해당 개념이 없어 항상 None). items는 등록 응답이 품목별 옵션 단위 식별자를
+    즉시 돌려주는 경우에만 채운다 - 두 채널 모두 옵션조합 등록은 조합별 식별자가
+    등록 응답 자체에 없어(공식 스키마 확인) 항상 fetch_option_registration_status()
+    후속 조회가 필요하므로, 이 구현들에서는 items가 항상 seller_product_code만
+    채워진 채 channel_option_id=None으로 돌아온다(추측 금지)."""
+
+    accepted: bool
+    platform_result_code: Optional[str] = None
+    channel_product_id: Optional[str] = None  # 상품 단위 식별자(네이버 originProductNo / 쿠팡 sellerProductId)
+    channel_option_id: Optional[str] = None  # 상품 전체가 공유하는 채널 리스팅 식별자(네이버 channelProductNo)
+    items: list[ProductOptionItemResult] = field(default_factory=list)
+
+
+@dataclass
+class ProductOptionRegistrationStatus:
+    """fetch_option_registration_status()의 결과 - 상품 전체 심사/승인 상태와,
+    채널이 실제로 확인해 준 품목별 옵션 식별자 후보 전부를 함께 반환한다.
+    status_name은 채널 원본 상태 문자열 그대로(정규화하지 않는다 -
+    fetch_registration_status와 동일 원칙). 호출부(services.
+    product_option_publish_service)가 우리가 등록 시 보낸 seller_product_code와
+    정확히 일치하는 항목만 매핑에 반영한다(중복/누락/불일치는 매핑 미확정으로
+    보류 - 이 데이터클래스 자체는 판단하지 않고 원본 후보 목록만 전달한다)."""
+
+    status_name: Optional[str]
+    items: list[ProductOptionItemResult]
 
 
 @dataclass
@@ -163,6 +210,12 @@ class BaseMallConnector(ABC):
     # 변경/대량 등록은 이 capability와 무관하게 이번 범위 밖(항상 미지원).
     supports_product_create: bool = False
     supports_product_info_update: bool = False
+    # 하나의 로컬 상품에 속한 여러 SKU를 채널 옵션 조합 상품 하나로 묶어 등록하는
+    # capability - 상용 ERP 확장(3단계, 세 번째 묶음). supports_product_create와
+    # 완전히 별개다(단순 상품 등록을 지원해도 옵션조합 등록은 미지원일 수 있다).
+    # 기존 옵션 구조 변경/대량 등록/자동 가격결정은 이 capability와 무관하게 항상
+    # 미지원(이번 범위 밖).
+    supports_product_option_create: bool = False
 
     def _marketplace_code(self) -> str:
         """오류 메시지용 안전한 채널 식별자(Secret/PII 아님). platform_code가 없으면 클래스명."""
@@ -340,6 +393,37 @@ class BaseMallConnector(ABC):
         인증정보·배송비·반품지·판매가격 등을 추측하거나 임의 기본값으로 채우지
         않고) ValueError로 명확히 차단해야 한다 - 채널 호출 자체를 하지 않는다."""
         raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "product_create")
+
+    def create_product_with_options(self, draft_snapshot: dict[str, Any]) -> ProductOptionsCreateResult:
+        """하나의 로컬 상품에 속한 여러 SKU를 채널 옵션 조합 상품 하나로 묶어
+        등록한다(기본: 미지원 오류). supports_product_option_create=True인
+        커넥터만 오버라이드한다 - 상용 ERP 확장(3단계, 세 번째 묶음).
+
+        draft_snapshot은 models.integration_sync.ProductOptionPublishCommandDetail에
+        확정 저장된, 명령 접수 시점의 스냅샷이다 - 키: name, description_html,
+        category_code, image_urls(list[str]), base_sale_price(Optional[float],
+        채널의 "상품 기준 판매가" - 옵션가가 이 값에 대한 추가금인 채널에서만
+        필수), channel_fields(dict, 채널별 공통 필수 정보), items(list[dict],
+        각 원소: product_option_id, option_values(list[[axis, value]], 등록
+        순서가 곧 축 순서), seller_product_code(str, 전역 유니크), sale_price
+        (이 SKU의 실제 판매 의도가), stock_quantity). create_product()와 동일한
+        원칙으로, 필수 항목이 비어 있으면(카테고리·옵션축·가격·수량 등을 추측하거나
+        임의 기본값으로 채우지 않고) ValueError/MarketplaceValidationError로
+        명확히 차단해야 한다 - 채널 호출 자체를 하지 않는다."""
+        raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "product_option_create")
+
+    def fetch_option_registration_status(
+        self, channel_product_id: str, channel_option_id: Optional[str] = None
+    ) -> ProductOptionRegistrationStatus:
+        """상품 단위 식별자(channel_product_id)로 옵션 조합 상품의 등록 심사/승인
+        상태와, 채널이 확인해 준 품목별 옵션 식별자 후보 전부를 조회한다(기본:
+        미지원 오류). supports_product_option_create=True인 커넥터만
+        오버라이드한다 - 두 채널 모두 조합별/아이템별 옵션 단위 식별자가 등록
+        응답에 없어(ProductOptionsCreateResult docstring 참고) 항상 이 후속
+        조회가 필요하다."""
+        raise MarketplaceCapabilityUnsupportedError(
+            self._marketplace_code(), "product_option_registration_status_lookup"
+        )
 
     def update_product_info(
         self,

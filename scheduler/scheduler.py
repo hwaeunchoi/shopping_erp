@@ -38,6 +38,7 @@ from scheduler.jobs import (  # noqa: E402
     customer_stats_job,
     order_collect_job,
     outbox_dispatch_job,
+    product_option_publish_dispatch_job,
     product_publish_dispatch_job,
     product_sync_dispatch_job,
     product_sync_job,
@@ -129,6 +130,10 @@ def run_product_publish_dispatch() -> None:
     _run_job("product_publish_dispatch", product_publish_dispatch_job.run, task_type="FULL_SYNC")
 
 
+def run_product_option_publish_dispatch() -> None:
+    _run_job("product_option_publish_dispatch", product_option_publish_dispatch_job.run, task_type="FULL_SYNC")
+
+
 def build_scheduler() -> BlockingScheduler:
     scheduler = BlockingScheduler(timezone="UTC")
     # 상품 동기화는 주문 수집보다 먼저 실행되도록 더 짧은 주기(10분보다 여유를 둔 20분)로
@@ -161,6 +166,15 @@ def build_scheduler() -> BlockingScheduler:
     # (PRODUCT_PUBLISH_DRAFT)이 모두 달라 product_sync_dispatch_job과 섞이지 않는다.
     scheduler.add_job(
         run_product_publish_dispatch, IntervalTrigger(minutes=2), id="product_publish_dispatch", max_instances=1
+    )
+    # 옵션조합 상품 등록 outbox 실행 - 상용 ERP 확장(3단계 세 번째 묶음, 기본 OFF:
+    # product_option_publish_enabled). command_type(PRODUCT_OPTION_CREATE)과
+    # target_type(PRODUCT_OPTION_PUBLISH_DRAFT)이 모두 달라 위 두 잡과 섞이지 않는다.
+    scheduler.add_job(
+        run_product_option_publish_dispatch,
+        IntervalTrigger(minutes=2),
+        id="product_option_publish_dispatch",
+        max_instances=1,
     )
     return scheduler
 

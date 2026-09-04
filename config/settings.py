@@ -100,6 +100,16 @@ class Settings(BaseSettings):
     # False(기본값)면 실제 채널 호출 없이 안전하게 차단된다.
     product_info_update_enabled: bool = False
 
+    # 상용 ERP 확장(3단계, 세 번째 묶음) - 하나의 로컬 상품에 속한 여러 SKU를 채널
+    # 옵션 조합 상품 하나로 묶어 등록하는 PRODUCT_OPTION_CREATE 명령만 이 플래그로
+    # 통제한다. 위 product_publish_enabled(옵션 조합 없는 단순 상품 등록)와는 완전히
+    # 독립이다 - 단순 등록을 켜도 옵션조합 등록은 여전히 OFF로 남고, 그 반대도
+    # 마찬가지다(services.product_option_publish_service.ProductOptionPublishService.
+    # enqueue_create, scheduler.jobs.product_option_publish_dispatch_job 참고).
+    # False(기본값)면 실제 채널 호출 없이 안전하게 차단된다 - 실계정 검증 승인 후
+    # 운영자가 명시적으로 켜야 한다.
+    product_option_publish_enabled: bool = False
+
     model_config = SettingsConfigDict(env_file=str(BASE_DIR / ".env"), env_file_encoding="utf-8", extra="ignore")
 
 

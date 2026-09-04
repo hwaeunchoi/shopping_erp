@@ -172,6 +172,27 @@ class ProductPublishCommandDetail(Base):
     snapshot_json: Mapped[str] = mapped_column(Text, nullable=False)
 
 
+class ProductOptionPublishCommandDetail(Base):
+    """ExternalCommand(command_type == PRODUCT_OPTION_CREATE)의 확정된 등록 스냅샷 -
+    상용 ERP 확장(3단계, 세 번째 묶음). ProductPublishCommandDetail과 동일한
+    원칙(접수 시점 값을 얼려 재시도 안전성을 확보)이며, 대상 초안 테이블만
+    다르다(models.product.ProductPublishOptionGroupDraft).
+
+    snapshot_json 구조: {name, description_html, category_code, image_urls,
+    base_sale_price, channel_fields, items: [{product_option_id, option_values,
+    seller_product_code, sale_price, stock_quantity}, ...]} - 접수 시점의 상품
+    공통값과 전체 품목(SKU) 목록을 통째로 얼린다(품목이 여럿이라 개별 컬럼으로
+    정규화하지 않는다 - ProductPublishCommandDetail과 동일한 이유)."""
+
+    __tablename__ = "product_option_publish_command_details"
+    __table_args__ = (Index("uq_product_option_publish_command_detail", "command_id", unique=True),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    command_id: Mapped[int] = mapped_column(ForeignKey("external_commands.id"), nullable=False)
+    group_draft_id: Mapped[int] = mapped_column(ForeignKey("product_publish_option_group_drafts.id"), nullable=False)
+    snapshot_json: Mapped[str] = mapped_column(Text, nullable=False)
+
+
 class OrderStatusConflict(Base, TimestampMixin):
     """내부 주문상태와 채널 주문상태가 "허용된 전이"로 설명되지 않을 때의 기록.
 

@@ -19,6 +19,8 @@ from models.product import (
     ProductOption,
     ProductPlatformMap,
     ProductPublishDraft,
+    ProductPublishOptionGroupDraft,
+    ProductPublishOptionGroupItemDraft,
     UnmatchedPlatformItem,
 )
 from repositories.base_repository import BaseRepository
@@ -177,6 +179,42 @@ class ProductPublishDraftRepository(BaseRepository[ProductPublishDraft]):
             ProductPublishDraft.product_option_id == product_option_id, ProductPublishDraft.platform_id == platform_id
         )
         return self.session.execute(stmt).scalar_one_or_none()
+
+
+class ProductPublishOptionGroupDraftRepository(BaseRepository[ProductPublishOptionGroupDraft]):
+    def __init__(self, session: Session) -> None:
+        super().__init__(session, ProductPublishOptionGroupDraft)
+
+    def get_by_product_and_platform(
+        self, product_id: int, platform_id: int
+    ) -> Optional[ProductPublishOptionGroupDraft]:
+        stmt = select(ProductPublishOptionGroupDraft).where(
+            ProductPublishOptionGroupDraft.product_id == product_id,
+            ProductPublishOptionGroupDraft.platform_id == platform_id,
+        )
+        return self.session.execute(stmt).scalar_one_or_none()
+
+
+class ProductPublishOptionGroupItemDraftRepository(BaseRepository[ProductPublishOptionGroupItemDraft]):
+    def __init__(self, session: Session) -> None:
+        super().__init__(session, ProductPublishOptionGroupItemDraft)
+
+    def get_by_group_and_option(
+        self, group_draft_id: int, product_option_id: int
+    ) -> Optional[ProductPublishOptionGroupItemDraft]:
+        stmt = select(ProductPublishOptionGroupItemDraft).where(
+            ProductPublishOptionGroupItemDraft.group_draft_id == group_draft_id,
+            ProductPublishOptionGroupItemDraft.product_option_id == product_option_id,
+        )
+        return self.session.execute(stmt).scalar_one_or_none()
+
+    def list_by_group(self, group_draft_id: int) -> list[ProductPublishOptionGroupItemDraft]:
+        stmt = (
+            select(ProductPublishOptionGroupItemDraft)
+            .where(ProductPublishOptionGroupItemDraft.group_draft_id == group_draft_id)
+            .order_by(ProductPublishOptionGroupItemDraft.id)
+        )
+        return list(self.session.execute(stmt).scalars().all())
 
 
 class ProductImageRepository(BaseRepository[ProductImage]):

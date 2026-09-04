@@ -38,6 +38,7 @@ import logging
 import time as time_module
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Optional
 
 import bcrypt
@@ -48,6 +49,9 @@ from integrations.malls.base_mall_connector import (
     SALE_STATUS_SUSPENDED,
     BaseMallConnector,
     ProductCreateResult,
+    ProductOptionItemResult,
+    ProductOptionRegistrationStatus,
+    ProductOptionsCreateResult,
     ProductSyncActionResult,
     ShipmentSubmitResult,
 )
@@ -313,6 +317,143 @@ def _validate_naver_publish_draft(draft: dict[str, Any]) -> None:
         )
 
 
+# --- 옵션 조합 상품 등록 (상용 ERP 확장 3단계, 세 번째 묶음) ---
+# 공식 OpenAPI 스펙(commerce-api-naver/commerce-api 저장소 docs/2.0.0-RC.js, 2026-09
+# 조회 - 위 신규 상품 등록과 동일한 방법으로 원문 JSON 스키마를 직접 파싱해 확인)
+# ExternalApiOptionInfoVo.product / ExternalApiOptionCombinationVo.product:
+#   detailAttribute.optionInfo.optionCombinationGroupNames.optionGroupName1..3(축 이름,
+#   최대 3개) + optionCombinations[](축 값 조합, 최대 3축):
+#     {optionName1(필수)/optionName2/optionName3: 그 축의 값,
+#      stockQuantity: int(미입력 시 0), price: int(옵션가 - salePrice에 대한
+#      "추가금", 미입력 시 0원. 절대가가 아니다 - models.product.
+#      ProductPublishOptionGroupDraft.base_sale_price 모듈 docstring 참고),
+#      sellerManagerCode: str(판매자 관리 코드), usable: bool(미입력 시 true)}
+#   optionInfo.useStockManagement=true로 설정해야 재고가 옵션 조합별로 관리된다
+#   (미설정 시 원상품 전체 stockQuantity만 쓰인다 - 우리는 조합별 재고를 쓰므로
+#   항상 true로 보낸다).
+#   ⚠️ 등록 응답(ExternalApiCreateUpdateProductResponseVo.product)에는
+#   originProductNo/smartstoreChannelProductNo/windowChannelProductNo만 있고 조합별
+#   식별자(optionCombinations[].id)가 없다 - 단일 옵션 등록(create_product)과 달리
+#   조합별 식별자는 등록 후 GET /v2/products/origin-products/{originProductNo}
+#   재조회로만 확인할 수 있다(fetch_option_registration_status 참고). id는
+#   ExternalApiOptionCombinationVo.product 필드 설명("옵션 ID 입력 시 기존 옵션
+#   수정")으로 미루어 서버가 생성 후 부여하고 조회로 되돌려주는 값으로 추정한다
+#   (조회 스키마가 등록 스키마와 동일하므로 이 자리에 채워져 돌아온다).
+NAVER_MAX_OPTION_COMBINATION_AXES = 3
+
+
+def _validate_naver_option_group_draft(draft: dict[str, Any]) -> None:
+    """옵션 조합 상품 등록 스냅샷의 공통(상품 레벨) 필수 항목을 검사한다 -
+    _validate_naver_publish_draft와 거의 동일하나, sale_price/stock_quantity는
+    품목(item)마다 따로 있어 여기서는 검사하지 않고 base_sale_price(상품 기준
+    판매가)만 검사한다(호출부가 items 자체의 완전성은 별도로 검사한다 -
+    services.product_option_publish_service 참고)."""
+    missing: list[str] = []
+    if not draft.get("name"):
+        missing.append("name(상품명)")
+    if draft.get("base_sale_price") is None:
+        missing.append("base_sale_price(salePrice, 옵션가의 기준이 되는 상품 판매가)")
+    if not draft.get("description_html"):
+        missing.append("description_html(상세설명)")
+    if not draft.get("category_code"):
+        missing.append("category_code(leafCategoryId)")
+    image_urls = draft.get("image_urls") or []
+    if not image_urls:
+        missing.append("image_urls(대표이미지 최소 1장 필요)")
+
+    cf = draft.get("channel_fields") or {}
+    if cf.get("minorPurchasable") is None:
+        missing.append("channel_fields.minorPurchasable")
+    if cf.get("naverShoppingRegistration") is None:
+        missing.append("channel_fields.naverShoppingRegistration")
+    if not cf.get("channelProductDisplayStatusType"):
+        missing.append("channel_fields.channelProductDisplayStatusType")
+
+    origin_area = cf.get("originAreaInfo") or {}
+    if not origin_area.get("originAreaCode"):
+        missing.append("channel_fields.originAreaInfo.originAreaCode")
+
+    after_service = cf.get("afterServiceInfo") or {}
+    for f in _NAVER_AFTER_SERVICE_REQUIRED_FIELDS:
+        if not after_service.get(f):
+            missing.append(f"channel_fields.afterServiceInfo.{f}")
+
+    delivery = cf.get("deliveryInfo") or {}
+    for f in ("deliveryType", "deliveryAttributeType"):
+        if not delivery.get(f):
+            missing.append(f"channel_fields.deliveryInfo.{f}")
+    delivery_fee = delivery.get("deliveryFee") or {}
+    if not delivery_fee.get("deliveryFeeType"):
+        missing.append("channel_fields.deliveryInfo.deliveryFee.deliveryFeeType")
+    claim_delivery = delivery.get("claimDeliveryInfo") or {}
+    for f in _NAVER_CLAIM_DELIVERY_REQUIRED_FIELDS:
+        if claim_delivery.get(f) is None:
+            missing.append(f"channel_fields.deliveryInfo.claimDeliveryInfo.{f}")
+
+    notice = cf.get("productInfoProvidedNotice") or {}
+    if notice.get("productInfoProvidedNoticeType") != "ETC":
+        missing.append("channel_fields.productInfoProvidedNotice.productInfoProvidedNoticeType(현재 ETC만 지원)")
+    else:
+        etc = notice.get("etc") or {}
+        for f in _NAVER_ETC_NOTICE_REQUIRED_FIELDS:
+            if not etc.get(f):
+                missing.append(f"channel_fields.productInfoProvidedNotice.etc.{f}")
+        if notice.get("categoryNoticeTypeConfirmedByOperator") is not True:
+            missing.append(
+                "channel_fields.productInfoProvidedNotice.categoryNoticeTypeConfirmedByOperator"
+                "(true여야 함 - 이 카테고리에 ETC 고시가 맞는지 판매자센터에서 직접 확인 필요)"
+            )
+
+    items = draft.get("items") or []
+    if not items:
+        missing.append("items(등록할 SKU가 1개 이상 필요)")
+
+    if missing:
+        raise MarketplaceValidationError(
+            "네이버 옵션조합 상품 등록에 필요한 항목이 비어 있습니다(추측 금지): " + ", ".join(missing)
+        )
+
+    axis_names: Optional[list[str]] = None
+    seen_codes: set[str] = set()
+    seen_combos: set[tuple[str, ...]] = set()
+    item_missing: list[str] = []
+    for item in items:
+        option_values = item.get("option_values") or []
+        axes = [str(a) for a, _v in option_values]
+        if axis_names is None:
+            axis_names = axes
+        elif axes != axis_names:
+            raise MarketplaceValidationError(
+                "모든 SKU는 같은 옵션축 순서를 가져야 합니다(추측 금지): "
+                f"기준={axis_names}, 다른 값={axes}(product_option_id={item.get('product_option_id')})"
+            )
+        if len(axes) == 0 or len(axes) > NAVER_MAX_OPTION_COMBINATION_AXES:
+            raise MarketplaceValidationError(
+                f"네이버 조합형 옵션은 축이 1~{NAVER_MAX_OPTION_COMBINATION_AXES}개여야 합니다"
+                f"(현재 {len(axes)}개, product_option_id={item.get('product_option_id')})."
+            )
+        combo_key = tuple(str(v) for _a, v in option_values)
+        if combo_key in seen_combos:
+            raise MarketplaceValidationError(f"중복된 옵션 조합입니다(추측 금지): {combo_key}")
+        seen_combos.add(combo_key)
+
+        code = item.get("seller_product_code")
+        if not code:
+            item_missing.append(f"items[product_option_id={item.get('product_option_id')}].seller_product_code")
+        elif code in seen_codes:
+            raise MarketplaceValidationError(f"같은 초안 안에 판매자 관리코드가 중복됩니다: {code}")
+        else:
+            seen_codes.add(code)
+        if item.get("sale_price") is None:
+            item_missing.append(f"items[product_option_id={item.get('product_option_id')}].sale_price")
+        if item.get("stock_quantity") is None:
+            item_missing.append(f"items[product_option_id={item.get('product_option_id')}].stock_quantity")
+    if item_missing:
+        raise MarketplaceValidationError(
+            "네이버 옵션조합 상품 등록에 필요한 품목별 항목이 비어 있습니다(추측 금지): " + ", ".join(item_missing)
+        )
+
+
 class NaverSmartstoreConnector(BaseMallConnector):
     platform_code = "naver_smartstore"
     supports_shipment_submit = True
@@ -320,6 +461,7 @@ class NaverSmartstoreConnector(BaseMallConnector):
     supports_sale_status_update = True
     supports_product_create = True
     supports_product_info_update = True
+    supports_product_option_create = True
 
     def __init__(
         self, session: Any = None, platform_id: Optional[int] = None, http_client: Optional[httpx.Client] = None
@@ -562,6 +704,123 @@ class NaverSmartstoreConnector(BaseMallConnector):
             channel_product_id=str(origin_product_no),
             channel_option_id=str(channel_product_no),
         )
+
+    def create_product_with_options(self, draft_snapshot: dict[str, Any]) -> ProductOptionsCreateResult:
+        """하나의 로컬 상품에 속한 여러 SKU를 네이버 조합형 옵션(optionCombinations)
+        하나의 원상품으로 묶어 등록한다(모듈 상단 NAVER_MAX_OPTION_COMBINATION_AXES
+        주석의 공식 스펙 근거 참고). create_product()와 달리 등록 응답이 조합별
+        식별자를 돌려주지 않으므로 items는 항상 seller_product_code만 채운 채
+        channel_option_id=None으로 반환한다 - fetch_option_registration_status()가
+        후속 조회로 확정한다."""
+        _validate_naver_option_group_draft(draft_snapshot)
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("naver")
+        client_id, client_secret, seller_id = credentials
+        access_token = self._fetch_access_token(client_id, client_secret, seller_id)
+
+        cf = draft_snapshot["channel_fields"]
+        image_urls: list[str] = draft_snapshot["image_urls"]
+        images: dict[str, Any] = {"representativeImage": {"url": image_urls[0]}}
+        if len(image_urls) > 1:
+            images["optionalImages"] = [{"url": u} for u in image_urls[1:]]
+
+        items: list[dict[str, Any]] = draft_snapshot["items"]
+        base_price = Decimal(str(draft_snapshot["base_sale_price"]))
+        axis_names = [str(a) for a, _v in (items[0].get("option_values") or [])]
+        option_combination_group_names = {
+            f"optionGroupName{i + 1}": axis_name for i, axis_name in enumerate(axis_names)
+        }
+        option_combinations = []
+        total_stock = 0
+        for item in items:
+            option_values = item["option_values"]
+            combo: dict[str, Any] = {}
+            for i, (_axis, value) in enumerate(option_values):
+                combo[f"optionName{i + 1}"] = str(value)
+            stock_quantity = int(item["stock_quantity"])
+            total_stock += stock_quantity
+            item_price = Decimal(str(item["sale_price"]))
+            combo["stockQuantity"] = stock_quantity
+            combo["price"] = int(item_price - base_price)
+            combo["sellerManagerCode"] = item["seller_product_code"]
+            combo["usable"] = True
+            option_combinations.append(combo)
+
+        origin_product = {
+            "statusType": "SALE",
+            "leafCategoryId": draft_snapshot["category_code"],
+            "name": draft_snapshot["name"],
+            "images": images,
+            "detailContent": draft_snapshot["description_html"],
+            "salePrice": int(base_price),
+            # 조합형 옵션 상품은 원상품 전체 재고가 옵션별 재고 합으로 자동 계산된다
+            # (모듈 docstring _has_option_managed_stock 참고) - 그 규칙과 일치하도록
+            # 미리 합산한 값을 그대로 보낸다(추측/임의값이 아니다).
+            "stockQuantity": total_stock,
+            "deliveryInfo": cf["deliveryInfo"],
+            "detailAttribute": {
+                "afterServiceInfo": cf["afterServiceInfo"],
+                "originAreaInfo": cf["originAreaInfo"],
+                "minorPurchasable": bool(cf["minorPurchasable"]),
+                "productInfoProvidedNotice": cf["productInfoProvidedNotice"],
+                "optionInfo": {
+                    "useStockManagement": True,
+                    "optionCombinationGroupNames": option_combination_group_names,
+                    "optionCombinations": option_combinations,
+                },
+            },
+        }
+        body = {
+            "originProduct": origin_product,
+            "smartstoreChannelProduct": {
+                "channelProductDisplayStatusType": cf["channelProductDisplayStatusType"],
+                "naverShoppingRegistration": bool(cf["naverShoppingRegistration"]),
+            },
+        }
+        response = self._request_with_retry(
+            "POST", CREATE_PRODUCT_PATH, headers={"Authorization": f"Bearer {access_token}"}, json=body
+        )
+        raise_for_status("naver", response.status_code)
+        with external_call("naver"):
+            payload = response.json()
+            origin_product_no = payload.get("originProductNo")
+            channel_product_no = payload.get("smartstoreChannelProductNo")
+        if not origin_product_no or not channel_product_no:
+            raise MarketplaceExternalAPIError("naver", "PARSE_FAILED", False, http_status=response.status_code)
+        return ProductOptionsCreateResult(
+            accepted=True,
+            platform_result_code="SUCCESS",
+            channel_product_id=str(origin_product_no),
+            channel_option_id=str(channel_product_no),
+            items=[ProductOptionItemResult(seller_product_code=item["seller_product_code"]) for item in items],
+        )
+
+    def fetch_option_registration_status(
+        self, channel_product_id: str, channel_option_id: Optional[str] = None
+    ) -> ProductOptionRegistrationStatus:
+        """등록된 원상품(channel_product_id=originProductNo)을 재조회해 조합별
+        옵션 식별자(id)를 sellerManagerCode와 함께 돌려준다 - 등록 응답 자체에는
+        조합별 식별자가 없어(create_product_with_options 모듈 주석 참고) 항상 이
+        후속 조회가 필요하다."""
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("naver")
+        client_id, client_secret, seller_id = credentials
+        access_token = self._fetch_access_token(client_id, client_secret, seller_id)
+        origin_product = self._fetch_origin_product(channel_product_id, access_token)
+        status_type = origin_product.get("statusType")
+        option_info = ((origin_product.get("detailAttribute") or {}).get("optionInfo")) or {}
+        combinations = option_info.get("optionCombinations") or []
+        items = [
+            ProductOptionItemResult(
+                seller_product_code=combo["sellerManagerCode"],
+                channel_option_id=str(combo["id"]) if combo.get("id") is not None else None,
+            )
+            for combo in combinations
+            if combo.get("sellerManagerCode")
+        ]
+        return ProductOptionRegistrationStatus(status_name=str(status_type) if status_type else None, items=items)
 
     def update_product_info(
         self,

@@ -47,6 +47,9 @@ from integrations.malls.base_mall_connector import (
     CategoryRequirement,
     CategoryRequirements,
     ProductCreateResult,
+    ProductOptionItemResult,
+    ProductOptionRegistrationStatus,
+    ProductOptionsCreateResult,
     ProductSyncActionResult,
     ShipmentSubmitResult,
 )
@@ -292,6 +295,79 @@ def _validate_coupang_publish_draft(draft: dict[str, Any]) -> list[str]:
     return missing
 
 
+# --- 옵션 조합 상품 등록 (상용 ERP 확장 3단계, 세 번째 묶음) ---
+# 공식 문서(Product Creation, developers.coupang.com/hc/en-us/articles/360033877853,
+# 2026-09 조회): items[] 하나하나가 곧 SKU다 - "판매가"(items[].salePrice)는 그
+# SKU의 절대 판매가다(네이버 옵션가처럼 기준가에 대한 추가금이 아니다 - models.
+# product.ProductPublishOptionGroupDraft 모듈 docstring 참고). "Can add up to
+# max 200 options"(상품당 옵션 최대 200개). itemName은 "Input for each item so
+# that there is no overlap"(항목마다 겹치지 않게 입력) - 옵션값 조합을 그대로
+# 이어붙여 자동 생성한다(운영자가 별도 문구를 입력할 필요가 없고, 조합 자체가
+# 유니크하므로 겹치지 않는다).
+COUPANG_MAX_OPTION_ITEMS = 200
+_COUPANG_ITEM_NAME_MAX_LENGTH = 150
+# 그룹(옵션조합) 등록의 item 템플릿 필드 - 단일 등록과 달리 itemName/salePrice/
+# maximumBuyCount는 SKU마다 다르므로 공통 템플릿(channel_fields.item)에서 검사하지
+# 않는다(각 품목에서 채운다).
+_COUPANG_GROUP_ITEM_TEMPLATE_REQUIRED_FIELDS = tuple(f for f in _COUPANG_ITEM_REQUIRED_FIELDS if f != "itemName")
+
+
+def _validate_coupang_option_group_draft(draft: dict[str, Any]) -> list[str]:
+    """공식 계약상 확인된, 네트워크 호출 없이 검사 가능한 필수 항목만 검사한다
+    (카테고리별 필수 속성은 호출부가 fetch_category_requirements로 조회해 별도
+    검사한다 - create_product와 동일 원칙). 품목 간 중복(조합/판매자코드)은 여기서
+    즉시 차단한다."""
+    missing: list[str] = []
+    if not draft.get("name"):
+        missing.append("name(sellerProductName)")
+    image_urls = draft.get("image_urls") or []
+    if not image_urls:
+        missing.append("image_urls(대표이미지 최소 1장 필요)")
+
+    cf = draft.get("channel_fields") or {}
+    for field in _COUPANG_TOP_LEVEL_REQUIRED_FIELDS:
+        if cf.get(field) in (None, ""):
+            missing.append(f"channel_fields.{field}")
+    if cf.get("requested") is None:
+        missing.append("channel_fields.requested")
+
+    item_template = cf.get("item") or {}
+    for field in _COUPANG_GROUP_ITEM_TEMPLATE_REQUIRED_FIELDS:
+        if item_template.get(field) in (None, ""):
+            missing.append(f"channel_fields.item.{field}")
+
+    items = draft.get("items") or []
+    if not items:
+        missing.append("items(등록할 SKU가 1개 이상 필요)")
+        return missing
+    if len(items) > COUPANG_MAX_OPTION_ITEMS:
+        missing.append(f"items(쿠팡 상품당 옵션 최대 {COUPANG_MAX_OPTION_ITEMS}개, 현재 {len(items)}개)")
+
+    seen_codes: set[str] = set()
+    seen_combos: set[tuple[str, ...]] = set()
+    for item in items:
+        option_values = item.get("option_values") or []
+        if not option_values:
+            missing.append(f"items[product_option_id={item.get('product_option_id')}].option_values")
+        combo_key = tuple(str(v) for _a, v in option_values)
+        if combo_key in seen_combos:
+            raise MarketplaceValidationError(f"중복된 옵션 조합입니다(추측 금지): {combo_key}")
+        seen_combos.add(combo_key)
+
+        code = item.get("seller_product_code")
+        if not code:
+            missing.append(f"items[product_option_id={item.get('product_option_id')}].seller_product_code")
+        elif code in seen_codes:
+            raise MarketplaceValidationError(f"같은 초안 안에 판매자 관리코드가 중복됩니다: {code}")
+        else:
+            seen_codes.add(code)
+        if item.get("sale_price") is None:
+            missing.append(f"items[product_option_id={item.get('product_option_id')}].sale_price")
+        if item.get("stock_quantity") is None:
+            missing.append(f"items[product_option_id={item.get('product_option_id')}].stock_quantity")
+    return missing
+
+
 class CoupangConnector(BaseMallConnector):
     platform_code = "coupang"
     supports_shipment_submit = True
@@ -311,6 +387,7 @@ class CoupangConnector(BaseMallConnector):
     # 정보수정(update_product_info)은 이번 라운드 범위 밖이다(다음 단계로 이월) -
     # supports_product_info_update는 base 기본값(False)을 그대로 상속한다.
     supports_product_create = True
+    supports_product_option_create = True
 
     def __init__(
         self, session: Any = None, platform_id: Optional[int] = None, http_client: Optional[httpx.Client] = None
@@ -633,6 +710,125 @@ class CoupangConnector(BaseMallConnector):
         vendor_item_ids = [str(it["vendorItemId"]) for it in items if it.get("vendorItemId") is not None]
         status_name = data.get("statusName")
         return {"status_name": str(status_name) if status_name else None, "channel_option_ids": vendor_item_ids}
+
+    def create_product_with_options(self, draft_snapshot: dict[str, Any]) -> ProductOptionsCreateResult:
+        """하나의 로컬 상품에 속한 여러 SKU를 쿠팡 items[] 하나(상품 하나, 옵션
+        여러 개)로 묶어 등록 접수한다(모듈 상단 COUPANG_MAX_OPTION_ITEMS 주석의
+        공식 스펙 근거 참고). create_product()와 마찬가지로 등록 응답은
+        sellerProductId만 돌려주고 vendorItemId(옵션 단위 식별자)는 승인 후
+        fetch_option_registration_status()로만 확인할 수 있다."""
+        category_code = draft_snapshot.get("category_code")
+        if not category_code:
+            raise MarketplaceValidationError("category_code(displayCategoryCode)가 비어 있습니다.")
+        core_missing = _validate_coupang_option_group_draft(draft_snapshot)
+        requirements = self.fetch_category_requirements(category_code)
+        mandatory_names = requirements.mandatory_names()
+        items_snapshot: list[dict[str, Any]] = draft_snapshot.get("items") or []
+        category_missing: list[str] = []
+        for item in items_snapshot:
+            option_value_names = {str(a) for a, _v in (item.get("option_values") or [])}
+            for name in mandatory_names:
+                if name not in option_value_names:
+                    category_missing.append(
+                        f"items[product_option_id={item.get('product_option_id')}].option_values.{name}"
+                    )
+        missing = core_missing + category_missing
+        if missing:
+            raise MarketplaceValidationError(
+                f"쿠팡 옵션조합 상품 등록에 필요한 항목이 비어 있습니다(카테고리={category_code}, 추측 금지): "
+                + ", ".join(missing)
+            )
+
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("coupang")
+        access_key, secret_key, vendor_id = credentials
+
+        image_urls: list[str] = draft_snapshot["image_urls"]
+        images = [{"imageOrder": 0, "imageType": "REPRESENTATION", "vendorPath": image_urls[0]}]
+        images.extend(
+            {"imageOrder": i, "imageType": "DETAIL", "vendorPath": url} for i, url in enumerate(image_urls[1:], start=1)
+        )
+        item_template = dict(draft_snapshot["channel_fields"]["item"])
+
+        items: list[dict[str, Any]] = []
+        for item_snapshot in items_snapshot:
+            option_values = item_snapshot["option_values"]
+            item_payload = dict(item_template)
+            item_payload["itemName"] = "/".join(str(v) for _a, v in option_values)[:_COUPANG_ITEM_NAME_MAX_LENGTH]
+            item_payload["salePrice"] = int(item_snapshot["sale_price"])
+            item_payload["maximumBuyCount"] = int(item_snapshot["stock_quantity"])
+            item_payload["externalVendorSku"] = item_snapshot["seller_product_code"]
+            item_payload["attributes"] = [
+                {"attributeTypeName": str(axis), "attributeValueName": str(value)} for axis, value in option_values
+            ]
+            item_payload["images"] = images
+            items.append(item_payload)
+
+        cf = draft_snapshot["channel_fields"]
+        body: dict[str, Any] = {"displayCategoryCode": category_code, "sellerProductName": draft_snapshot["name"]}
+        for field in _COUPANG_TOP_LEVEL_REQUIRED_FIELDS:
+            body[field] = cf[field]
+        body["vendorId"] = vendor_id
+        body["requested"] = bool(cf["requested"])
+        body["images"] = images
+        body["items"] = items
+
+        path = CREATE_PRODUCT_PATH
+        authorization = self._authorization(access_key, secret_key, "POST", path, "")
+        response = self._request_with_retry(
+            "POST",
+            path,
+            headers={"Authorization": authorization, "Content-Type": "application/json;charset=UTF-8"},
+            json_body=body,
+        )
+        raise_for_status("coupang", response.status_code)
+        with external_call("coupang"):
+            payload = response.json()
+            inner = payload.get("data") or {}
+            code = inner.get("code")
+            seller_product_id = inner.get("data")
+        accepted = code == "SUCCESS" and seller_product_id is not None
+        return ProductOptionsCreateResult(
+            accepted=accepted,
+            platform_result_code=str(code),
+            channel_product_id=str(seller_product_id) if seller_product_id is not None else None,
+            channel_option_id=None,  # 쿠팡은 옵션 상위의 별도 채널상품ID 개념이 없다.
+            items=[
+                ProductOptionItemResult(seller_product_code=item_snapshot["seller_product_code"])
+                for item_snapshot in items_snapshot
+            ],
+        )
+
+    def fetch_option_registration_status(
+        self, channel_product_id: str, channel_option_id: Optional[str] = None
+    ) -> ProductOptionRegistrationStatus:
+        """등록 접수된 상품(sellerProductId)을 재조회해 품목별 externalVendorSku와
+        확정된 vendorItemId(승인 전이면 null)를 함께 돌려준다(모듈 상단
+        PRODUCT_QUERY_PATH_TMPL 주석 참고) - fetch_registration_status와 달리
+        SKU별 결과를 그대로 보존한다(배열 순서로 추정하지 않고 호출부가
+        externalVendorSku로 다시 대응시킨다)."""
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("coupang")
+        access_key, secret_key, _vendor_id = credentials
+        path = PRODUCT_QUERY_PATH_TMPL.format(seller_product_id=channel_product_id)
+        authorization = self._authorization(access_key, secret_key, "GET", path, "")
+        response = self._request_with_retry("GET", path, headers={"Authorization": authorization})
+        raise_for_status("coupang", response.status_code)
+        with external_call("coupang"):
+            payload = response.json()
+            data = payload.get("data") or {}
+        status_name = data.get("statusName")
+        items = [
+            ProductOptionItemResult(
+                seller_product_code=it["externalVendorSku"],
+                channel_option_id=str(it["vendorItemId"]) if it.get("vendorItemId") is not None else None,
+            )
+            for it in (data.get("items") or [])
+            if it.get("externalVendorSku")
+        ]
+        return ProductOptionRegistrationStatus(status_name=str(status_name) if status_name else None, items=items)
 
     # --- 실제 API 연동 ---
 
