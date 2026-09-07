@@ -19,6 +19,7 @@ const NAV_ITEMS: Array<{ to: string; label: string; permission?: string }> = [
   { to: '/returns', label: '반품관리', permission: 'EXCHANGE_RETURN_MANAGE' },
   { to: '/cancellations', label: '취소관리', permission: 'EXCHANGE_RETURN_MANAGE' },
   { to: '/products', label: '상품관리', permission: 'PRODUCT_MANAGE' },
+  { to: '/products-bulk', label: '상품 대량처리', permission: 'PRODUCT_MANAGE' },
   { to: '/unmatched-items', label: '미매칭 상품', permission: 'PRODUCT_MANAGE' },
   { to: '/customers', label: '고객관리' },
   { to: '/inventory', label: '재고관리', permission: 'INVENTORY_VIEW' },

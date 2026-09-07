@@ -196,6 +196,63 @@ export interface OptionRegistrationStatus {
   items: OptionRegistrationStatusItem[]
 }
 
+// 상용 ERP 확장(3단계, 네 번째 묶음) - 상품/옵션조합 등록과 재고/판매상태/정보수정의
+// 대량 접수·진행상태 조회·재처리. 단건 화면(위 타입들)과 같은 백엔드 서비스를
+// 공유하므로 status/outcome 값도 동일한 어휘를 그대로 쓴다.
+export interface BulkTarget {
+  id: number
+  platform_id: number
+  platform_code: string
+  product_name: string | null
+  sku_code: string | null
+  registered_at: string | null
+}
+
+export type BulkOutcome =
+  | 'ACCEPTED'
+  | 'VALIDATION_FAILED'
+  | 'UNSUPPORTED'
+  | 'BLOCKED_BY_UNKNOWN'
+  | 'DUPLICATE_OR_SUPERSEDED'
+  | 'FAILED_TO_ENQUEUE'
+
+export interface BulkItemResult {
+  target_id: number
+  outcome: BulkOutcome
+  command_id: number | null
+  error_code: string | null
+}
+
+export interface BulkSubmitResult {
+  items: BulkItemResult[]
+  aborted: boolean
+}
+
+export interface BulkCommandStatus {
+  id: number
+  command_type: string
+  target_id: number
+  status: string
+  attempt_count: number
+  retryable: boolean
+  error_code: string | null
+  next_retry_at: string | null
+  completed_at: string | null
+}
+
+export type BulkRetryOutcome = 'RETRIED' | 'NOT_FOUND' | 'NOT_RETRYABLE' | 'UNKNOWN_REQUIRES_RESOLUTION' | 'FAILED_TO_ENQUEUE'
+
+export interface BulkRetryItemResult {
+  command_id: number
+  outcome: BulkRetryOutcome
+  error_code: string | null
+}
+
+export interface BulkRetryResult {
+  items: BulkRetryItemResult[]
+  aborted: boolean
+}
+
 export interface ProductPlatformMapCreate {
   platform_id: number
   platform_option_id: string

@@ -13,6 +13,7 @@ import { ReturnsPage } from './pages/ReturnsPage'
 import { CancellationsPage } from './pages/CancellationsPage'
 import { ProductsPage } from './pages/ProductsPage'
 import { ProductDetailPage } from './pages/ProductDetailPage'
+import { ProductBulkPage } from './pages/ProductBulkPage'
 import { UnmatchedItemsPage } from './pages/UnmatchedItemsPage'
 import { CustomersPage } from './pages/CustomersPage'
 import { InventoryPage } from './pages/InventoryPage'
@@ -50,6 +51,7 @@ function App() {
         <Route path="/cancellations" element={<Protected><CancellationsPage /></Protected>} />
         <Route path="/products" element={<Protected><ProductsPage /></Protected>} />
         <Route path="/products/:productId" element={<Protected><ProductDetailPage /></Protected>} />
+        <Route path="/products-bulk" element={<Protected><ProductBulkPage /></Protected>} />
         <Route path="/unmatched-items" element={<Protected><UnmatchedItemsPage /></Protected>} />
         <Route path="/customers" element={<Protected><CustomersPage /></Protected>} />
         <Route path="/inventory" element={<Protected><InventoryPage /></Protected>} />

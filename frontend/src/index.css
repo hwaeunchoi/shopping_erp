@@ -697,6 +697,7 @@ input, select {
 
 .tabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
   margin-bottom: 16px;
   border-bottom: 1px solid var(--border);
@@ -709,6 +710,7 @@ input, select {
   cursor: pointer;
   font-size: 14px;
   border-bottom: 2px solid transparent;
+  white-space: nowrap;
 }
 
 .tab-button.active {
