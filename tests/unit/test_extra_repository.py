@@ -19,6 +19,19 @@ from repositories.extra_repository import (
 )
 
 
+def _FrozenDatetime(fixed: datetime) -> type[datetime]:
+    """extra_repository.datetime.now(timezone.utc)가 항상 fixed를 반환하도록
+    고정한다 - touch()의 동시성 가드(WHERE viewed_at < excluded.viewed_at)를
+    "먼저/나중" 순서를 통제해 검증하기 위함이다."""
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed
+
+    return _Frozen
+
+
 def _make_user(db_session, username="testuser"):
     from models.user import Role, User
 
@@ -167,6 +180,57 @@ class TestRecentViewRepository:
         result = repo.list_recent(user1.id)
 
         assert [r.target_id for r in result] == [1]
+
+    def test_touch_updates_to_a_newer_viewed_at(self, db_session, monkeypatch):
+        """정상 순서(먼저 본 뒤 나중에 다시 봄)로는 viewed_at이 최신 시각으로
+        갱신되어야 한다 - 아래 "뒤로 되돌리지 않음" 테스트와 짝을 이룬다."""
+        import repositories.extra_repository as extra_repo_module
+
+        user = _make_user(db_session)
+        repo = RecentViewRepository(db_session)
+        t1 = datetime.now(timezone.utc)
+        t2 = t1 + timedelta(seconds=30)
+
+        monkeypatch.setattr(extra_repo_module, "datetime", _FrozenDatetime(t1))
+        first = repo.touch(user.id, "ORDER", 1)
+        first_id, first_viewed_at = first.id, first.viewed_at  # populate_existing이 같은
+        # 파이썬 객체를 제자리에서 갱신하므로, 두 번째 touch() 이후에도 비교할 수
+        # 있게 값을 미리 복사해 둔다(first 참조 자체는 second와 동일 객체가 된다).
+        monkeypatch.setattr(extra_repo_module, "datetime", _FrozenDatetime(t2))
+        second = repo.touch(user.id, "ORDER", 1)
+
+        assert second.id == first_id
+        assert second.viewed_at > first_viewed_at
+
+    def test_touch_does_not_move_viewed_at_backward_for_a_late_arriving_older_request(self, db_session, monkeypatch):
+        """실제 발견된 결함의 재발 방지: "조회 후 없으면 INSERT" 방식을 원자적
+        INSERT ... ON CONFLICT DO UPDATE로 바꾸면서, 두 동시 요청 중 하나가
+        나중에 실행을 마쳐도(그 요청이 들고 있던 시각 자체는 더 과거라면)
+        이미 기록된 더 최신 viewed_at을 과거로 되돌리면 안 된다는 요구사항을
+        함께 만족해야 한다 - WHERE viewed_at < excluded.viewed_at 가드가 이를
+        보장한다."""
+        import repositories.extra_repository as extra_repo_module
+
+        user = _make_user(db_session)
+        repo = RecentViewRepository(db_session)
+        later = datetime.now(timezone.utc)
+        earlier = later - timedelta(seconds=30)
+
+        monkeypatch.setattr(extra_repo_module, "datetime", _FrozenDatetime(later))
+        first = repo.touch(user.id, "ORDER", 1)
+        first_id, first_viewed_at = first.id, first.viewed_at  # populate_existing이 같은
+        # 파이썬 객체를 제자리에서 갱신하므로 값을 미리 복사해 둔다 - 그렇지
+        # 않으면 갱신이 실수로 적용돼도(회귀) first도 함께 바뀌어 있어 이
+        # 테스트가 결함을 놓치게 된다.
+
+        monkeypatch.setattr(extra_repo_module, "datetime", _FrozenDatetime(earlier))
+        second = repo.touch(user.id, "ORDER", 1)
+
+        assert second.id == first_id
+        # DB에 왕복 저장된 값끼리만 비교한다(naive/aware 혼용 비교 회피) -
+        # 갱신이 스킵됐다면 두 번째 조회값도 첫 번째와 완전히 동일해야 한다.
+        assert second.viewed_at == first_viewed_at
+        assert len(repo.list_recent(user.id)) == 1
 
 
 class TestFavoriteRepository:

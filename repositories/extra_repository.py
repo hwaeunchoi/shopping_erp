@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from models.extra import Favorite, IntegrationStatus, Memo, RecentView, ReportSchedule, TaskExecutionHistory
@@ -97,16 +99,53 @@ class RecentViewRepository(BaseRepository[RecentView]):
         super().__init__(session, RecentView)
 
     def touch(self, user_id: int, target_type: str, target_id: int) -> RecentView:
-        stmt = select(RecentView).where(
-            RecentView.user_id == user_id, RecentView.target_type == target_type, RecentView.target_id == target_id
-        )
-        existing = self.session.execute(stmt).scalar_one_or_none()
+        """동일 대상 재열람 시 새 행을 만들지 않고 viewed_at만 갱신한다.
+
+        (user_id, target_type, target_id) 유니크 제약(uq_recent_view -
+        migrations/versions/20260904_1530_c4cd4340574e_recent_views_unique_constraint.py)을
+        원자적 INSERT ... ON CONFLICT DO UPDATE 한 문장으로 흡수한다. 예전
+        방식("조회 후 없으면 INSERT")은 두 요청이 동시에 같은 조합을 처음
+        기록하려 하면 조회 시점엔 둘 다 "없음"으로 보여(TOCTOU) 하나가 유니크
+        제약 위반(IntegrityError)을 던졌다 - 이 메서드가 그 예외를 잡아
+        "중복이니 무시"하는 방식은 쓰지 않는다(정말 다른 원인으로 난
+        IntegrityError까지 조용히 삼킬 위험이 있다). 대신 DB가 그 경합 자체를
+        단일 문장 안에서 직렬화하게 만들어, 두 요청 모두 예외 없이 끝나고
+        정확히 한 행만 남는다.
+
+        WHERE viewed_at < excluded.viewed_at로 갱신 조건을 걸어, 나중에 실행이
+        끝난 요청이라도 그 요청이 들고 있던 시각이 이미 저장된 값보다 과거이면
+        (다른 요청이 그사이 더 최신 시각으로 먼저 기록한 경우) viewed_at을
+        뒤로 되돌리지 않는다 - 이 조건에 걸려 갱신이 스킵되면 RETURNING이 빈
+        결과를 주므로, 그 경우에만 별도 조회로 현재 행을 그대로 반환한다."""
         now = datetime.now(timezone.utc)
-        if existing is not None:
-            existing.viewed_at = now
-            self.session.flush()
-            return existing
-        return self.add(RecentView(user_id=user_id, target_type=target_type, target_id=target_id, viewed_at=now))
+        dialect_name = self.session.get_bind().dialect.name
+        insert_fn = pg_insert if dialect_name == "postgresql" else sqlite_insert
+        insert_stmt = insert_fn(RecentView).values(
+            user_id=user_id, target_type=target_type, target_id=target_id, viewed_at=now
+        )
+        upsert_stmt = insert_stmt.on_conflict_do_update(
+            index_elements=["user_id", "target_type", "target_id"],
+            set_={"viewed_at": insert_stmt.excluded.viewed_at},
+            where=(RecentView.viewed_at < insert_stmt.excluded.viewed_at),
+        ).returning(RecentView.id)
+        row_id = self.session.execute(upsert_stmt).scalar_one_or_none()
+        self.session.flush()
+        if row_id is None:
+            return self.session.execute(
+                select(RecentView).where(
+                    RecentView.user_id == user_id,
+                    RecentView.target_type == target_type,
+                    RecentView.target_id == target_id,
+                )
+            ).scalar_one()
+        # populate_existing=True: 이 행이 세션 identity map에 이미 로드돼 있으면
+        # (예: 같은 요청 안에서 먼저 조회한 적이 있으면) get()이 캐시된 예전
+        # 파이썬 객체를 그대로 돌려줘 방금 UPDATE로 바뀐 viewed_at을 반영하지
+        # 못한다 - Core로 실행한 UPDATE는 이미 로드된 ORM 인스턴스를 자동으로
+        # 갱신하지 않기 때문이다. 항상 DB의 최신 값으로 다시 채운다.
+        view = self.session.get(RecentView, row_id, populate_existing=True)
+        assert view is not None  # 방금 INSERT/UPDATE로 확정된 행 - 항상 존재한다.
+        return view
 
     def list_recent(self, user_id: int, limit: int = 10) -> list[RecentView]:
         stmt = (

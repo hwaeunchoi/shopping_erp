@@ -60,7 +60,10 @@ class RecentView(Base):
     """최근 본 항목 (v1.1). 동일 대상 재열람 시 viewed_at만 갱신."""
 
     __tablename__ = "recent_views"
-    __table_args__ = (Index("idx_recent_views_user", "user_id", "viewed_at"),)
+    __table_args__ = (
+        Index("idx_recent_views_user", "user_id", "viewed_at"),
+        UniqueConstraint("user_id", "target_type", "target_id", name="uq_recent_view"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
