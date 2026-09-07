@@ -1244,6 +1244,7 @@ function ProductOptionGroupPublishControls({
   const [isSavingDraft, setIsSavingDraft] = useState(false)
   const [savingRowId, setSavingRowId] = useState<number | null>(null)
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const [isConfirmingEtcNotice, setIsConfirmingEtcNotice] = useState(false)
   const [command, setCommand] = useState<ProductSyncExternalCommand | null>(null)
   const [registrationStatus, setRegistrationStatus] = useState<OptionRegistrationStatus | null>(null)
   const [confirmInputs, setConfirmInputs] = useState<Record<number, string>>({})
@@ -1477,6 +1478,48 @@ function ProductOptionGroupPublishControls({
     }
   }
 
+  // ProductPublishControls(단일 SKU 등록)의 ETC 확인 블록과 동일한 원칙 - 이
+  // 확인은 시스템이 대신 검증한 것이 아니라 운영자 확인 기록일 뿐이다(공식으로
+  // 검증할 API가 없다 - integrations.malls.naver_smartstore_connector 모듈
+  // docstring 참고). 옵션조합 등록도 같은 원상품 레벨 필드(productInfoProvidedNotice)를
+  // 쓰므로 동일하게 필요하다.
+  let currentNoticeType: string | undefined
+  try {
+    const parsed = channelFields.trim() ? JSON.parse(channelFields) : {}
+    const notice = parsed?.productInfoProvidedNotice
+    if (notice && typeof notice === 'object') {
+      currentNoticeType = (notice as Record<string, unknown>).productInfoProvidedNoticeType as string | undefined
+    }
+  } catch {
+    currentNoticeType = undefined
+  }
+
+  const handleConfirmEtcNotice = async () => {
+    if (!draft) return
+    if (
+      !window.confirm(
+        `카테고리 코드 '${draft.category_code ?? ''}'에 네이버 ETC(기타 재화) 상품정보제공고시 양식을 ` +
+          '쓰는 것이 맞는지 판매자센터에서 직접 확인했습니까?\n' +
+          '이 확인은 시스템이 대신 검증한 것이 아니라 운영자 본인의 확인 기록으로 남습니다.',
+      )
+    ) {
+      return
+    }
+    setError(null)
+    setIsConfirmingEtcNotice(true)
+    try {
+      const updated = await api.post<ProductOptionGroupDraft>(
+        `/api/products/option-publish-drafts/${draft.id}/confirm-etc-notice`,
+        {},
+      )
+      setDraft(updated)
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'ETC 카테고리 적합성 확인 기록 중 오류가 발생했습니다.')
+    } finally {
+      setIsConfirmingEtcNotice(false)
+    }
+  }
+
   return (
     <div>
       <form className="inline-form" onSubmit={handleSaveGroupDraft} style={{ flexWrap: 'wrap', marginBottom: 4 }}>
@@ -1513,6 +1556,36 @@ function ProductOptionGroupPublishControls({
           {isSavingDraft ? '저장 중...' : '상품 공통정보 저장'}
         </button>
       </form>
+
+      {currentNoticeType === 'ETC' && (
+        <div className="hint-text" style={{ marginBottom: 8, padding: 8, border: '1px solid var(--border)', borderRadius: 6 }}>
+          <p style={{ margin: '0 0 4px' }}>
+            ⚠️ 이 채널은 상품정보제공고시로 <strong>ETC(기타 재화)</strong> 양식을 사용합니다. ETC 입력 형식
+            자체는 이 시스템이 지원하지만, <strong>이 카테고리에 ETC 고시가 실제로 맞는지는 공식 API로 검증할
+            방법이 없어</strong> 운영자가 네이버 판매자센터에서 직접 확인해야 합니다. 아래 확인은 그 사실을
+            기록할 뿐이며 "공식 적합성 검증 완료"를 의미하지 않습니다 - 카테고리 코드나 고시유형을 바꾸면
+            이 확인은 자동으로 무효화됩니다.
+          </p>
+          {draft?.etc_notice_confirmation_valid ? (
+            <p style={{ margin: '0 0 4px', color: '#15803d' }}>
+              ✅ 확인됨 - 사용자 #{draft.etc_notice_confirmed_by}
+              {draft.etc_notice_confirmed_at && `, ${new Date(draft.etc_notice_confirmed_at).toLocaleString()}`}
+              (카테고리 {draft.etc_notice_confirmed_category_code})
+            </p>
+          ) : draft?.etc_notice_confirmed_at ? (
+            <p style={{ margin: '0 0 4px', color: '#b45309' }}>
+              ⚠️ 이전 확인(카테고리 {draft.etc_notice_confirmed_category_code})이 카테고리/고시유형 변경으로
+              무효화되었습니다 - 다시 확인이 필요합니다.
+            </p>
+          ) : (
+            <p style={{ margin: '0 0 4px', color: '#b45309' }}>❌ 아직 확인되지 않았습니다 - 확인 전에는 등록이 차단됩니다.</p>
+          )}
+          <button type="button" onClick={handleConfirmEtcNotice} disabled={!draft || isConfirmingEtcNotice}>
+            {isConfirmingEtcNotice ? '기록 중...' : '이 카테고리에 ETC 고시가 맞음을 확인'}
+          </button>
+          {!draft && <span> (먼저 상품 공통정보를 저장하세요)</span>}
+        </div>
+      )}
 
       <p className="hint-text">
         옵션축 이름(최대 3개, 네이버 조합형 옵션 제한) - 모든 SKU에 공통 적용됩니다.

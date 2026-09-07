@@ -206,3 +206,103 @@ class TestFetchOptionRegistrationStatus:
         result = connector.fetch_option_registration_status(ORIGIN_PRODUCT_NO)
 
         assert result.items == []
+
+
+# --- 조합 옵션 식별자(services.product_option_publish_service._create_mapping이
+# ProductPlatformMap.platform_option_id에 저장하는 "COMBO-{originProductNo}-{comboId}"
+# 네임스페이스 접두사 문자열)가 기존 단일 매핑 경로(재고/판매상태/정보수정)에
+# 원문 채널 ID처럼 잘못 전송되지 않는지 검증한다 - 두 메서드 모두 소스코드상
+# platform_option_id를 요청 구성에 전혀 쓰지 않는다(원상품 단위로만 동작하기
+# 때문 - platform_origin_product_id만 사용). update_inventory()는 별도로
+# TestUpdateInventoryBlocksOptionManagedStock(test_naver_smartstore_connector_
+# product_sync.py)이 이미 옵션조합 상품 자체를 명시적으로 차단함을 검증한다.
+_COMBO_STYLE_ID = "COMBO-5000000001-111"
+
+
+def _origin_product_with_option_info() -> dict:
+    return {
+        "statusType": "SALE",
+        "name": "옵션조합 상품명",
+        "salePrice": 20000,
+        "detailContent": "<p>기존 설명</p>",
+        "stockQuantity": 15,
+        "leafCategoryId": "50000803",
+        "images": {"representativeImage": {"url": "https://img.example.com/existing.jpg"}},
+        "deliveryInfo": {"deliveryType": "DELIVERY", "deliveryFee": {"deliveryFeeType": "FREE"}},
+        "detailAttribute": {
+            "originAreaInfo": {"originAreaCode": "0200037"},
+            "optionInfo": {
+                "useStockManagement": True,
+                "optionCombinationGroupNames": {"optionGroupName1": "색상"},
+                "optionCombinations": [
+                    {"id": 111, "optionName1": "블랙", "stockQuantity": 10, "price": 0, "sellerManagerCode": "SKU-A"}
+                ],
+            },
+        },
+    }
+
+
+class TestComboOptionIdNeverSentOnExistingSingleMappingPaths:
+    def test_update_sale_status_never_transmits_the_combo_prefixed_id(self, db_session, platform):
+        from integrations.malls.base_mall_connector import SALE_STATUS_ON_SALE
+
+        _register_credentials(db_session, platform)
+        captured: list = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            if request.url.path.endswith("/oauth2/token"):
+                return httpx.Response(200, json={"access_token": "fake-token", "expires_in": 3600})
+            if request.method == "PUT" and request.url.path.endswith(
+                f"/origin-products/{ORIGIN_PRODUCT_NO}/change-status"
+            ):
+                return httpx.Response(200, json={"code": "SUCCESS"})
+            raise AssertionError(f"예상치 못한 요청: {request.method} {request.url.path}")
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.commerce.naver.com")
+        connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        connector.update_sale_status(_COMBO_STYLE_ID, SALE_STATUS_ON_SALE, platform_origin_product_id=ORIGIN_PRODUCT_NO)
+
+        put_req = next(r for r in captured if r.method == "PUT")
+        assert _COMBO_STYLE_ID not in put_req.url.path
+        assert _COMBO_STYLE_ID.encode() not in put_req.content
+
+    def test_update_product_info_never_transmits_the_combo_prefixed_id_and_preserves_option_info(
+        self, db_session, platform
+    ):
+        _register_credentials(db_session, platform)
+        captured: list = []
+        origin_product = _origin_product_with_option_info()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            if request.url.path.endswith("/oauth2/token"):
+                return httpx.Response(200, json={"access_token": "fake-token", "expires_in": 3600})
+            if request.method == "GET" and request.url.path.endswith(f"/origin-products/{ORIGIN_PRODUCT_NO}"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "originProduct": origin_product,
+                        "smartstoreChannelProduct": {"channelProductDisplayStatusType": "ON"},
+                    },
+                )
+            if request.method == "PUT" and request.url.path.endswith(f"/origin-products/{ORIGIN_PRODUCT_NO}"):
+                return httpx.Response(
+                    200, json={"originProductNo": int(ORIGIN_PRODUCT_NO), "smartstoreChannelProductNo": 1}
+                )
+            raise AssertionError(f"예상치 못한 요청: {request.method} {request.url.path}")
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.commerce.naver.com")
+        connector = NaverSmartstoreConnector(session=db_session, platform_id=platform.id, http_client=http_client)
+
+        connector.update_product_info(_COMBO_STYLE_ID, ORIGIN_PRODUCT_NO, name="바뀐 상품명(공유 원상품 필드)")
+
+        put_req = next(r for r in captured if r.method == "PUT")
+        assert _COMBO_STYLE_ID not in put_req.url.path
+        assert _COMBO_STYLE_ID.encode() not in put_req.content
+        body = json.loads(put_req.content)
+        # 조합 옵션 정보는 그대로 보존돼야 한다(name/salePrice/detailContent 세
+        # 필드만 바꾸는 전체교체형 PUT - update_product_info의 기존 보존 원칙).
+        assert body["originProduct"]["detailAttribute"]["optionInfo"] == origin_product["detailAttribute"]["optionInfo"]
+        assert body["originProduct"]["name"] == "바뀐 상품명(공유 원상품 필드)"
