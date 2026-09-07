@@ -25,6 +25,22 @@ export interface Platform {
   is_active: boolean
 }
 
+// GET /api/platforms/capability-matrix - 활성/비활성 무관 전체 플랫폼. capabilities가
+// null이면 공식 API 계약이 아직 검증되지 않은 채널이라는 뜻이다(개별 기능을 점검해
+// 전부 false로 나온 것이 아니다).
+export interface PlatformCapability {
+  id: number
+  code: string
+  name: string
+  connector_class: string
+  is_active: boolean
+  official_contract_verified: boolean
+  capabilities: Record<string, boolean> | null
+  last_success_at: string | null
+  last_error_at: string | null
+  last_error_message: string | null
+}
+
 export interface Product {
   id: number
   name: string

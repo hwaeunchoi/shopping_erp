@@ -4,7 +4,7 @@ import { useApiData } from '../api/useApiData'
 import type {
   ApiCredentialMasked,
   ApiCredentialUpsert,
-  Platform,
+  PlatformCapability,
   RolePermissions,
   SettingsPermission,
   SettingsRole,
@@ -12,6 +12,93 @@ import type {
   SettingsUserCreate,
   SystemSetting,
 } from '../api/types'
+
+// capability 키 -> 화면 표시 라벨. api/routers/platforms.py의 CAPABILITY_KEYS와
+// 정확히 같은 키 집합이어야 한다(새 capability가 백엔드에 추가되면 여기도 추가).
+const CAPABILITY_LABELS: Record<string, string> = {
+  product_create: '신규 상품 등록',
+  product_option_create: '옵션조합 등록',
+  product_info_update: '상품정보 수정',
+  inventory_update: '재고 전송',
+  sale_status_update: '판매상태 전송',
+  shipment_submit: '송장 전송',
+  cancellation_sync: '취소 수집',
+  return_sync: '반품 수집',
+  exchange_sync: '교환 수집',
+  cancellation_lookup_by_order: '주문단위 취소조회',
+  settlement_sync: '정산 수집',
+  settlement_detail_sync: '정산 상세 수집',
+}
+
+function ChannelsTab() {
+  const { data, error, isLoading } = useApiData<PlatformCapability[]>(
+    () => api.get('/api/platforms/capability-matrix'),
+    [],
+  )
+
+  return (
+    <div>
+      <p className="hint-text">
+        채널별로 공식 API 계약이 실제로 확인·검증되었는지와, 검증된 채널의 기능별 지원 여부를 보여줍니다. "공식 계약
+        미확인"은 개별 기능을 점검해서 전부 미지원으로 나온 것이 아니라, 아직 실 연동 자체가 없다는 뜻입니다.
+      </p>
+      {isLoading && <p>불러오는 중...</p>}
+      {error && <p className="form-error">{error}</p>}
+      <div className="table-scroll">
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>채널</th>
+              <th>플랫폼 상태</th>
+              <th>공식 계약</th>
+              <th>지원 기능</th>
+              <th>마지막 성공</th>
+              <th>마지막 실패</th>
+            </tr>
+          </thead>
+          <tbody>
+            {data?.map((p) => {
+              const supported = p.capabilities ? Object.entries(p.capabilities).filter(([, v]) => v) : []
+              return (
+                <tr key={p.id}>
+                  <td>{p.name}</td>
+                  <td>
+                    <span className="status-badge">{p.is_active ? '활성' : '비활성'}</span>
+                  </td>
+                  <td>
+                    {p.official_contract_verified ? (
+                      <span className="status-badge">검증됨</span>
+                    ) : (
+                      <span className="status-badge">공식 계약 미확인</span>
+                    )}
+                  </td>
+                  <td>
+                    {p.capabilities === null
+                      ? '-'
+                      : supported.length === 0
+                        ? '지원 기능 없음'
+                        : supported.map(([k]) => CAPABILITY_LABELS[k] ?? k).join(', ')}
+                  </td>
+                  <td>{p.last_success_at ? new Date(p.last_success_at).toLocaleString() : '이력 없음'}</td>
+                  <td>
+                    {p.last_error_at ? (
+                      <>
+                        {new Date(p.last_error_at).toLocaleString()}
+                        {p.last_error_message && ` (${p.last_error_message})`}
+                      </>
+                    ) : (
+                      '이력 없음'
+                    )}
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
 
 // 설정 화면: 사용자관리/역할관리/권한관리/API Credential관리/시스템설정 5개 탭.
 // 전체가 백엔드 SETTINGS_MANAGE 권한으로 보호되며, 이 화면 자체도 그 권한이 있는
@@ -235,7 +322,10 @@ const CREDENTIAL_KEYS_BY_CONNECTOR: Record<string, { required: string[]; optiona
 }
 
 function CredentialsTab() {
-  const { data: platforms } = useApiData<Platform[]>(() => api.get('/api/platforms'), [])
+  // capability-matrix는 비활성 플랫폼(11번가 등)도 포함한다 - 선택했을 때 아래
+  // "현재 실제 API 연동을 지원하지 않는 플랫폼입니다" 안내가 나오게 하려면, 애초에
+  // 목록에서 골라볼 수 있어야 한다(/api/platforms는 활성 플랫폼만 반환한다).
+  const { data: platforms } = useApiData<PlatformCapability[]>(() => api.get('/api/platforms/capability-matrix'), [])
   const [ownerId, setOwnerId] = useState<number>(0)
   const { data, error, isLoading, reload } = useApiData<ApiCredentialMasked[]>(
     () => (ownerId ? api.get(`/api/settings/api-credentials?owner_type=PLATFORM&owner_id=${ownerId}`) : Promise.resolve([])),
@@ -402,7 +492,7 @@ function SystemSettingsTab() {
   )
 }
 
-type SettingsTab = 'users' | 'roles' | 'permissions' | 'credentials' | 'system'
+type SettingsTab = 'users' | 'roles' | 'permissions' | 'credentials' | 'channels' | 'system'
 
 export function SettingsPage() {
   const [tab, setTab] = useState<SettingsTab>('users')
@@ -412,6 +502,7 @@ export function SettingsPage() {
     { key: 'roles', label: '역할 관리' },
     { key: 'permissions', label: '권한 관리' },
     { key: 'credentials', label: 'API Credential 관리' },
+    { key: 'channels', label: '채널 연동 현황' },
     { key: 'system', label: '시스템 설정' },
   ]
 
@@ -434,6 +525,7 @@ export function SettingsPage() {
       {tab === 'roles' && <RolesTab />}
       {tab === 'permissions' && <PermissionsTab />}
       {tab === 'credentials' && <CredentialsTab />}
+      {tab === 'channels' && <ChannelsTab />}
       {tab === 'system' && <SystemSettingsTab />}
     </div>
   )
