@@ -638,3 +638,42 @@ class ProductSyncDispatchService:
         )
         self.session.flush()
         return command
+
+    def retry_failed_command(self, command_id: int, resolved_by: Optional[int] = None) -> ExternalCommand:
+        """실패(FAILED)로 확정된 명령을 운영자 요청으로 재처리 대상(PENDING)으로
+        되돌린다 - 상용 ERP 확장(대량처리 묶음)의 "실패 항목 선택 재처리" 전용
+        진입점이다. 재고/판매상태/정보수정 세 명령종류를 모두 다룬다(이 서비스가
+        관리하는 target_type=PRODUCT_PLATFORM_MAP 전체). 접수 시점에 얼려 둔
+        스냅샷(ProductSyncCommandDetail)은 건드리지 않는다 - 재시도는 "정확히
+        같은 요청"의 반복이다. UNKNOWN은 이 메서드로 재처리할 수 없다 - 반드시
+        resolve_unknown_command()로 운영자가 채널을 직접 확인한 뒤에만
+        해소해야 한다."""
+        command = self.command_repo.get_by_id(command_id)
+        if command is None:
+            raise ValueError(f"명령을 찾을 수 없습니다: command_id={command_id}")
+        if command.target_type != TARGET_TYPE:
+            raise ProductSyncCommandTypeMismatchError(
+                f"이 서비스가 다루지 않는 대상입니다: command_id={command_id}, target_type={command.target_type}"
+            )
+        if command.status != "FAILED":
+            raise ValueError(f"실패(FAILED) 상태인 명령만 재처리할 수 있습니다(현재 상태: {command.status}).")
+        before_status = command.status
+        command.status = "PENDING"
+        command.next_retry_at = None
+        command.error_code = None
+        command.retryable = False
+        self.session.add(
+            AuditLog(
+                entity_type="EXTERNAL_COMMAND",
+                entity_id=command.id,
+                action="UPDATE",
+                before_json=f'{{"status":"{before_status}"}}',
+                after_json='{"status":"PENDING"}',
+                changed_by=resolved_by,
+                changed_at=datetime.now(timezone.utc),
+                command="product_sync_command.retry_failed",
+                reason="운영자가 실패한 명령의 재처리를 요청함",
+            )
+        )
+        self.session.flush()
+        return command

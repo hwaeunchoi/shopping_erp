@@ -605,6 +605,26 @@ class ProductOptionPublishService:
         self.session.flush()
         return command
 
+    def retry_failed_command(self, command_id: int) -> ExternalCommand:
+        """services.product_publish_service.ProductPublishService.retry_failed_command와
+        동일 원칙 - 실패(FAILED) 명령만 PENDING으로 되돌리고, UNKNOWN은
+        resolve_unknown_command()로만 해소해야 한다."""
+        command = self.command_repo.get_by_id(command_id)
+        if command is None:
+            raise ValueError(f"명령을 찾을 수 없습니다: command_id={command_id}")
+        if command.command_type != PRODUCT_OPTION_CREATE:
+            raise ProductOptionPublishCommandTypeMismatchError(
+                f"이 서비스가 다루지 않는 명령종류입니다: command_id={command_id}, command_type={command.command_type}"
+            )
+        if command.status != "FAILED":
+            raise ValueError(f"실패(FAILED) 상태인 명령만 재처리할 수 있습니다(현재 상태: {command.status}).")
+        command.status = "PENDING"
+        command.next_retry_at = None
+        command.error_code = None
+        command.retryable = False
+        self.session.flush()
+        return command
+
     # --- 품목별 옵션 단위 식별자 확정 ---
 
     def _create_mapping(

@@ -35,6 +35,7 @@ from api.routers import (
     orders,
     platforms,
     products,
+    products_bulk,
     purchase_orders,
     recent_views,
     reports,
@@ -66,6 +67,11 @@ openapi_tags = [
     {"name": "health", "description": "헬스체크"},
     {"name": "auth", "description": "로그인 및 내 정보 조회"},
     {"name": "products", "description": "상품/SKU 조회. 필요 권한: PRODUCT_MANAGE"},
+    {
+        "name": "products-bulk",
+        "description": "상품/옵션조합 등록, 재고/판매상태/정보수정의 대량 접수·진행상태 조회·재처리. "
+        "필요 권한: PRODUCT_MANAGE",
+    },
     {"name": "customers", "description": "고객 조회. 로그인한 사용자면 조회 가능 (전용 권한 없음)"},
     {
         "name": "orders",
@@ -141,6 +147,7 @@ app = FastAPI(
 
 app.include_router(auth.router)
 app.include_router(products.router)
+app.include_router(products_bulk.router)
 app.include_router(customers.router)
 app.include_router(orders.router)
 app.include_router(shipments.router)

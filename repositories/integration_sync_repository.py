@@ -198,6 +198,56 @@ class ExternalCommandRepository:
         )
         return int(self.session.execute(stmt).scalar_one()) > 0
 
+    def exists_unknown_for_target(self, command_type: str, target_type: str, target_ids: Iterable[int] | int) -> bool:
+        """같은 대상(들)·같은 명령종류에 대해(생성 순서와 무관하게) 아직 해소되지
+        않은 UNKNOWN 명령이 있는지 확인한다 - 상용 ERP 확장(대량처리 묶음)의
+        대량 접수 사전검증 전용이다. exists_unresolved_unknown_predecessor()는
+        "이 명령보다 먼저 생성된"이라는 순서 조건이 필요해(그 명령 자신의 id가
+        있어야 함) 아직 명령을 만들기 전인 사전검증에는 쓸 수 없다 - 이 메서드는
+        새 명령을 접수하기 전에 "지금 이 대상에 미해소 UNKNOWN이 있는가"만 확인해,
+        있으면 접수 자체를 건너뛰고(BLOCKED_BY_UNKNOWN) 어차피 실행 시점에
+        차단당할 PENDING 명령을 미리 만들지 않기 위함이다. 실제 실행 시점의
+        최종 방어선은 여전히 exists_unresolved_unknown_predecessor()다(이
+        메서드는 사용자 경험 개선용 사전 안내일 뿐, 이 검사를 우회해도 실행
+        시점에는 안전하게 차단된다)."""
+        ids = [target_ids] if isinstance(target_ids, int) else list(target_ids)
+        stmt = select(func.count()).where(
+            ExternalCommand.command_type == command_type,
+            ExternalCommand.target_type == target_type,
+            ExternalCommand.target_id.in_(ids),
+            ExternalCommand.status == "UNKNOWN",
+        )
+        return int(self.session.execute(stmt).scalar_one()) > 0
+
+    def list_for_targets(
+        self, command_type: str, target_type: str, target_ids: Iterable[int] | int
+    ) -> list[ExternalCommand]:
+        """같은 대상(들)·같은 명령종류의 명령을 상태 무관하게 전부 찾는다 - 상용
+        ERP 확장(대량처리 묶음)이 대량 접수 직전에 "이 대상들에 이미 어떤 명령이든
+        있었는가"를 스냅샷으로 떠 두고, 실제 enqueue 호출 후 돌아온 command.id가
+        이 스냅샷에 이미 있었으면(=새로 만들어진 게 아니라 멱등키로 기존 것을
+        그대로 돌려받음) DUPLICATE_OR_SUPERSEDED로, 스냅샷에 없었으면(=이번에
+        새로 생성됨) ACCEPTED로 구분하기 위한 용도다."""
+        ids = [target_ids] if isinstance(target_ids, int) else list(target_ids)
+        if not ids:
+            return []
+        stmt = select(ExternalCommand).where(
+            ExternalCommand.command_type == command_type,
+            ExternalCommand.target_type == target_type,
+            ExternalCommand.target_id.in_(ids),
+        )
+        return list(self.session.execute(stmt).scalars())
+
+    def list_by_ids(self, command_ids: Iterable[int]) -> list[ExternalCommand]:
+        """대량 작업 진행상태 조회 전용 - 여러 command_id를 한 번에 조회해 클라이언트가
+        건별로 폴링하지 않아도 되게 한다. 순서는 보장하지 않는다(호출부가 command_id
+        기준으로 다시 매칭한다)."""
+        ids = list(command_ids)
+        if not ids:
+            return []
+        stmt = select(ExternalCommand).where(ExternalCommand.id.in_(ids))
+        return list(self.session.execute(stmt).scalars())
+
     def exists_newer_command_for_target(
         self, command_type: str, target_type: str, target_ids: Iterable[int] | int, after_id: int
     ) -> bool:

@@ -555,6 +555,31 @@ class ProductPublishService:
         self.session.flush()
         return command
 
+    def retry_failed_command(self, command_id: int) -> ExternalCommand:
+        """실패(FAILED)로 확정된 명령을 운영자 요청으로 재처리 대상(PENDING)으로
+        되돌린다 - 상용 ERP 확장(대량처리 묶음)의 "실패 항목 선택 재처리" 전용
+        진입점이다. 접수 시점에 얼려 둔 스냅샷(ProductPublishCommandDetail)은
+        건드리지 않으므로 재시도는 "정확히 같은 요청"의 반복이다(모듈 docstring
+        참고) - 새 값으로 다시 보내려면 초안을 수정하고 새로 접수해야 한다.
+        UNKNOWN(결과 확인 필요) 명령은 이 메서드로 재처리할 수 없다 - 반드시
+        resolve_unknown_command()로 운영자가 채널을 직접 확인한 뒤에만
+        해소해야 한다(결과를 모르는 채로 재전송하면 중복 등록 위험)."""
+        command = self.command_repo.get_by_id(command_id)
+        if command is None:
+            raise ValueError(f"명령을 찾을 수 없습니다: command_id={command_id}")
+        if command.command_type != PRODUCT_CREATE:
+            raise ProductPublishCommandTypeMismatchError(
+                f"이 서비스가 다루지 않는 명령종류입니다: command_id={command_id}, command_type={command.command_type}"
+            )
+        if command.status != "FAILED":
+            raise ValueError(f"실패(FAILED) 상태인 명령만 재처리할 수 있습니다(현재 상태: {command.status}).")
+        command.status = "PENDING"
+        command.next_retry_at = None
+        command.error_code = None
+        command.retryable = False
+        self.session.flush()
+        return command
+
     # --- 심사상태 조회 / 매핑 확정(쿠팡처럼 등록 응답에 옵션단위 식별자가 없는 채널) ---
 
     def check_registration_status(self, draft_id: int) -> dict[str, Any]:

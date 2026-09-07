@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from sqlalchemy import Select, func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from models.base import utcnow
 from models.product import (
@@ -169,6 +169,27 @@ class ProductPlatformMapRepository(BaseRepository[ProductPlatformMap]):
         )
         return list(self.session.execute(stmt).scalars().all())
 
+    def list_filtered(
+        self, *, platform_id: Optional[int] = None, keyword: Optional[str] = None, limit: int = 200
+    ) -> list[ProductPlatformMap]:
+        """상용 ERP 확장(대량처리 묶음) - 상품 상세를 거치지 않고 채널 매핑을 직접
+        선택하는 화면(대량 재고/판매상태/정보수정)용 전체 조회. product_option과
+        그 소속 product를 미리 로드해(selectinload) 화면에 상품명·SKU코드를
+        표시할 때 N+1 조회가 나지 않게 한다. keyword는 SKU코드/판매자상품코드
+        부분일치로 좁힌다."""
+        stmt = select(ProductPlatformMap).options(
+            selectinload(ProductPlatformMap.product_option).selectinload(ProductOption.product)
+        )
+        if platform_id is not None:
+            stmt = stmt.where(ProductPlatformMap.platform_id == platform_id)
+        if keyword:
+            like = f"%{keyword}%"
+            stmt = stmt.join(ProductOption, ProductPlatformMap.product_option_id == ProductOption.id).where(
+                or_(ProductOption.sku_code.ilike(like), ProductPlatformMap.seller_product_code.ilike(like))
+            )
+        stmt = stmt.order_by(ProductPlatformMap.id.desc()).limit(limit)
+        return list(self.session.execute(stmt).scalars().all())
+
 
 class ProductPublishDraftRepository(BaseRepository[ProductPublishDraft]):
     def __init__(self, session: Session) -> None:
@@ -179,6 +200,20 @@ class ProductPublishDraftRepository(BaseRepository[ProductPublishDraft]):
             ProductPublishDraft.product_option_id == product_option_id, ProductPublishDraft.platform_id == platform_id
         )
         return self.session.execute(stmt).scalar_one_or_none()
+
+    def list_filtered(self, *, platform_id: Optional[int] = None, limit: int = 200) -> list[ProductPublishDraft]:
+        """상용 ERP 확장(대량처리 묶음) - 대량 등록 접수 화면의 초안 선택 목록.
+        이미 등록 완료된(registered_at is not None) 초안도 포함한다 - 재등록
+        차단은 접수 시점(enqueue_create)에 이미 안전하게 처리되므로, 목록
+        자체에서 미리 숨기지 않고 실제 접수 결과(ALREADY_REGISTERED 사유의
+        VALIDATION_FAILED)로 알려준다."""
+        stmt = select(ProductPublishDraft).options(
+            selectinload(ProductPublishDraft.product_option).selectinload(ProductOption.product)
+        )
+        if platform_id is not None:
+            stmt = stmt.where(ProductPublishDraft.platform_id == platform_id)
+        stmt = stmt.order_by(ProductPublishDraft.id.desc()).limit(limit)
+        return list(self.session.execute(stmt).scalars().all())
 
 
 class ProductPublishOptionGroupDraftRepository(BaseRepository[ProductPublishOptionGroupDraft]):
@@ -193,6 +228,17 @@ class ProductPublishOptionGroupDraftRepository(BaseRepository[ProductPublishOpti
             ProductPublishOptionGroupDraft.platform_id == platform_id,
         )
         return self.session.execute(stmt).scalar_one_or_none()
+
+    def list_filtered(
+        self, *, platform_id: Optional[int] = None, limit: int = 200
+    ) -> list[ProductPublishOptionGroupDraft]:
+        """상용 ERP 확장(대량처리 묶음) - 대량 옵션조합 등록 접수 화면의 초안 선택
+        목록. ProductPublishDraftRepository.list_all과 동일 원칙."""
+        stmt = select(ProductPublishOptionGroupDraft).options(selectinload(ProductPublishOptionGroupDraft.product))
+        if platform_id is not None:
+            stmt = stmt.where(ProductPublishOptionGroupDraft.platform_id == platform_id)
+        stmt = stmt.order_by(ProductPublishOptionGroupDraft.id.desc()).limit(limit)
+        return list(self.session.execute(stmt).scalars().all())
 
 
 class ProductPublishOptionGroupItemDraftRepository(BaseRepository[ProductPublishOptionGroupItemDraft]):
