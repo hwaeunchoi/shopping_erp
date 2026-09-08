@@ -281,14 +281,157 @@
   실계정 검증은 이번 단계에서도 수행하지 않았다(위 채널 전송 플래그가 그대로
   꺼져 있으므로 실제 전송 자체가 발생하지 않는다).
 
-### 5단계(잔여) - CS 연동/택배사 실시간 연동
+### 5-B단계 - 문의·CS 통합 관리 (구현 완료 - 내부 CS 워크스페이스 + 쿠팡 콜센터 문의 조회 한정)
 
-- **범위**: CS 문의-주문 연결, 택배사 API를 통한 실시간 배송추적, 물류센터
-  연동(WMS 트리거) - 5-A단계에서 명시적으로 제외한 항목.
+- **범위**: CS(고객문의) 케이스를 생성·배정·상태전이·메모·답변초안·이력·대량처리·
+  대시보드까지 다루는 통합 업무공간. **외부 채널로의 실제 답변 전송은 이번
+  단계에 없다** - 공식 계약상 안전하게 확정할 수 없는 필드가 있어(아래 "채널
+  문의 연동 조사 결과" 참고) 답변 초안 저장까지만 지원하고 UNSUPPORTED로
+  표시한다.
+- **내부 CS만 구현된 부분**(모든 채널 공통): 케이스 생성/조회/검색/필터, 담당자
+  배정(동시성 보장), 상태전이(OPEN/IN_PROGRESS/WAITING_CUSTOMER/
+  WAITING_CHANNEL/RESOLVED/CLOSED), 내부 메모, 답변 초안 저장, 처리기한·지연
+  표시, 태그, 작업 이력, 대량 배정/대량 상태변경(CLOSED 대상 제외 - 건별
+  확인 필요), 중복 문의 감지(같은 주문+문의유형, 24시간 이내 미종결 건 경고),
+  대시보드 집계(상태별/미배정/지연 건수), 첨부파일 메타데이터(재사용, 아래
+  참고).
+- **채널 조회까지 구현된 부분**: 쿠팡 콜센터 문의(callCenterInquiries)만
+  - 공식 문서(developers.coupang.com/hc/en-us/articles/
+    360033645354-Query-of-Coupang-Contact-Center-Inquiries, 2026-09 조회)의
+    요청 파라미터(vendorId/partnerCounselingStatus 4종 필수 순회/
+    inquiryStartAt·inquiryEndAt 최대 7일/pageNum·pageSize)와 응답 스키마
+    (inquiryId/content/inquiryAt/inquiryStatus/csPartnerCounselingStatus/
+    buyerPhone/orderId/pagination)를 전부 확인하고 그대로 구현했다
+    (`integrations/malls/coupang_connector.py`의 `fetch_inquiries()`,
+    `supports_inquiry_sync=True`).
+  - `services/cs_channel_sync_service.py`가 (platform_id,
+    external_inquiry_id) 유니크 제약으로 멱등 저장하고, 재수집 시 담당자/
+    우선순위/상태/태그/내부메모/답변초안은 절대 덮어쓰지 않으며(원본
+    상태(external_raw_status)와 마지막 고객 메시지 시각만 갱신), 항목 하나
+    실패해도 SAVEPOINT로 흡수해 나머지 항목·이전 성공은 유지한다(전체 성공
+    위장 없음).
+  - 자동 실행은 `scheduler/jobs/cs_inquiry_sync_job.py`(15분 주기, 기본 OFF),
+    수동 실행은 `POST /api/cs-cases/sync` - 둘 다
+    `settings.cs_inquiry_sync_enabled`(기본 False)가 꺼져 있으면 커넥터를
+    만들지도 외부 요청을 보내지도 않는다(세션도 열지 않는 자동 잡과 달리 수동
+    API는 플랫폼 조회 정도는 하지만 채널 HTTP 호출은 0건).
+- **채널 조회는 확인됐지만 이번 단계에서 구현하지 않은 것**: 쿠팡 상품별
+  문의(onlineInquiries) - GET 조회 계약(엔드포인트/파라미터/응답 스키마)은
+  공식 문서로 확인됐으나, 콜센터 문의와 스키마가 달라 한 라운드에 두 종류를
+  같이 다루지 않기 위해 범위 관리 차원에서 다음 단계로 미뤘다(계약 미확인이
+  이유가 아니다 - 명확히 구분해 기록한다).
+- **실제 답변 전송을 구현하지 않은 이유(명시)**: 쿠팡 콜센터 답변 API
+  (`POST .../callCenterInquiries/{id}/replies`)는 필드 이름(vendorId/
+  inquiryId/content/replyBy/parentAnswerId) 존재는 공식 문서로 확인되지만,
+  `parentAnswerId`가 "신규 답변(채널 이관이 아닌 일반적인 경우)"에 어떤 값을
+  가져야 하는지는 확보한 문서 범위에서 확정할 수 없었다. 실제 판매자 계정에
+  잘못된 값으로 답변을 시도하면 고객에게 나가는 실제 커뮤니케이션에 영향을
+  줄 수 있어, 필드 이름 확인만으로는 부족하다고 보고(요구사항의 "공식 문서로
+  확인된 기능만 구현" 원칙을 필드 존재가 아니라 실사용 의미 확정 수준으로
+  적용) 이번 단계에서는 조회만 구현했다. 네이버는 문의 목록 조회 API
+  (`GET /v1/pay-user/inquiries`)의 존재와 요청 파라미터(startSearchDate/
+  endSearchDate/page/size/answered)는 GitHub 공식 기술지원 저장소
+  (commerce-api-naver/commerce-api) 메인테이너 답변으로 확인했으나, 정확한
+  응답 스키마 필드명은 apicenter.commerce.naver.com이 이 환경에서 접근 불가라
+  확인하지 못해(1단계·2-A단계와 동일한 한계) 커넥터 구현 자체가 없다
+  (`supports_inquiry_sync`는 `NaverSmartstoreConnector`에서 오버라이드하지
+  않아 base 기본값 False를 그대로 상속).
+- **11번가/ESM/카카오쇼핑**: 4단계와 동일하게 공식 셀러 계약이 확인되지 않아
+  미지원(`MarketplaceCapabilityUnsupportedError`).
+- **데이터 모델**(`models/cs_case.py`): `CsCase`/`CsCaseHistory` 신규 테이블.
+  클레임(교환/반품/취소) 연결은 세 테이블에 FK를 각각 두지 않고 기존
+  `Memo`/`Attachment`와 동일한 다형성(claim_type/claim_id) 패턴을 재사용했다.
+  내부 메모/첨부파일 메타데이터는 새 테이블을 만들지 않고 기존
+  `models.extra.Memo`/`Attachment`를 `target_type="CS_CASE"`로 재사용한다 -
+  `Attachment`는 이전까지 스키마만 있고 어떤 라우터도 쓰지 않던 테이블이라
+  이번 단계에서 `AttachmentRepository`를 처음 추가했다. **실제 파일 업로드
+  저장소는 이 코드베이스 어디에도 없으므로 새로 만들지 않았다** - 첨부파일은
+  메타데이터 조회만 가능하고, 업로드는 미지원으로 남긴다(요구사항의 "기존
+  파일 저장 정책이 있을 때만 재사용, 없으면 안전한 메타데이터 모델까지만"
+  원칙 그대로).
+- **상태전이**(`services/cs_state_machine.py`): 최소 6개 상태(OPEN/
+  IN_PROGRESS/WAITING_CUSTOMER/WAITING_CHANNEL/RESOLVED/CLOSED). CLOSED는
+  RESOLVED에서만 도달 가능하고, 생성 시 직접 지정 불가(API 스키마 자체에
+  status 필드가 없음), 재오픈(CLOSED->OPEN)은 상태표 자체는 허용하지만
+  `change_status()`(일반 경로)가 아니라 `reopen_case()` 전용 메서드로만
+  실행되도록 서비스 계층에서 이중으로 막는다(상태표만 믿지 않음). IN_PROGRESS
+  전환은 담당자가 먼저 배정돼 있어야 한다.
+- **동시 초과배정 방지**: 담당자 배정은 상태(status)가 아니라 담당자
+  자체(assignee_id)를 낙관적 동시성 기준으로 쓴다
+  (`CsCaseRepository.claim_assignee()`, `UPDATE ... WHERE assignee_id = 기대값`)
+  - 배정은 status를 바꾸지 않으므로 status 기준 가드로는 "두 사람이 같은
+    미배정 건에 서로 다른 담당자를 동시에 배정"하는 경합을 잡지 못한다는
+    것을 격리 PostgreSQL 두 커넥션 테스트로 먼저 확인한 뒤 이 방식으로
+    설계했다.
+- **송장 중복 방지에 대응하는 "동일 채널 문의 중복 생성 방지"**: `cs_cases`의
+  `(platform_id, external_inquiry_id)` 유니크 제약이 재수집 경합에서도 실제로
+  하나만 통과시키는지 격리 PostgreSQL 두 커넥션 테스트로 확인했다 - 유니크
+  제약 위반은 `IntegrityError`로 발생하고 `CsChannelSyncService.
+  sync_inquiries()`의 항목별 SAVEPOINT가 이를 흡수해 그 항목만 실패로
+  기록하고 전체 동기화는 계속 진행한다.
+- **UNKNOWN 처리**: 이번 단계는 외부 답변 전송 자체가 없으므로 CS 케이스
+  전용 UNKNOWN 명령이 존재하지 않는다 - 화면에는 "실제 채널 답변 전송
+  미지원(UNSUPPORTED)" 안내만 표시한다. 기존 배송(Shipment) outbox의
+  UNKNOWN 정책(자동 재전송 금지, 운영자 수동 해소)은 이번 단계에서 전혀
+  건드리지 않았다.
+- **개인정보**: 목록/상세 모두 이름은 첫 글자만(`services/pii_mask.py`
+  `mask_name`), 전화번호는 마지막 4자리만(`mask_phone`) 노출한다. 전체
+  전화번호/주소는 `CS_PII_DETAIL` 권한이 있는 사용자에게만 API 응답에
+  추가로 포함된다(`api/routers/cs_cases.py`의 `_has_permission` 검사 -
+  권한이 없으면 항상 `null`). 문의 본문/내부 메모/답변 내용 자체는 로그에
+  출력하지 않는다(`CsCaseHistory.note`는 상태 코드 등 안전한 요약만 담고
+  본문을 복사하지 않는다).
+- **권한**(`scripts/init_db.py` `DEFAULT_PERMISSIONS`에 6종 신규 추가):
+  `CS_VIEW`(조회) / `CS_MANAGE`(생성·수정·메모·답변초안) / `CS_ASSIGN`(담당자
+  배정) / `CS_CLOSE`(종결·재오픈) / `CS_REPLY_SUBMIT`(외부 답변 접수 - 실제
+  구현이 없어 아직 어디서도 검사되지 않는다, 향후 채널 답변 계약이 확인되면
+  사용할 자리만 예약) / `CS_PII_DETAIL`(개인정보 상세 조회 - 의도적으로
+  `*_VIEW` 접미사를 피해 명명했다, `Viewer` 역할에 자동 부여되는 기존
+  네이밍 관례(`code.endswith("_VIEW")`)에 실수로 걸리지 않게 하기 위함).
+  종결(POST .../close)과 재오픈(POST .../reopen)은 일반 상태변경
+  (POST .../status)과 다른 권한(`CS_CLOSE`)을 검사한다 - 일반 상태변경
+  엔드포인트는 `new_status="CLOSED"` 요청 자체를 400으로 거부해 종결 전용
+  경로로만 가도록 강제한다.
+- **UI**(`frontend/src/pages/CsCasesPage.tsx`, `/cs-cases`, 신규 권한
+  `CS_VIEW` 사이드바 게이팅): 대시보드 집계 타일, 상태/채널/문의유형/우선순위/
+  담당자/기한 필터 + 미배정·지연 빠른 필터 + 검색, 목록(체크박스 다중선택) +
+  상세 패널, 연결된 주문 링크, 담당자 배정/상태변경/종결/재오픈, 내부메모와
+  답변초안을 화면에서도 완전히 분리된 영역으로 표시, 대량 배정/대량 상태변경,
+  채널 문의 수동 동기화 트리거(연결된 케이스에서만), 개인정보 상세 권한 안내
+  문구, 처리중 버튼 비활성화로 중복 클릭 방지. 375/768/1280px 확인 완료 -
+  확인 중 `.bulk-bar` 안의 이름없는 래퍼 `<div>`가 `min-width:0`이 없어
+  다중 ID 입력칸이 있는 확인 패널에서 페이지 폭을 밀어내는 사전 버그를
+  발견해 `frontend/src/index.css`에 `.bulk-bar > div { min-width: 0; }`
+  규칙을 추가했다 - 이 규칙은 CS 화면 전용이 아니라 같은 구조를 쓰는 기존
+  확인 패널(상품 대량처리/출고관리)에도 적용돼 동일한 잠재 결함을 함께
+  막는다.
+- **검증**: 신규 단위 테스트(상태머신 21개, 서비스 38개, 채널 동기화
+  서비스 11개, PII 마스킹 8개, 쿠팡 문의 커넥터 5개) + API 통합 테스트
+  (`tests/integration/test_api_cs_cases.py` 18개, 권한/생성·중복감지/PII
+  마스킹/전체 생명주기/대량처리/대시보드/동기화) + 격리 PostgreSQL 2건
+  동시성 테스트(`tests/integration/test_cs_case_concurrency_pg.py` - 동일
+  케이스 동시 담당자배정 정확히 하나만 성공, 동일 외부문의ID 동시 최초수집
+  시 정확히 하나만 케이스 생성) 전부 통과. 신규 Alembic 마이그레이션은
+  SQLite/격리 PostgreSQL 양쪽에서 upgrade/downgrade/upgrade, 유니크 제약
+  (NULL 다중 허용 포함) 실제 동작, 기존 샘플 데이터 보존 확인. 실계정
+  검증은 수행하지 않았다(채널 조회 자체는 기능 플래그로 막혀 있고, 답변
+  전송은 구현 자체가 없다).
+
+### 5-C단계(잔여) - CS-주문 자동 연결 고도화/택배사 실시간 연동
+
+- **범위**: 5-B단계가 다루지 않은 나머지 - 채널 문의를 수집 시점에 주문라인
+  단위까지 자동 매칭하는 고도화(현재는 orderId 매칭까지만, order_item_id는
+  수기 연결), 쿠팡 상품별 문의(onlineInquiries) 조회, 네이버 문의 연동
+  (응답 스키마 확인 필요), 실제 채널 답변 전송(`parentAnswerId` 등 필드
+  의미 확정 필요), 택배사 API를 통한 실시간 배송추적, 물류센터 연동(WMS
+  트리거) - 5-A/5-B단계에서 명시적으로 제외한 항목.
 - **의존성**: 1단계의 `carrier_codes.py` 정규화 테이블 확장 필요(현재
   `CJ_LOGISTICS`만 등록, 나머지는 `UnknownCarrierError`로 명시적 거부 중).
-  택배사 추가 시 반드시 공식 문서 교차 확인 후 등록.
-- **완료 기준**: 택배사 실시간 조회 API 연동, CS 문의-주문-배송 상태 연결 화면.
+  택배사 추가 시 반드시 공식 문서 교차 확인 후 등록. CS 답변 전송은
+  apicenter.commerce.naver.com 접근 확보 또는 쿠팡 `parentAnswerId` 의미
+  확인이 선행돼야 한다.
+- **완료 기준**: 택배사 실시간 조회 API 연동, 검증된 채널 답변 전송(outbox
+  기반), CS 문의-주문라인 자동 매칭 화면.
 
 ### 6단계 - 대량처리/대시보드 고도화
 
