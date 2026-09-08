@@ -374,6 +374,27 @@ class ShipmentDispatchService:
             self._sync_channel_status_after_success(orders_to_sync)
         return command
 
+    def retry_failed_command(self, command_id: int) -> ExternalCommand:
+        """실패(FAILED)로 확정된 송장 전송 명령을 운영자 요청으로 재처리 대상
+        (PENDING)으로 되돌린다 - services.product_publish_service.
+        ProductPublishService.retry_failed_command와 동일 원칙(정확히 같은
+        요청의 반복). UNKNOWN(결과 확인 필요) 명령은 이 메서드로 재처리할 수
+        없다 - 반드시 resolve_unknown_command()로 운영자가 채널을 직접 확인한
+        뒤에만 해소해야 한다(결과를 모르는 채로 재전송하면 중복 등록 위험)."""
+        command = self.command_repo.get_by_id(command_id)
+        if command is None:
+            raise ValueError(f"명령을 찾을 수 없습니다: command_id={command_id}")
+        if command.target_type != "SHIPMENT":
+            raise ValueError(f"이 서비스가 다루지 않는 명령입니다: command_id={command_id}")
+        if command.status != "FAILED":
+            raise ValueError(f"실패(FAILED) 상태인 명령만 재처리할 수 있습니다(현재 상태: {command.status}).")
+        command.status = "PENDING"
+        command.next_retry_at = None
+        command.error_code = None
+        command.retryable = False
+        self.session.flush()
+        return command
+
     @staticmethod
     def _idempotency_key(shipment: Shipment) -> str:
         return f"SHIPMENT_SUBMIT:{shipment.id}:{shipment.tracking_no}"

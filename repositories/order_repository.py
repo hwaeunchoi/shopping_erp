@@ -516,6 +516,14 @@ class ShipmentRepository(BaseRepository[Shipment]):
         stmt = select(Shipment).where(Shipment.status == status)
         return list(self.session.execute(stmt).scalars().all())
 
+    def list_by_carrier(self, carrier: str) -> list[Shipment]:
+        """상용 ERP 확장(5단계, A묶음) - 같은 택배사의 기존 송장번호와 중복인지
+        확인하기 위한 조회. tracking_no는 등록 경로마다 공백/하이픈 표기가 다를 수
+        있어(기존 단건 등록 API는 정규화하지 않는다) DB 쪽에서 정확히 비교하지
+        않고, 호출부(services.fulfillment_service)가 정규화한 값끼리 비교한다."""
+        stmt = select(Shipment).where(Shipment.carrier == carrier, Shipment.tracking_no.is_not(None))
+        return list(self.session.execute(stmt).scalars().all())
+
     def _filtered_stmt(
         self, status: Optional[str] = None, order_id: Optional[int] = None, search: Optional[str] = None
     ) -> Select[Any]:

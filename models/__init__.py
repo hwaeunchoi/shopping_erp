@@ -59,6 +59,9 @@ from models.order import (  # noqa: F401
     ClaimCollectionCursor,
 )
 
+# 출고(피킹/검수/포장) - 상용 ERP 확장(5단계, A묶음)
+from models.fulfillment import FulfillmentBatch, FulfillmentBatchItem, FulfillmentBatchItemHistory  # noqa: F401
+
 # 정산
 from models.settlement import Settlement, SettlementDetail, SettlementDiscrepancy  # noqa: F401
 

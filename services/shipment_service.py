@@ -76,6 +76,22 @@ class ShipmentService:
             self.shipment_repo.link_order(shipment.id, oid)
         return shipment
 
+    def create_with_items(
+        self, items: list[tuple[int, int, int]], carrier: Optional[str], tracking_no: Optional[str]
+    ) -> Shipment:
+        """부분출고/분할배송 전용 - 주문 전체가 아니라 (order_id, order_item_id,
+        quantity) 조합의 목록으로 배송(송장) 1건을 만든다. create()/consolidate()와
+        달리 항상 라인 단위로 연결한다(order_item_id가 NULL인 "주문 전체" 연결을
+        만들지 않는다 - 그래야 같은 라인의 남은 수량을 나중에 다른 배송으로 또
+        나눠 보낼 수 있다). services.fulfillment_service(상용 ERP 확장 5단계,
+        출고 배치)의 포장완료 단계 전용 진입점이다."""
+        if not items:
+            raise ValueError("배송에 연결할 라인이 없습니다.")
+        shipment = self.shipment_repo.add(Shipment(carrier=carrier, tracking_no=tracking_no, status="READY"))
+        for order_id, order_item_id, quantity in items:
+            self.shipment_repo.link_order(shipment.id, order_id, order_item_id, quantity)
+        return shipment
+
     def update_info(
         self, shipment: Shipment, carrier: Optional[str] = None, tracking_no: Optional[str] = None
     ) -> Shipment:
