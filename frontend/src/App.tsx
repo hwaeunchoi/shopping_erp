@@ -8,6 +8,7 @@ import { OrdersPage } from './pages/OrdersPage'
 import { OrderDetailPage } from './pages/OrderDetailPage'
 import { ShipmentsPage } from './pages/ShipmentsPage'
 import { FulfillmentPage } from './pages/FulfillmentPage'
+import { CsCasesPage } from './pages/CsCasesPage'
 import { OrderConflictsPage } from './pages/OrderConflictsPage'
 import { ExchangesPage } from './pages/ExchangesPage'
 import { ReturnsPage } from './pages/ReturnsPage'
@@ -47,6 +48,7 @@ function App() {
         <Route path="/orders/:orderId" element={<Protected><OrderDetailPage /></Protected>} />
         <Route path="/shipments" element={<Protected><ShipmentsPage /></Protected>} />
         <Route path="/fulfillment" element={<Protected><FulfillmentPage /></Protected>} />
+        <Route path="/cs-cases" element={<Protected><CsCasesPage /></Protected>} />
         <Route path="/order-conflicts" element={<Protected><OrderConflictsPage /></Protected>} />
         <Route path="/exchanges" element={<Protected><ExchangesPage /></Protected>} />
         <Route path="/returns" element={<Protected><ReturnsPage /></Protected>} />

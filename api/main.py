@@ -26,6 +26,7 @@ from api.routers import (
     auth,
     cancellations,
     costs,
+    cs_cases,
     customers,
     exchanges,
     favorites,
@@ -87,6 +88,11 @@ openapi_tags = [
     {"name": "exchanges", "description": "교환 조회/등록/상태변경. 필요 권한: EXCHANGE_RETURN_MANAGE"},
     {"name": "returns", "description": "반품 조회/등록/상태변경. 필요 권한: EXCHANGE_RETURN_MANAGE"},
     {"name": "cancellations", "description": "취소 조회/등록/상태변경. 필요 권한: EXCHANGE_RETURN_MANAGE"},
+    {
+        "name": "cs-cases",
+        "description": "CS(고객문의) 케이스 통합 관리. 조회: CS_VIEW, 생성/수정/메모/답변초안: CS_MANAGE, "
+        "담당자 배정: CS_ASSIGN, 종결/재오픈: CS_CLOSE, 개인정보 상세 조회: CS_PII_DETAIL",
+    },
     {"name": "inventory", "description": "재고 조회. 필요 권한: INVENTORY_VIEW"},
     {"name": "settlements", "description": "정산 조회. 필요 권한: SETTLEMENT_VIEW"},
     {"name": "costs", "description": "비용 조회/등록. 필요 권한: COST_MANAGE"},
@@ -160,6 +166,7 @@ app.include_router(fulfillment.router)
 app.include_router(exchanges.router)
 app.include_router(returns.router)
 app.include_router(cancellations.router)
+app.include_router(cs_cases.router)
 app.include_router(inventory.router)
 app.include_router(suppliers.router)
 app.include_router(purchase_orders.router)

@@ -1286,3 +1286,118 @@ export interface FulfillmentItemOutcome {
   outcome: FulfillmentOutcome
   error_code: string | null
 }
+
+// --- 상용 ERP 확장(5단계, B묶음) - CS(고객문의) 통합 관리 ---
+
+export const CS_CASE_STATUSES = [
+  'OPEN',
+  'IN_PROGRESS',
+  'WAITING_CUSTOMER',
+  'WAITING_CHANNEL',
+  'RESOLVED',
+  'CLOSED',
+] as const
+export type CsCaseStatus = (typeof CS_CASE_STATUSES)[number]
+
+export interface CsCase {
+  id: number
+  platform_id: number | null
+  external_inquiry_id: string | null
+  external_source: string | null
+  external_raw_status: string | null
+  order_id: number | null
+  order_item_id: number | null
+  product_option_id: number | null
+  shipment_id: number | null
+  fulfillment_batch_item_id: number | null
+  claim_type: string | null
+  claim_id: number | null
+  inquiry_type: string
+  priority: string
+  status: CsCaseStatus
+  assignee_id: number | null
+  subject: string | null
+  customer_message: string
+  reply_draft: string | null
+  due_at: string | null
+  last_customer_message_at: string | null
+  last_agent_response_at: string | null
+  resolved_at: string | null
+  closed_at: string | null
+  reopened_count: number
+  tags: string | null
+  created_by: number | null
+  created_at: string
+  customer_name_masked: string | null
+  customer_phone_masked: string | null
+  // CS_PII_DETAIL 권한이 있을 때만 값이 채워진다(없으면 항상 null).
+  customer_phone_full: string | null
+  customer_address_full: string | null
+}
+
+export interface CsCaseCreate {
+  inquiry_type: string
+  customer_message: string
+  priority?: string
+  subject?: string | null
+  order_id?: number | null
+  order_item_id?: number | null
+  product_option_id?: number | null
+  shipment_id?: number | null
+  fulfillment_batch_item_id?: number | null
+  claim_type?: string | null
+  claim_id?: number | null
+  customer_id?: number | null
+  due_at?: string | null
+  tags?: string | null
+}
+
+export interface CsCaseCreateResponse {
+  case: CsCase
+  duplicate_of_case_id: number | null
+}
+
+export interface CsCaseHistoryEntry {
+  id: number
+  action: string
+  from_value: string | null
+  to_value: string | null
+  changed_by: number | null
+  changed_at: string
+  note: string | null
+}
+
+export interface CsCaseMemo {
+  id: number
+  content: string
+  created_by: number | null
+  created_at: string
+}
+
+export type CsBulkOutcome = 'ACCEPTED' | 'BLOCKED' | 'VALIDATION_FAILED' | 'NOT_FOUND'
+
+export interface CsBulkOutcomeItem {
+  case_id: number
+  outcome: CsBulkOutcome
+  error_code: string | null
+}
+
+export interface CsDashboardSummary {
+  by_status: Record<string, number>
+  unassigned_count: number
+  overdue_count: number
+}
+
+export interface CsSyncResult {
+  platform_code: string
+  status: 'SUCCESS' | 'PARTIAL_SUCCESS' | 'FAILED' | 'UNSUPPORTED' | 'DISABLED'
+  created: number
+  updated: number
+  failed: number
+  reason_code: string | null
+}
+
+export interface CsReference {
+  inquiry_types: string[]
+  priorities: string[]
+}

@@ -15,6 +15,7 @@ const NAV_ITEMS: Array<{ to: string; label: string; permission?: string }> = [
   { to: '/orders', label: '주문관리', permission: 'ORDER_VIEW' },
   { to: '/shipments', label: '배송관리', permission: 'SHIPMENT_VIEW' },
   { to: '/fulfillment', label: '출고관리', permission: 'SHIPMENT_VIEW' },
+  { to: '/cs-cases', label: 'CS 관리', permission: 'CS_VIEW' },
   { to: '/order-conflicts', label: '주문상태 충돌', permission: 'ORDER_EDIT' },
   { to: '/exchanges', label: '교환관리', permission: 'EXCHANGE_RETURN_MANAGE' },
   { to: '/returns', label: '반품관리', permission: 'EXCHANGE_RETURN_MANAGE' },
