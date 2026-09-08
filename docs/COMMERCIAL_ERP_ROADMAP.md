@@ -170,10 +170,121 @@
 - **완료 기준**: 각 채널 공식 문서 기준 MockTransport 계약 테스트, capability
   matrix의 해당 열이 실제 구현 항목만 True로 표시.
 
-### 5단계 - CS/풀필먼트/택배사 연동
+### 5-A단계 - 출고·택배 처리 통합 (구현 완료 - 창고 내부 워크플로우 한정)
+
+- **범위**: 주문을 실제 창고 업무 순서(출고대기 -> 피킹 -> 검수 -> 포장완료 ->
+  송장등록 -> 채널전송 대기 -> 전송완료)로 처리하는 출고 배치 기능. **택배사
+  API를 통한 예약/라벨 출력/실시간 배송추적 조회는 이 단계 범위가 아니다** -
+  공식 계약이 확인되지 않아 추측 구현하지 않았다(아래 "미구현/차단" 참고).
+- **새 도메인**(`models/fulfillment.py`): `FulfillmentBatch`(출고 배치) /
+  `FulfillmentBatchItem`(배치에 속한 주문라인 1건 - 항상 정확히 하나의
+  `OrderItem`에 대응) / `FulfillmentBatchItemHistory`(작업 이력). 상태값은
+  `READY -> PICKING -> PICKED -> VERIFYING -> VERIFIED -> PACKED ->
+  SUBMIT_PENDING -> SUBMITTED`(+ `BLOCKED`/`CANCELLED`)이며
+  `services/fulfillment_state_machine.py`가 서버 측 전이 검증을 전담한다 -
+  검수 전 포장완료, 취소 주문의 신규 출고, 이미 SUBMITTED인 항목의 취소 등은
+  전이표 자체에서 차단된다.
+- **부분출고/분할배송 데이터 모델**: 기존 `ShipmentItem.order_item_id` 구조를
+  그대로 재사용한다 - 한 주문라인을 여러 `FulfillmentBatchItem`/`Shipment`로
+  나눠 담을 수 있고, 누적 출고수량은 항상 `ShipmentItem` 실측 수량 기준으로
+  계산한다(`FulfillmentBatchItemRepository.sum_committed_quantity_by_order_items`
+  등). 라인의 일부만 출고돼도 주문 전체가 즉시 배송완료로 바뀌지 않으며, 기존
+  `ShipmentDispatchService._is_order_fully_dispatched()`가 모든 라인이 채널
+  전송까지 완료된 뒤에만 주문 상태를 전환한다(이 로직은 1단계에서 이미 구현된
+  것을 그대로 재사용했고 이번 단계에서 수정하지 않았다).
+- **재고 차감 시점과 롤백 경계**: 검수완료가 아니라 **포장완료
+  (`FulfillmentService.pack_and_register_tracking`) 시점에 검수 확정수량만큼
+  정확히 한 번** 차감한다(`FulfillmentBatchItem.inventory_deducted_at`으로
+  멱등 표시). 이는 기존 단건 배송 흐름(`ShipmentService.change_status()` ->
+  `apply_status_change()`가 운영자의 수동 `warehouse_id` 지정 시 주문 전체
+  수량을 차감하는 방식)과는 다른 별도의 추가 경로다 - 기존 정책을 변경하지
+  않고 배치 흐름 전용으로 새로 추가했다. 채널 송장 전송이 이후에 실패해도
+  이미 물리적으로 창고를 떠난 것으로 간주해 **재고 차감은 되돌리지 않는다** -
+  되돌리려면 운영자가 `cancel_item()`을 명시적으로 호출해야 하며, 이 경우
+  같은 트랜잭션에서 배치항목 상태 전환과 재고 복원이 함께 처리된다.
+- **동시 초과출고/중복차감 방지**: (1) 같은 주문라인에 대한 배치 생성 경합은
+  `ExternalCommandRepository.acquire_target_lock()`(PostgreSQL advisory lock,
+  `target_type="FULFILLMENT_ORDER_ITEM"`)로 직렬화해 잔여수량 초과 배정을
+  막는다. (2) 같은 배치항목의 상태 전이는
+  `FulfillmentBatchItemRepository.claim_transition()`의 원자적 조건부
+  UPDATE(`WHERE id=? AND status=?`)로 정확히 하나만 성공한다(낙관적 동시성
+  체크도 겸함 - API가 요청받은 `expected_status`를 그대로 전달). (3) 같은
+  (창고,옵션) 재고 행에 대한 동시 포장 확정은 별도 advisory lock
+  (`target_type="FULFILLMENT_INVENTORY"`)으로 감싸는데, **잠금을 기다리는
+  동안 다른 트랜잭션이 먼저 포장을 커밋했을 가능성**이 있어 잠금 획득 직후
+  배치항목을 다시 조회(refresh)해 여전히 `VERIFIED` 상태인지 재확인한다 -
+  아니면 재고를 다시 차감하지 않고 `ALREADY_PROCESSED`로 결과만 남긴다. 이
+  재확인 로직은 최초 구현에서 누락돼 있었고(잠금만 걸고 상태 재확인 없이
+  바로 차감), 격리 PostgreSQL 두 커넥션 동시성 테스트
+  (`tests/integration/test_fulfillment_concurrency_pg.py::TestConcurrentPackSameBatchItem`)로
+  실제 이중차감이 재현되는 것을 확인한 뒤 발견·수정했다(단순 애플리케이션
+  SELECT 검사만으로는 이 경합을 막을 수 없다는 것이 실제로 증명된 사례).
+  서로 다른 주문라인/서로 다른 (창고,옵션) 조합은 서로 다른 잠금 키를 쓰므로
+  불필요하게 직렬화되지 않는다.
+- **송장 중복 방지**: 택배사 코드는 창고 기록용 내부 목록
+  (`services/fulfillment_carrier.py`의 `INTERNAL_CARRIERS` - CJ대한통운/
+  한진택배/롯데택배/로젠택배/우체국택배/기타)으로 관리하고, 채널 실제 전송
+  시점에는 기존 `integrations/malls/carrier_codes.py`(공식 확인된
+  CJ대한통운만 매핑, 나머지는 `UnknownCarrierError`)를 그대로 통과해야 한다 -
+  두 목록을 섞지 않는다. 송장번호는 공백/하이픈 제거 후 문자열로 정규화하고
+  (앞자리 0 보존), 같은 택배사+정규화된 송장번호 조합이 이미 등록돼 있으면
+  거부한다(의도된 분할배송은 각기 다른 배치항목이 같은 송장 1건에 묶이는
+  것이므로 이 검사에 걸리지 않는다).
+- **채널 송장 outbox 접수와 UNKNOWN 처리**: API는 외부 채널을 직접 호출하지
+  않는다 - `submit_to_channel()`이 기존 `ShipmentDispatchService.enqueue()`를
+  그대로 호출해 PENDING `ExternalCommand`만 만들고 202를 반환하며, 실제 전송은
+  기존 `outbox_dispatch_job`이 수행한다. 채널 응답이 불명확한 경우
+  `ExternalCommand`는 기존 1단계 정책 그대로 `UNKNOWN`으로 표시되고 **자동
+  재처리되지 않는다** - 화면(진행상태 표)에 "확인 필요" 안내만 노출하고,
+  운영자가 기존 `POST /api/shipments/commands/{id}/resolve`로 직접 확인 후
+  해소해야 한다(`retry_failed_items()`도 `command.status == "UNKNOWN"`이면
+  `BLOCKED`만 반환하고 재시도하지 않는다). `FAILED`로 확정된 명령만 선택
+  재처리할 수 있고, 이미 성공(SUCCESS)한 라인은 같은 배치를 다시 처리해도
+  재전송 대상에서 제외된다(기존 `ExternalCommandLineResultRepository`의
+  라인별 성공 기록 재사용).
+- **내부 물리 출고 상태와 외부 채널 송장 전송 상태는 분리돼 있다**:
+  `FulfillmentBatchItem.status`(피킹/검수/포장 등 창고 내부 작업)와
+  `ExternalCommand.status`(채널 전송 성공/실패/UNKNOWN)는 서로 다른 테이블의
+  서로 다른 상태값이며 하나로 합치지 않았다 - 포장완료는 재고가 실제로
+  줄었다는 사실만 의미하고, 채널이 그 송장을 실제로 접수했는지는
+  `ExternalCommand.status == "SUCCESS"`를 확인해야만 알 수 있다. 화면의
+  진행상태 표는 이 둘을 나란히 보여주되 절대 하나로 합쳐 표시하지 않는다.
+- **UI**(`frontend/src/pages/FulfillmentPage.tsx`, `/fulfillment`, 기존
+  `SHIPMENT_VIEW` 권한 재사용): 출고 배치 생성(검색/선택/수량 입력/서버
+  재검증 전 클라이언트 사전 안내), 배치 목록/상세, 피킹/검수/포장 처리,
+  택배사 선택+송장번호 일괄입력, 채널 전송 접수, 항목별
+  접수/실패/UNKNOWN/이미처리됨 결과 표시, FAILED만 선택 재처리, 작업 이력
+  조회. 기존 단건 배송 화면(`ShipmentsPage.tsx`, `/shipments`)은 변경하지
+  않았고 서로 다른 API를 쓴다(겹치는 도메인 로직 없음 - 단건 화면은 이미
+  운영 중인 `/api/shipments`를, 배치 화면은 이번에 추가한 `/api/fulfillment/*`를
+  각각 사용). 수취인 전화번호/주소는 목록 어디에도 표시하지 않는다.
+- **미구현/차단(5-A단계 범위 밖)**:
+  - 택배사 API 연동(예약 접수, 라벨 출력, 실시간 배송추적 조회) - 공식 계약
+    미확인. 이번 단계의 "택배 통합"은 택배사 코드/송장번호를 안전하게
+    관리하고 기존 outbox로 네이버/쿠팡에 전송 접수하는 단계까지다.
+  - 네이버/쿠팡으로의 **실제** 송장 전송은 기존 `shipment_channel_submit_enabled`
+    기능 플래그(기본 False, 이번 단계에서 값을 바꾸지 않음)로 여전히
+    차단돼 있고, 활성화 여부와 별개로 위 "실계정 검증 전 필요 조건"/"실전송
+    활성화 체크리스트"의 운영 승인 절차를 그대로 따라야 한다. 창고 내부
+    워크플로우(배치 생성/피킹/검수/포장) 자체는 외부 호출이 없어 별도 플래그가
+    없다.
+  - 11번가/ESM/카카오쇼핑: 4단계와 동일하게 공식 계약이 확인되지 않아 이번
+    단계에서도 미지원(해당 채널의 커넥터는 여전히 `MarketplaceCapabilityUnsupportedError`).
+- **검증**: 신규 단위 테스트(상태머신/택배사·송장 검증/서비스) +
+  API 통합 테스트(`tests/integration/test_api_fulfillment.py`, 권한/생성/
+  전체출고/부분출고/상태충돌 409/실패 케이스) + 격리 PostgreSQL 2건 동시성
+  테스트(`tests/integration/test_fulfillment_concurrency_pg.py` - 동일
+  주문라인 동시 배치생성 초과배정 방지, 동일 배치항목 동시 포장 중복차감
+  방지) 전부 통과. 신규 Alembic 마이그레이션은 SQLite/격리 PostgreSQL 양쪽에서
+  upgrade/downgrade/upgrade 및 기존 샘플 데이터 보존 확인. 전체 회귀
+  (1261 tests) / Ruff / MyPy / 프론트 `tsc -b`+`oxlint`+`vite build` 전부 통과.
+  실계정 검증은 이번 단계에서도 수행하지 않았다(위 채널 전송 플래그가 그대로
+  꺼져 있으므로 실제 전송 자체가 발생하지 않는다).
+
+### 5단계(잔여) - CS 연동/택배사 실시간 연동
 
 - **범위**: CS 문의-주문 연결, 택배사 API를 통한 실시간 배송추적, 물류센터
-  연동(WMS 트리거).
+  연동(WMS 트리거) - 5-A단계에서 명시적으로 제외한 항목.
 - **의존성**: 1단계의 `carrier_codes.py` 정규화 테이블 확장 필요(현재
   `CJ_LOGISTICS`만 등록, 나머지는 `UnknownCarrierError`로 명시적 거부 중).
   택배사 추가 시 반드시 공식 문서 교차 확인 후 등록.
