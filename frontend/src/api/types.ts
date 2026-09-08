@@ -1185,3 +1185,104 @@ export interface ReportScheduleCreate {
   next_run_at: string
   is_enabled?: boolean
 }
+
+// --- 상용 ERP 확장(5단계, A묶음) - 출고 배치(피킹/검수/포장/송장등록/채널전송) ---
+
+export interface FulfillmentWarehouse {
+  id: number
+  name: string
+}
+
+export interface CarrierOption {
+  code: string
+  label: string
+}
+
+export interface FulfillableOrderItem {
+  order_id: number
+  order_item_id: number
+  platform_order_no: string
+  product_option_id: number
+  sku_code: string
+  product_name: string
+  order_quantity: number
+  remaining_quantity: number
+}
+
+export const FULFILLMENT_BATCH_ITEM_STATUSES = [
+  'READY',
+  'PICKING',
+  'PICKED',
+  'VERIFYING',
+  'VERIFIED',
+  'PACKED',
+  'SUBMIT_PENDING',
+  'SUBMITTED',
+  'BLOCKED',
+  'CANCELLED',
+] as const
+export type FulfillmentBatchItemStatus = (typeof FULFILLMENT_BATCH_ITEM_STATUSES)[number]
+
+export interface FulfillmentBatch {
+  id: number
+  warehouse_id: number
+  status: string
+  note: string | null
+  created_by: number | null
+  created_at: string
+}
+
+export interface FulfillmentBatchItem {
+  id: number
+  batch_id: number
+  order_id: number
+  order_item_id: number
+  product_option_id: number
+  platform_order_no: string
+  sku_code: string
+  product_name: string
+  requested_quantity: number
+  picked_quantity: number | null
+  verified_quantity: number | null
+  status: FulfillmentBatchItemStatus
+  failure_reason_code: string | null
+  shipment_id: number | null
+  picked_at: string | null
+  verified_at: string | null
+  packed_at: string | null
+}
+
+export interface FulfillmentBatchDetail {
+  batch: FulfillmentBatch
+  items: FulfillmentBatchItem[]
+}
+
+export interface FulfillmentProgressItem {
+  batch_item: FulfillmentBatchItem
+  command_status: string | null
+  command_id: number | null
+  command_error_code: string | null
+}
+
+export interface FulfillmentHistoryEntry {
+  id: number
+  batch_item_id: number
+  from_status: string | null
+  to_status: string
+  changed_by: number | null
+  changed_at: string
+  note: string | null
+}
+
+export type FulfillmentOutcome =
+  | 'ACCEPTED'
+  | 'ALREADY_PROCESSED'
+  | 'BLOCKED'
+  | 'VALIDATION_FAILED'
+  | 'FAILED_TO_ENQUEUE'
+
+export interface FulfillmentItemOutcome {
+  batch_item_id: number
+  outcome: FulfillmentOutcome
+  error_code: string | null
+}

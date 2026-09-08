@@ -29,6 +29,7 @@ from api.routers import (
     customers,
     exchanges,
     favorites,
+    fulfillment,
     inventory,
     notifications,
     order_conflicts,
@@ -79,6 +80,10 @@ openapi_tags = [
         "대시보드 경고(alerts)는 DASHBOARD_VIEW 권한 필요",
     },
     {"name": "shipments", "description": "배송 조회/등록/상태변경. 필요 권한: SHIPMENT_VIEW"},
+    {
+        "name": "fulfillment",
+        "description": "출고 배치(피킹/검수/포장/송장등록/채널전송 접수) 관리. 필요 권한: SHIPMENT_VIEW",
+    },
     {"name": "exchanges", "description": "교환 조회/등록/상태변경. 필요 권한: EXCHANGE_RETURN_MANAGE"},
     {"name": "returns", "description": "반품 조회/등록/상태변경. 필요 권한: EXCHANGE_RETURN_MANAGE"},
     {"name": "cancellations", "description": "취소 조회/등록/상태변경. 필요 권한: EXCHANGE_RETURN_MANAGE"},
@@ -151,6 +156,7 @@ app.include_router(products_bulk.router)
 app.include_router(customers.router)
 app.include_router(orders.router)
 app.include_router(shipments.router)
+app.include_router(fulfillment.router)
 app.include_router(exchanges.router)
 app.include_router(returns.router)
 app.include_router(cancellations.router)

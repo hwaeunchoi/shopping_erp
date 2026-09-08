@@ -299,6 +299,17 @@ input, select {
   }
 }
 
+/* 출고관리 페이지 전용 - 위 상품상세 규칙과 같은 이유(사이드바 고정폭은 이번
+   범위 밖)로, 택배사 선택/송장번호 입력이 좁은 화면에서 화면 밖으로 밀리지
+   않게 한다. */
+@media (max-width: 768px) {
+  .fulfillment-page input,
+  .fulfillment-page select {
+    min-width: 0;
+    max-width: 100%;
+  }
+}
+
 .clickable-row {
   cursor: pointer;
 }
