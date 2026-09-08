@@ -216,6 +216,13 @@ class BaseMallConnector(ABC):
     # 기존 옵션 구조 변경/대량 등록/자동 가격결정은 이 capability와 무관하게 항상
     # 미지원(이번 범위 밖).
     supports_product_option_create: bool = False
+    # 채널 CS(고객문의) 조회 지원 여부 - 상용 ERP 확장(5단계, B묶음). 답변(쓰기) 전송은
+    # 별도 capability가 아니라 아예 이 인터페이스에 없다 - 공식 계약상 정상 케이스(신규
+    # 답변, transfer 아닌 경우)의 요청 바디 필드 의미를 안전하게 확정할 수 없어서
+    # 이번 단계에서는 어떤 채널도 실제 답변 전송을 구현하지 않는다(docs/
+    # COMMERCIAL_ERP_ROADMAP.md 5-B단계 절 참고 - 실계정에 잘못된 값으로 답변을
+    # 보내는 위험을 피하기 위함). CS 케이스는 답변 초안 저장까지만 지원한다.
+    supports_inquiry_sync: bool = False
 
     def _marketplace_code(self) -> str:
         """오류 메시지용 안전한 채널 식별자(Secret/PII 아님). platform_code가 없으면 클래스명."""
@@ -337,6 +344,22 @@ class BaseMallConnector(ABC):
         반환 형식은 fetch_cancellations()와 동일한 단일 딕셔너리이거나, 조회기간
         내 취소 사실이 없으면 None(빈 결과 - 오류 아님)."""
         raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "cancellation_lookup_by_order")
+
+    def fetch_inquiries(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+        """기간 내 채널 CS(고객문의) 목록을 정규화된 형식으로 조회한다(기본: 미지원
+        오류 - 빈 목록으로 위장하지 않는다). supports_inquiry_sync=True인 커넥터만
+        오버라이드한다.
+
+        반환 형식(정규화):
+            {"platform_inquiry_id": str,       # 채널의 문의 고유 ID(재수집 dedup 키)
+             "content": str,                    # 고객 문의 본문
+             "inquiry_at": datetime,
+             "raw_status": Optional[str],        # 채널 원본 상태(정규화하지 않고 그대로 보존)
+             "needs_answer": bool,               # 채널이 아직 답변 대기로 표시했는지
+             "platform_order_no": Optional[str], # 연결된 주문(orders.platform_order_no와 매칭)
+             "customer_phone": Optional[str]}    # PII - 호출부는 로그에 남기지 않는다
+        """
+        raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "inquiry_sync")
 
     def fetch_settlement_details(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
         """기간 내 정산 상세(주문 단위) 내역을 정규화된 형식으로 조회한다(기본: 미지원

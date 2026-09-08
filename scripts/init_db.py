@@ -59,6 +59,15 @@ DEFAULT_PERMISSIONS = [
     ("SYSTEM_MONITOR_VIEW", "시스템 모니터링 조회", "시스템모니터링"),
     ("SETTINGS_MANAGE", "환경설정 관리", "설정"),
     ("AUDIT_LOG_VIEW", "감사로그 조회", "설정"),
+    # 상용 ERP 확장(5단계, B묶음) - CS(고객문의) 케이스. 조회/생성수정/배정/종결·재오픈/
+    # 외부답변접수/개인정보상세조회를 별도 코드로 나눈다(요구사항 원문 그대로) -
+    # 담당자 배정과 종결 권한이 없는 상담원도 CS_MANAGE(메모/답변초안)는 가질 수 있다.
+    ("CS_VIEW", "CS 케이스 조회", "CS관리"),
+    ("CS_MANAGE", "CS 케이스 생성/수정(메모·답변초안)", "CS관리"),
+    ("CS_ASSIGN", "CS 담당자 배정", "CS관리"),
+    ("CS_CLOSE", "CS 종결/재오픈", "CS관리"),
+    ("CS_REPLY_SUBMIT", "CS 외부 채널 답변 접수", "CS관리"),
+    ("CS_PII_DETAIL", "CS 개인정보 상세 조회", "CS관리"),
 ]
 
 # 역할별 기본 권한 매핑 - Admin은 전체, Manager는 설정/감사로그 제외, Viewer는 조회만

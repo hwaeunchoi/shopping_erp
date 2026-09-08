@@ -15,7 +15,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from models.extra import Favorite, IntegrationStatus, Memo, RecentView, ReportSchedule, TaskExecutionHistory
+from models.extra import Attachment, Favorite, IntegrationStatus, Memo, RecentView, ReportSchedule, TaskExecutionHistory
 from repositories.base_repository import BaseRepository
 
 
@@ -254,5 +254,25 @@ class MemoRepository(BaseRepository[Memo]):
             select(Memo)
             .where(Memo.target_type == target_type, Memo.target_id == target_id)
             .order_by(Memo.created_at.desc())
+        )
+        return list(self.session.execute(stmt).scalars().all())
+
+
+class AttachmentRepository(BaseRepository[Attachment]):
+    """첨부파일 메타데이터(다형성 target_type/target_id) - 상용 ERP 확장(5단계, B묶음)에서
+    CS 케이스(target_type="CS_CASE") 조회용으로 처음 실사용한다. 실제 업로드
+    저장소는 이 코드베이스에 아직 없으므로(models/extra.py의 Attachment는 이전까지
+    스키마만 있고 어떤 라우터/서비스도 쓰지 않았다) file_path는 클라이언트가 이미
+    다른 방식으로 확보한 참조(예: 채널이 제공한 첨부 URL)만 저장한다 - 새 업로드
+    파이프라인을 이번 단계에서 만들지 않는다."""
+
+    def __init__(self, session: Session) -> None:
+        super().__init__(session, Attachment)
+
+    def list_by_target(self, target_type: str, target_id: int) -> list[Attachment]:
+        stmt = (
+            select(Attachment)
+            .where(Attachment.target_type == target_type, Attachment.target_id == target_id)
+            .order_by(Attachment.created_at.desc())
         )
         return list(self.session.execute(stmt).scalars().all())

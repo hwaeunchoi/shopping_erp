@@ -112,6 +112,21 @@ RETURN_STATUS_CODES = ["RU", "UC", "CC", "PR"]
 RETURN_MAX_PER_PAGE = 50
 RETURN_MAX_RANGE_DAYS = 31
 
+# --- 콜센터 문의(CS) 조회 (공식 문서: developers.coupang.com/hc/en-us/articles/
+# 360033645354-Query-of-Coupang-Contact-Center-Inquiries, 2026-09 조회) ---
+# 상품별 문의(onlineInquiries)도 조회 계약 자체는 같은 문서군에서 확인되지만, 이번
+# 단계는 콜센터 문의만 구현한다(범위 관리 - docs/COMMERCIAL_ERP_ROADMAP.md 5-B단계
+# 절 참고). 답변(쓰기) API(POST .../replies)의 요청 바디 필드(vendorId/inquiryId/
+# content/replyBy/parentAnswerId)는 존재가 확인되지만, parentAnswerId가 "신규
+# 답변(transfer 아님)" 케이스에서 어떤 값이어야 하는지는 문서에서 확정할 수 없어
+# 이번 단계에서 답변 전송은 구현하지 않는다(fetch만, 조회 전용).
+CALL_CENTER_INQUIRY_PATH_TMPL = "/v2/providers/openapi/apis/api/v5/vendors/{vendor_id}/callCenterInquiries"
+# partnerCounselingStatus는 필수 파라미터이며 한 번에 한 상태만 준다(공식 문서
+# 파라미터 표: NONE/ANSWER/NO_ANSWER/TRANSFER) - 그래서 4종을 순회해 합친다.
+CALL_CENTER_INQUIRY_STATUSES = ["NONE", "ANSWER", "NO_ANSWER", "TRANSFER"]
+CALL_CENTER_INQUIRY_MAX_PER_PAGE = 30
+CALL_CENTER_INQUIRY_MAX_RANGE_DAYS = 7
+
 # 응답 필드 receiptStatus(응답 예시로 확인, 파라미터 표의 코드와는 다른 표기) -> 내부
 # 정규화 상태. 실 응답 예시에서 확인된 값만 매핑하고 나머지는 REVIEW로 보존한다(완료로
 # 추정 금지) - services.claim_state_machine 참고.
@@ -388,6 +403,7 @@ class CoupangConnector(BaseMallConnector):
     # supports_product_info_update는 base 기본값(False)을 그대로 상속한다.
     supports_product_create = True
     supports_product_option_create = True
+    supports_inquiry_sync = True
 
     def __init__(
         self, session: Any = None, platform_id: Optional[int] = None, http_client: Optional[httpx.Client] = None
@@ -508,6 +524,16 @@ class CoupangConnector(BaseMallConnector):
         )
         normalized = self._normalize_cancel_requests(raw_items)
         return normalized[0] if normalized else None
+
+    def fetch_inquiries(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+        """콜센터 문의(CS) 목록 조회 - 상품별 문의(onlineInquiries)는 이번 단계
+        범위 밖(모듈 상단 CALL_CENTER_INQUIRY_PATH_TMPL 주석 참고)."""
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("coupang")
+        access_key, secret_key, vendor_id = credentials
+        raw_items = self._fetch_raw_call_center_inquiries(start_date, end_date, access_key, secret_key, vendor_id)
+        return self._normalize_call_center_inquiries(raw_items)
 
     def fetch_exchanges(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
         """교환 목록 조회(공식 문서: developers.coupang.com/ko/api/exchanges/
@@ -1083,6 +1109,68 @@ class CoupangConnector(BaseMallConnector):
             for item in raw_items
             if item.get("receiptType") == "RETURN" and item.get("orderId") is not None
         ]
+
+    def _fetch_raw_call_center_inquiries(
+        self, start_date: date, end_date: date, access_key: str, secret_key: str, vendor_id: str
+    ) -> list[dict[str, Any]]:
+        path = CALL_CENTER_INQUIRY_PATH_TMPL.format(vendor_id=vendor_id)
+        raw_items: list[dict[str, Any]] = []
+
+        for status_value in CALL_CENTER_INQUIRY_STATUSES:
+            window_start = start_date
+            while window_start <= end_date:
+                window_end = min(window_start + timedelta(days=CALL_CENTER_INQUIRY_MAX_RANGE_DAYS - 1), end_date)
+                page_num = 1
+                while True:
+                    params: list[tuple[str, str]] = [
+                        ("vendorId", vendor_id),
+                        ("partnerCounselingStatus", status_value),
+                        ("inquiryStartAt", window_start.isoformat()),
+                        ("inquiryEndAt", window_end.isoformat()),
+                        ("pageNum", str(page_num)),
+                        ("pageSize", str(CALL_CENTER_INQUIRY_MAX_PER_PAGE)),
+                    ]
+                    query = urlencode(params)
+                    authorization = self._authorization(access_key, secret_key, "GET", path, query)
+                    response = self._request_with_retry(
+                        "GET", f"{path}?{query}", headers={"Authorization": authorization}
+                    )
+                    raise_for_status("coupang", response.status_code)
+                    with external_call("coupang"):
+                        payload = response.json()
+                        data = payload.get("data") or {}
+                        raw_items.extend(data.get("content", []) or [])
+                        pagination = data.get("pagination") or {}
+                        current_page = pagination.get("currentPage") or page_num
+                        total_pages = pagination.get("totalPages") or page_num
+                    if current_page >= total_pages:
+                        break
+                    page_num += 1
+                window_start = window_end + timedelta(days=1)
+
+        return raw_items
+
+    @staticmethod
+    def _normalize_call_center_inquiries(raw_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """inquiryId가 없는 항목은 dedup 키가 없어 대상에서 제외한다(방어적)."""
+        normalized: list[dict[str, Any]] = []
+        for item in raw_items:
+            inquiry_id = item.get("inquiryId")
+            if inquiry_id is None:
+                continue
+            order_id = item.get("orderId")
+            normalized.append(
+                {
+                    "platform_inquiry_id": str(inquiry_id),
+                    "content": item.get("content") or "",
+                    "inquiry_at": _parse_coupang_datetime(item.get("inquiryAt")),
+                    "raw_status": f'{item.get("inquiryStatus")}:{item.get("csPartnerCounselingStatus")}',
+                    "needs_answer": item.get("csPartnerCounselingStatus") == "requestAnswer",
+                    "platform_order_no": str(order_id) if order_id is not None else None,
+                    "customer_phone": item.get("buyerPhone"),
+                }
+            )
+        return normalized
 
     def _fetch_raw_cancel_by_order(
         self, start_date: date, end_date: date, platform_order_no: str, access_key: str, secret_key: str, vendor_id: str

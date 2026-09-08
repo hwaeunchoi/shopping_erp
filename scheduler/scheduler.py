@@ -35,6 +35,7 @@ from scheduler.jobs import (  # noqa: E402
     backup_job,
     channel_status_sync_job,
     claim_sync_job,
+    cs_inquiry_sync_job,
     customer_stats_job,
     order_collect_job,
     outbox_dispatch_job,
@@ -134,6 +135,10 @@ def run_product_option_publish_dispatch() -> None:
     _run_job("product_option_publish_dispatch", product_option_publish_dispatch_job.run, task_type="FULL_SYNC")
 
 
+def run_cs_inquiry_sync() -> None:
+    _run_job("cs_inquiry_sync", cs_inquiry_sync_job.run, task_type="FULL_SYNC")
+
+
 def build_scheduler() -> BlockingScheduler:
     scheduler = BlockingScheduler(timezone="UTC")
     # 상품 동기화는 주문 수집보다 먼저 실행되도록 더 짧은 주기(10분보다 여유를 둔 20분)로
@@ -176,6 +181,10 @@ def build_scheduler() -> BlockingScheduler:
         id="product_option_publish_dispatch",
         max_instances=1,
     )
+    # 채널 CS(고객문의) 조회 동기화 - 상용 ERP 확장(5단계 B묶음, 기본 OFF:
+    # cs_inquiry_sync_enabled). 조회 전용이다 - 어떤 코드 경로도 채널에 답변을
+    # 쓰지 않는다(services/cs_channel_sync_service.py 모듈 docstring 참고).
+    scheduler.add_job(run_cs_inquiry_sync, IntervalTrigger(minutes=15), id="cs_inquiry_sync", max_instances=1)
     return scheduler
 
 

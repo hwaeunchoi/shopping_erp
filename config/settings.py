@@ -110,6 +110,15 @@ class Settings(BaseSettings):
     # 운영자가 명시적으로 켜야 한다.
     product_option_publish_enabled: bool = False
 
+    # 상용 ERP 확장(5단계, B묶음) - 채널 CS(고객문의) 조회 동기화만 이 플래그로
+    # 통제한다(자동: scheduler.jobs.cs_inquiry_sync_job / 수동: POST
+    # /api/cs-cases/sync). False(기본값)면 커넥터를 만들지도 fetch_inquiries를
+    # 호출하지도 않아 외부 요청이 0건임을 보장한다 - 실계정 검증 승인 후
+    # 운영자가 명시적으로 켜야 한다. 실제 채널 답변 전송은 어떤 플래그로도
+    # 아직 켤 수 없다 - services/cs_channel_sync_service.py 모듈 docstring
+    # 참고(공식 계약상 안전하게 확정할 수 없는 필드가 있어 구현 자체가 없다).
+    cs_inquiry_sync_enabled: bool = False
+
     model_config = SettingsConfigDict(env_file=str(BASE_DIR / ".env"), env_file_encoding="utf-8", extra="ignore")
 
 
