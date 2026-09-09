@@ -8,7 +8,7 @@ ERD 2.6 정산 그룹(settlements, settlement_details)과 상용 ERP 확장(2단
 from datetime import date
 from typing import Optional
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from models.settlement import Settlement, SettlementDetail, SettlementDiscrepancy
@@ -18,6 +18,11 @@ from repositories.base_repository import BaseRepository
 class SettlementRepository(BaseRepository[Settlement]):
     def __init__(self, session: Session) -> None:
         super().__init__(session, Settlement)
+
+    def count_by_status(self) -> dict[str, int]:
+        """상용 ERP 확장(6단계) - 운영 대시보드 정산 수집 상태 카드 근거."""
+        stmt = select(Settlement.status, func.count()).group_by(Settlement.status)
+        return {row[0]: row[1] for row in self.session.execute(stmt).all()}
 
     def list_by_platform(self, platform_id: int) -> list[Settlement]:
         stmt = select(Settlement).where(Settlement.platform_id == platform_id)

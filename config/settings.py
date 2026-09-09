@@ -119,6 +119,14 @@ class Settings(BaseSettings):
     # 참고(공식 계약상 안전하게 확정할 수 없는 필드가 있어 구현 자체가 없다).
     cs_inquiry_sync_enabled: bool = False
 
+    # 상용 ERP 확장(6단계) - 운영 대시보드 심각도(INFO/WARNING/ERROR/CRITICAL) 분류
+    # 임계값. 오류 문자열 검색이 아니라 이 숫자 임계값과 구조화된 필드(status/
+    # error_code)만으로 심각도를 정한다(services/operations_dashboard_service.py
+    # 참고). 값 자체가 실 동작(재시도/회수)에 영향을 주지 않는다 - 화면 표시 전용이다.
+    ops_unknown_critical_after_hours: int = 24
+    ops_stale_running_warning_after_minutes: int = 15
+    ops_integration_down_after_days: int = 3
+
     model_config = SettingsConfigDict(env_file=str(BASE_DIR / ".env"), env_file_encoding="utf-8", extra="ignore")
 
 

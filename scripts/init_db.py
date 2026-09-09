@@ -68,6 +68,12 @@ DEFAULT_PERMISSIONS = [
     ("CS_CLOSE", "CS 종결/재오픈", "CS관리"),
     ("CS_REPLY_SUBMIT", "CS 외부 채널 답변 접수", "CS관리"),
     ("CS_PII_DETAIL", "CS 개인정보 상세 조회", "CS관리"),
+    # 상용 ERP 확장(6단계) - 통합 운영 대시보드/실패 작업함. 조회는 기존
+    # DASHBOARD_VIEW/SYSTEM_MONITOR_VIEW를 재사용하고(신규 조회 권한을 만들지
+    # 않는다 - api/routers/tasks.py의 기존 권한 재사용 관례와 동일), 상태를
+    # 바꾸는 두 동작만 신규 권한으로 분리한다(CS_ASSIGN/CS_CLOSE 분리 관례와 동일).
+    ("OPERATIONS_RETRY", "통합 실패 작업함 선택 재처리", "운영대시보드"),
+    ("OPERATIONS_UNKNOWN_RESOLVE", "통합 실패 작업함 UNKNOWN 수동 해소", "운영대시보드"),
 ]
 
 # 역할별 기본 권한 매핑 - Admin은 전체, Manager는 설정/감사로그 제외, Viewer는 조회만

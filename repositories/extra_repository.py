@@ -222,6 +222,33 @@ class IntegrationStatusRepository(BaseRepository[IntegrationStatus]):
         self.session.flush()
         return record
 
+    def upsert_partial(self, integration_type: str, integration_code: str, error_message: str) -> IntegrationStatus:
+        """일부만 성공한 실행(예: 클레임 3종 중 2종 성공)을 기록한다 - 상용 ERP
+        확장(6단계). status="PARTIAL"은 이번 단계에서 추가하는 세 번째 값이다
+        (NORMAL/ERROR 둘뿐이던 기존 값에 CHECK 제약이 없어 스키마 변경 없이
+        추가할 수 있다 - models/extra.py IntegrationStatus 참고). last_success_at도
+        갱신한다 - PARTIAL은 "이번 실행에서 최소 하나는 성공했다"는 뜻이므로."""
+        record = self.get_by_type_and_code(integration_type, integration_code)
+        now = datetime.now(timezone.utc)
+        if record is None:
+            record = IntegrationStatus(
+                integration_type=integration_type,
+                integration_code=integration_code,
+                status="PARTIAL",
+                last_success_at=now,
+                last_error_at=now,
+                last_error_message=error_message[:2000],
+                updated_at=now,
+            )
+            return self.add(record)
+        record.status = "PARTIAL"
+        record.last_success_at = now
+        record.last_error_at = now
+        record.last_error_message = error_message[:2000]
+        record.updated_at = now
+        self.session.flush()
+        return record
+
     def upsert_error(self, integration_type: str, integration_code: str, error_message: str) -> IntegrationStatus:
         record = self.get_by_type_and_code(integration_type, integration_code)
         now = datetime.now(timezone.utc)

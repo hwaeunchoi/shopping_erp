@@ -21,6 +21,23 @@ from models.integration_sync import (
     ProductSyncCommandDetail,
 )
 
+# 상용 ERP 확장(6단계) - 운영 대시보드/통합 실패 작업함이 다루는 "쓰기 명령" 종류.
+# 이 6종만 재시도(attempt_count)/최종상태(SUCCESS·FAILED)가 명령 단위로 남아 대시보드
+# 성공률·실패 작업함 대상이 될 수 있다(주문/클레임/정산/CS문의 수집은 읽기 전용 배치라
+# 명령 단위 이력이 없다 - services/operations_dashboard_service.py 모듈 docstring 참고).
+WRITE_COMMAND_TYPES = (
+    "SHIPMENT_SUBMIT",
+    "PRODUCT_CREATE",
+    "PRODUCT_OPTION_CREATE",
+    "INVENTORY_UPDATE",
+    "SALE_STATUS_UPDATE",
+    "PRODUCT_INFO_UPDATE",
+)
+# 통합 실패 작업함 기본 대상 상태 - 운영자가 조치할 수 있거나 조치를 기다리는 상태만.
+# PENDING(정상 대기)/SUCCESS/CANCELLED는 "실패"가 아니므로 기본 목록에서 제외한다
+# (호출부가 status를 명시하면 그 값 하나로만 좁혀 PENDING/SUCCESS도 조회 가능).
+DEFAULT_FAILURE_STATUSES = ("FAILED", "RETRY_WAIT", "UNKNOWN", "RUNNING")
+
 
 class ExternalCommandRepository:
     def __init__(self, session: Session) -> None:
@@ -302,6 +319,99 @@ class ExternalCommandRepository:
         result = cast(CursorResult, self.session.execute(stmt))
         return result.rowcount == 1
 
+    # --- 상용 ERP 확장(6단계) - 운영 대시보드/통합 실패 작업함 ------------------
+
+    def list_failures(
+        self,
+        command_type: Optional[str] = None,
+        platform_id: Optional[int] = None,
+        status: Optional[str] = None,
+        created_from: Optional[datetime] = None,
+        created_to: Optional[datetime] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[ExternalCommand]:
+        """통합 실패 작업함 목록 - status를 지정하지 않으면 DEFAULT_FAILURE_STATUSES
+        (FAILED/RETRY_WAIT/UNKNOWN/RUNNING)만 본다. command_type을 지정하지 않으면
+        WRITE_COMMAND_TYPES(명령 단위 이력이 있는 6종)로 범위를 좁힌다 - 안 그러면
+        향후 추가될 무관한 command_type까지 이 화면에 섞여 들어온다."""
+        stmt = select(ExternalCommand)
+        stmt = self._apply_failure_filters(stmt, command_type, platform_id, status, created_from, created_to)
+        stmt = stmt.order_by(ExternalCommand.id.desc()).limit(limit).offset(offset)
+        return list(self.session.execute(stmt).scalars().all())
+
+    def count_failures(
+        self,
+        command_type: Optional[str] = None,
+        platform_id: Optional[int] = None,
+        status: Optional[str] = None,
+        created_from: Optional[datetime] = None,
+        created_to: Optional[datetime] = None,
+    ) -> int:
+        stmt = select(func.count()).select_from(ExternalCommand)
+        stmt = self._apply_failure_filters(stmt, command_type, platform_id, status, created_from, created_to)
+        return self.session.execute(stmt).scalar_one()
+
+    def _apply_failure_filters(
+        self,
+        stmt: Any,
+        command_type: Optional[str],
+        platform_id: Optional[int],
+        status: Optional[str],
+        created_from: Optional[datetime],
+        created_to: Optional[datetime],
+    ) -> Any:
+        stmt = stmt.where(ExternalCommand.command_type.in_(WRITE_COMMAND_TYPES))
+        if command_type is not None:
+            stmt = stmt.where(ExternalCommand.command_type == command_type)
+        if platform_id is not None:
+            stmt = stmt.where(ExternalCommand.platform_id == platform_id)
+        if status is not None:
+            stmt = stmt.where(ExternalCommand.status == status)
+        else:
+            stmt = stmt.where(ExternalCommand.status.in_(DEFAULT_FAILURE_STATUSES))
+        if created_from is not None:
+            stmt = stmt.where(ExternalCommand.created_at >= created_from)
+        if created_to is not None:
+            stmt = stmt.where(ExternalCommand.created_at < created_to)
+        return stmt
+
+    def count_grouped_by_status(
+        self, command_type: Optional[str] = None, platform_id: Optional[int] = None
+    ) -> dict[str, int]:
+        """명령종류(기본: WRITE_COMMAND_TYPES 전체)·플랫폼별 상태 분포 - 대시보드
+        "송장/상품등록/재고/판매상태/정보수정 명령 상태" 카드의 근거."""
+        stmt = select(ExternalCommand.status, func.count()).where(ExternalCommand.command_type.in_(WRITE_COMMAND_TYPES))
+        if command_type is not None:
+            stmt = stmt.where(ExternalCommand.command_type == command_type)
+        if platform_id is not None:
+            stmt = stmt.where(ExternalCommand.platform_id == platform_id)
+        stmt = stmt.group_by(ExternalCommand.status)
+        return {row[0]: row[1] for row in self.session.execute(stmt).all()}
+
+    def success_rate_window(
+        self, since: datetime, until: datetime, command_type: Optional[str] = None, platform_id: Optional[int] = None
+    ) -> tuple[int, int]:
+        """[since, until) 구간에 생성된 명령 중 SUCCESS/FAILED로 "확정"된 것만 센다
+        (성공, 실패) 튜플로 반환 - PENDING/RUNNING/RETRY_WAIT/UNKNOWN/CANCELLED는
+        분자·분모 어디에도 포함하지 않는다(요구사항: 아직 처리되지 않은 건을 실패로
+        치지 않는다 - services/operations_dashboard_service.py 모듈 docstring 참고).
+        created_at 기준이다(완료 시각인 completed_at은 FAILED/RETRY_WAIT 경로에서
+        기록되지 않는 값이라 창구 경계 판정에 쓸 수 없다)."""
+        stmt = select(ExternalCommand.status, func.count()).where(
+            ExternalCommand.command_type.in_(WRITE_COMMAND_TYPES),
+            ExternalCommand.created_at >= since,
+            ExternalCommand.created_at < until,
+            ExternalCommand.status.in_(("SUCCESS", "FAILED")),
+        )
+        if command_type is not None:
+            stmt = stmt.where(ExternalCommand.command_type == command_type)
+        if platform_id is not None:
+            stmt = stmt.where(ExternalCommand.platform_id == platform_id)
+        stmt = stmt.group_by(ExternalCommand.status)
+        counts = {row[0]: row[1] for row in self.session.execute(stmt).all()}
+        return counts.get("SUCCESS", 0), counts.get("FAILED", 0)
+
 
 class ExternalCommandLineResultRepository:
     def __init__(self, session: Session) -> None:
@@ -369,6 +479,10 @@ class OrderStatusConflictRepository:
         if order_id is not None:
             stmt = stmt.where(OrderStatusConflict.order_id == order_id)
         return list(self.session.execute(stmt.order_by(OrderStatusConflict.detected_at.desc())).scalars())
+
+    def count_unresolved(self) -> int:
+        stmt = select(func.count()).select_from(OrderStatusConflict).where(OrderStatusConflict.resolved_at.is_(None))
+        return self.session.execute(stmt).scalar_one()
 
     def get_unresolved_for_status(self, order_id: int, channel_status: str) -> Optional[OrderStatusConflict]:
         """같은 주문에 같은 채널상태로 이미 미해소 충돌이 있는지 확인한다(중복 생성 방지).

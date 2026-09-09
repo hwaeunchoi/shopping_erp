@@ -18,6 +18,13 @@ skipped: unsupported로 남는다).
 외부 HTTP 요청이 0건임을 보장한다). 실계정 검증 승인 후 운영자가 명시적으로
 켜야 한다. 실제 채널 답변 전송은 이 잡에도, 어떤 코드 경로에도 없다(조회
 전용 - services/cs_channel_sync_service.py 모듈 docstring 참고).
+
+상용 ERP 확장(6단계): 운영 대시보드 근거로 integration_status(integration_type=
+"CS_INQUIRY")를 갱신한다 - sync_inquiries()가 이미 반환하던 status(SUCCESS/
+PARTIAL_SUCCESS/FAILED/UNSUPPORTED, 이 잡 안에서는 DISABLED가 나오지 않는다 -
+전역 플래그가 꺼져 있으면 위에서 이미 반환했다)를 그대로 옮겨 적을 뿐이고,
+CsChannelSyncService의 동기화 로직(멱등 저장/로컬 데이터 보존/SAVEPOINT
+격리)은 전혀 바꾸지 않았다.
 """
 
 import logging
@@ -32,12 +39,14 @@ from integrations.malls.errors import (
     MarketplaceCredentialMissingError,
     MarketplaceExternalAPIError,
 )
+from repositories.extra_repository import IntegrationStatusRepository
 from repositories.platform_repository import PlatformRepository
 from services.cs_channel_sync_service import CsChannelSyncService
 
 logger = logging.getLogger(__name__)
 
 COLLECT_WINDOW_DAYS = 7
+INTEGRATION_TYPE = "CS_INQUIRY"
 
 
 def _safe_error_summary(exc: Exception) -> str:
@@ -61,12 +70,14 @@ def run() -> dict[str, dict]:
         end_date = date.today()
         start_date = end_date - timedelta(days=COLLECT_WINDOW_DAYS)
         sync_service = CsChannelSyncService(db)
+        integration_status_repo = IntegrationStatusRepository(db)
 
         for platform in PlatformRepository(db).list_active():
             try:
                 connector = get_mall_connector(platform.connector_class, session=db, platform_id=platform.id)
                 result = sync_service.sync_inquiries(connector, platform.id, start_date, end_date)
                 results[platform.code] = result
+                _record_integration_status(integration_status_repo, platform.code, result.get("status"))
                 db.commit()
             except MarketplaceCapabilityUnsupportedError:
                 db.rollback()
@@ -77,6 +88,20 @@ def run() -> dict[str, dict]:
                 db.rollback()
                 summary = _safe_error_summary(e)
                 results[platform.code] = {"error": summary}
+                integration_status_repo.upsert_error(INTEGRATION_TYPE, platform.code, summary)
+                db.commit()
                 logger.warning("CS 문의 동기화 실패: platform=%s, reason=%s", platform.code, summary)
                 continue
     return results
+
+
+def _record_integration_status(
+    integration_status_repo: IntegrationStatusRepository, platform_code: str, sync_status: object
+) -> None:
+    if sync_status == "SUCCESS":
+        integration_status_repo.upsert_success(INTEGRATION_TYPE, platform_code)
+    elif sync_status == "PARTIAL_SUCCESS":
+        integration_status_repo.upsert_partial(INTEGRATION_TYPE, platform_code, "일부 문의만 수집 성공")
+    elif sync_status == "FAILED":
+        integration_status_repo.upsert_error(INTEGRATION_TYPE, platform_code, "CS 문의 수집 전체 실패")
+    # UNSUPPORTED(capability 없음)는 기록하지 않는다(미지원과 실패를 구분).

@@ -62,6 +62,14 @@ class FulfillmentBatchItemRepository(BaseRepository[FulfillmentBatchItem]):
         stmt = select(FulfillmentBatchItem).where(FulfillmentBatchItem.shipment_id == shipment_id)
         return list(self.session.execute(stmt).scalars().all())
 
+    def count_by_status(self) -> dict[str, int]:
+        """상용 ERP 확장(6단계) - 운영 대시보드 출고 진행상태 카드(출고대기/피킹/검수/
+        포장완료) 근거. BATCH_ITEM_STATUSES 10종 전체를 그대로 반환하고, 4개 카드로
+        묶는 매핑은 services/operations_dashboard_service.py에 명시한다(여기서
+        손실 있는 그룹핑을 하지 않고 원본 상태를 그대로 노출)."""
+        stmt = select(FulfillmentBatchItem.status, func.count()).group_by(FulfillmentBatchItem.status)
+        return {row[0]: row[1] for row in self.session.execute(stmt).all()}
+
     def list_by_ids(self, ids: list[int]) -> list[FulfillmentBatchItem]:
         if not ids:
             return []

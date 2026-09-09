@@ -392,6 +392,21 @@ class OrderRepository(BaseRepository[Order]):
             channel_match,
         )
 
+    def count_created_between(self, start: datetime, end: datetime) -> int:
+        """상용 ERP 확장(6단계) - "오늘 수집된 주문" 근거. 채널의 주문일자(order_date)가
+        아니라 우리 DB에 실제로 적재된 시각(created_at, TimestampMixin 기본값)을
+        기준으로 센다 - 채널 주문일자는 늦게 수집되면 "오늘"이 아닐 수 있고, 반대로
+        오늘 수집된 주문의 채널 주문일자가 어제일 수도 있어 "수집" 의미와 맞지
+        않는다(services/operations_dashboard_service.py 모듈 docstring 참고).
+        [start, end) - 호출부가 명확한 UTC 경계를 계산해 넘긴다(naive UTC 비교
+        관례는 count_delayed_unshipped과 동일)."""
+        stmt = (
+            select(func.count())
+            .select_from(Order)
+            .where(Order.is_deleted.is_(False), Order.created_at >= start, Order.created_at < end)
+        )
+        return self.session.execute(stmt).scalar_one()
+
     def count_delayed_unshipped(self, threshold_days: int = 2) -> int:
         """SRS FR-ORD-02: 배송준비(NEW/PREPARING) 상태로 threshold_days일 이상 머문 주문 수."""
         cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=threshold_days)

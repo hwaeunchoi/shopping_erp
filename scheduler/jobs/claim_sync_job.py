@@ -19,6 +19,14 @@ results[code]["cancellations_by_order_lookup"]에 따로 담긴다. 이 경로�
 기본 차단: settings.claims_settlement_sync_enabled가 False(기본값)이면 이 잡은
 아무 것도 하지 않고 즉시 반환한다(세션도 열지 않고 커넥터도 만들지 않는다 - 외부
 HTTP 요청이 0건임을 보장한다). 실계정 검증 승인 후 운영자가 명시적으로 켜야 한다.
+
+상용 ERP 확장(6단계): 운영 대시보드의 "플랫폼별 마지막 성공·실패 시각"/"클레임
+수집 성공/부분성공/실패" 근거로 integration_status(integration_type="CLAIM")를
+갱신한다 - sync_claims()가 이미 계산해 두던 overall_status(SUCCESS/PARTIAL/
+FAILED/UNSUPPORTED)를 그대로 옮겨 적을 뿐, 이 잡의 수집 로직 자체(sync_claims/
+sync_cancellations_by_candidate_orders 호출 순서·내용)는 전혀 바꾸지 않았다.
+UNSUPPORTED는 기존 order_collect_job과 동일하게 기록하지 않는다(미지원과
+실패를 구분 - DB에 남기지 않는다).
 """
 
 import logging
@@ -33,8 +41,11 @@ from integrations.malls.errors import (
     MarketplaceCredentialMissingError,
     MarketplaceExternalAPIError,
 )
+from repositories.extra_repository import IntegrationStatusRepository
 from repositories.platform_repository import PlatformRepository
 from services.claim_sync_service import ClaimSyncService
+
+INTEGRATION_TYPE = "CLAIM"
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +73,7 @@ def run() -> dict[str, dict]:
         end_date = date.today()
         start_date = end_date - timedelta(days=COLLECT_WINDOW_DAYS)
         sync_service = ClaimSyncService(db)
+        integration_status_repo = IntegrationStatusRepository(db)
 
         for platform in PlatformRepository(db).list_active():
             try:
@@ -73,6 +85,7 @@ def run() -> dict[str, dict]:
                     connector, platform.id
                 )
                 results[platform.code] = result
+                _record_integration_status(integration_status_repo, platform.code, result.get("overall_status"))
                 db.commit()
             except MarketplaceCapabilityUnsupportedError:
                 db.rollback()
@@ -83,6 +96,20 @@ def run() -> dict[str, dict]:
                 db.rollback()
                 summary = _safe_error_summary(e)
                 results[platform.code] = {"error": summary}
+                integration_status_repo.upsert_error(INTEGRATION_TYPE, platform.code, summary)
+                db.commit()
                 logger.warning("클레임 수집 실패: platform=%s, reason=%s", platform.code, summary)
                 continue
     return results
+
+
+def _record_integration_status(
+    integration_status_repo: IntegrationStatusRepository, platform_code: str, overall_status: object
+) -> None:
+    if overall_status == "SUCCESS":
+        integration_status_repo.upsert_success(INTEGRATION_TYPE, platform_code)
+    elif overall_status == "PARTIAL":
+        integration_status_repo.upsert_partial(INTEGRATION_TYPE, platform_code, "일부 클레임 유형만 수집 성공")
+    elif overall_status == "FAILED":
+        integration_status_repo.upsert_error(INTEGRATION_TYPE, platform_code, "클레임 수집 전 항목 실패")
+    # UNSUPPORTED는 기록하지 않는다(미지원과 실패를 구분 - order_collect_job과 동일 관례).

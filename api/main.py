@@ -33,6 +33,7 @@ from api.routers import (
     fulfillment,
     inventory,
     notifications,
+    operations,
     order_conflicts,
     orders,
     platforms,
@@ -123,6 +124,12 @@ openapi_tags = [
         "task_type별로 ORDER_EDIT/AD_MANAGE/REPORT_VIEW/SETTINGS_MANAGE 권한 필요",
     },
     {"name": "notifications", "description": "알림센터 조회/읽음처리. 필요 권한: NOTIFICATION_VIEW"},
+    {
+        "name": "operations",
+        "description": "통합 운영 대시보드/실패 작업함. 조회: DASHBOARD_VIEW(scheduler 잡 상태는 "
+        "SYSTEM_MONITOR_VIEW), 실패 항목 재처리: OPERATIONS_RETRY, UNKNOWN 수동 해소: "
+        "OPERATIONS_UNKNOWN_RESOLVE",
+    },
     {"name": "alert-rules", "description": "사용자 정의 알림 규칙 관리. 필요 권한: SETTINGS_MANAGE"},
     {
         "name": "settings",
@@ -186,6 +193,7 @@ app.include_router(notifications.router)
 app.include_router(alert_rules.router)
 app.include_router(settings_router.router)
 app.include_router(order_conflicts.router)
+app.include_router(operations.router)
 
 
 @app.exception_handler(IntegrityError)
