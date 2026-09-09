@@ -4,6 +4,7 @@ import { ProtectedRoute } from './components/ProtectedRoute'
 import { Layout } from './components/Layout'
 import { LoginPage } from './pages/LoginPage'
 import { DashboardPage } from './pages/DashboardPage'
+import { OperationsDashboardPage } from './pages/OperationsDashboardPage'
 import { OrdersPage } from './pages/OrdersPage'
 import { OrderDetailPage } from './pages/OrderDetailPage'
 import { ShipmentsPage } from './pages/ShipmentsPage'
@@ -44,6 +45,7 @@ function App() {
       <Routes>
         <Route path="/login" element={<LoginPage />} />
         <Route path="/" element={<Protected><DashboardPage /></Protected>} />
+        <Route path="/operations" element={<Protected><OperationsDashboardPage /></Protected>} />
         <Route path="/orders" element={<Protected><OrdersPage /></Protected>} />
         <Route path="/orders/:orderId" element={<Protected><OrderDetailPage /></Protected>} />
         <Route path="/shipments" element={<Protected><ShipmentsPage /></Protected>} />

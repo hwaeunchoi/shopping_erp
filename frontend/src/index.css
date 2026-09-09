@@ -7,6 +7,8 @@
   --accent: #2563eb;
   --accent-hover: #1d4ed8;
   --danger: #dc2626;
+  --warning: #b45309;
+  --warning-bg: #fef3c7;
   --sidebar-bg: #111827;
   --sidebar-text: #d1d5db;
 
@@ -26,6 +28,8 @@
   --accent: #3b82f6;
   --accent-hover: #60a5fa;
   --danger: #f87171;
+  --warning: #fbbf24;
+  --warning-bg: #453b1a;
   --sidebar-bg: #0b0d12;
   --sidebar-text: #cbd5e1;
 }
@@ -322,6 +326,46 @@ input, select {
   }
 }
 
+/* 상용 ERP 확장(6단계) - 운영 대시보드 전용. 위 페이지들과 같은 이유. */
+@media (max-width: 768px) {
+  .operations-dashboard-page input,
+  .operations-dashboard-page select,
+  .operations-dashboard-page textarea {
+    min-width: 0;
+    max-width: 100%;
+  }
+}
+
+.ops-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.ops-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+
+.ops-trend-row {
+  display: flex;
+  gap: 24px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.ops-trend-row > div {
+  min-width: 0;
+  flex: 1 1 320px;
+  overflow-x: auto;
+}
+
 .clickable-row {
   cursor: pointer;
 }
@@ -477,6 +521,19 @@ input, select {
   color: #b91c1c;
   font-weight: 600;
 }
+
+/* 상용 ERP 확장(6단계) - 운영 대시보드 심각도 배지(INFO/WARNING/ERROR/CRITICAL). */
+.severity-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.severity-info { background: #eef2ff; color: var(--accent); font-weight: 400; }
+.severity-warning { background: var(--warning-bg); color: var(--warning); }
+.severity-error { background: #fee2e2; color: var(--danger); }
+.severity-critical { background: var(--danger); color: #fff; }
 
 /* --- UI v1.1 addendum: 통합검색/최근조회/즐겨찾기/AI Assistant --- */
 

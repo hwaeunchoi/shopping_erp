@@ -12,6 +12,7 @@ import { RecentViewsDropdown } from './RecentViewsDropdown'
 // 메뉴는 사이드바에서 아예 숨긴다(백엔드가 403으로 막는 것과 동일하게 동작).
 const NAV_ITEMS: Array<{ to: string; label: string; permission?: string }> = [
   { to: '/', label: '대시보드' },
+  { to: '/operations', label: '운영 대시보드', permission: 'DASHBOARD_VIEW' },
   { to: '/orders', label: '주문관리', permission: 'ORDER_VIEW' },
   { to: '/shipments', label: '배송관리', permission: 'SHIPMENT_VIEW' },
   { to: '/fulfillment', label: '출고관리', permission: 'SHIPMENT_VIEW' },

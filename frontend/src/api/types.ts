@@ -1401,3 +1401,120 @@ export interface CsReference {
   inquiry_types: string[]
   priorities: string[]
 }
+
+// --- 상용 ERP 확장(6단계) - 통합 운영 대시보드 --------------------------------
+
+export type OpsSeverity = 'INFO' | 'WARNING' | 'ERROR' | 'CRITICAL'
+
+export interface OpsRateWindow {
+  success: number
+  failed: number
+  total: number
+  rate_percent: number | null // null이면 화면에 N/A로 표시(분모 0)
+}
+
+export interface OpsSummary {
+  generated_at: string
+  window_definition: {
+    today_utc: [string, string]
+    last_24h_utc: [string, string]
+    last_7d_utc: [string, string]
+    note: string
+  }
+  orders: {
+    collected_today: number
+    unshipped: number
+    delayed_unshipped: number
+  }
+  fulfillment: {
+    by_kpi_bucket: Record<string, number>
+    raw_by_status: Record<string, number>
+  }
+  shipment_commands_by_status: Record<string, number>
+  product_commands_by_status: Record<string, number>
+  order_status_conflicts_unresolved: number
+  cs: {
+    by_status: Record<string, number>
+    unassigned: number
+    overdue: number
+  }
+  claims_pending: {
+    exchange: number
+    return: number
+    cancellation: number
+  }
+  settlement_by_status: Record<string, number>
+  success_rate: {
+    last_24h: OpsRateWindow
+    last_7d: OpsRateWindow
+    scope_note: string
+  }
+}
+
+export interface OpsTimeseriesPoint {
+  date: string
+  success: number
+  failed: number
+}
+
+export interface OpsIntegrationStatus {
+  integration_type: string
+  integration_code: string
+  status: string
+  last_success_at: string | null
+  last_error_at: string | null
+  last_error_message: string | null
+  severity: OpsSeverity
+}
+
+export interface OpsSchedulerJob {
+  target: string | null
+  task_type: string
+  status: string
+  started_at: string
+  finished_at: string | null
+  error_message: string | null
+  severity: OpsSeverity
+}
+
+export interface OpsFailure {
+  id: number
+  command_type: string
+  platform_id: number
+  platform_code: string | null
+  target_type: string
+  target_id: number
+  status: string
+  attempt_count: number
+  next_retry_at: string | null
+  error_code: string | null
+  created_at: string
+  updated_at: string
+  detail_link: string
+}
+
+export interface OpsFailureDetail extends OpsFailure {
+  request_summary: string | null
+  response_summary: string | null
+  available_unknown_actions: string[]
+}
+
+export interface OpsFailureListOut {
+  items: OpsFailure[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export type OpsBulkRetryOutcome =
+  | 'RETRIED'
+  | 'NOT_FOUND'
+  | 'NOT_RETRYABLE'
+  | 'UNKNOWN_REQUIRES_RESOLUTION'
+  | 'FAILED_TO_ENQUEUE'
+
+export interface OpsBulkRetryItem {
+  command_id: number
+  outcome: OpsBulkRetryOutcome
+  error_code: string | null
+}
