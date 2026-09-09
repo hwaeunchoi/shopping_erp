@@ -392,16 +392,23 @@ class ExternalCommandRepository:
     def success_rate_window(
         self, since: datetime, until: datetime, command_type: Optional[str] = None, platform_id: Optional[int] = None
     ) -> tuple[int, int]:
-        """[since, until) 구간에 생성된 명령 중 SUCCESS/FAILED로 "확정"된 것만 센다
+        """[since, until] 구간에 생성된 명령 중 SUCCESS/FAILED로 "확정"된 것만 센다
         (성공, 실패) 튜플로 반환 - PENDING/RUNNING/RETRY_WAIT/UNKNOWN/CANCELLED는
         분자·분모 어디에도 포함하지 않는다(요구사항: 아직 처리되지 않은 건을 실패로
         치지 않는다 - services/operations_dashboard_service.py 모듈 docstring 참고).
         created_at 기준이다(완료 시각인 completed_at은 FAILED/RETRY_WAIT 경로에서
-        기록되지 않는 값이라 창구 경계 판정에 쓸 수 없다)."""
+        기록되지 않는 값이라 창구 경계 판정에 쓸 수 없다). until은 포함(<=)한다 -
+        호출부(OperationsDashboardService.summary())가 "지금"을 그대로 상한으로
+        넘기는데, 명령이 생성된 시각(별도 요청에서 찍힌 datetime.now())과 이
+        상한(그 다음 요청에서 다시 찍힌 datetime.now())이 OS 시계 분해능 때문에
+        정확히 같은 값으로 나올 수 있다 - 그런 경우까지 배제(<)하면 "방금 만든
+        건이 방금 조회한 통계에 안 잡히는" 경계 결함이 생긴다(실제로 전체
+        테스트 스위트를 함께 돌릴 때 간헐적으로 재현됨 - tests/integration/
+        test_api_operations.py 참고)."""
         stmt = select(ExternalCommand.status, func.count()).where(
             ExternalCommand.command_type.in_(WRITE_COMMAND_TYPES),
             ExternalCommand.created_at >= since,
-            ExternalCommand.created_at < until,
+            ExternalCommand.created_at <= until,
             ExternalCommand.status.in_(("SUCCESS", "FAILED")),
         )
         if command_type is not None:

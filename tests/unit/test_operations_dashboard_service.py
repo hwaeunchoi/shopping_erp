@@ -158,6 +158,21 @@ class TestSuccessRate:
         # 7일 창에는 포함된다.
         assert summary["success_rate"]["last_7d"]["total"] == 1
 
+    def test_command_created_exactly_at_now_is_included(self, db_session, platform):
+        """상한(until)은 포함(<=)한다 - 명령 생성 시각과 summary()가 계산한 now가
+        OS 시계 분해능 때문에 정확히 같은 값이 되는 경우가 실제로 있다(전체
+        테스트 스위트를 함께 돌릴 때 간헐적으로 재현된 회귀 - repositories/
+        integration_sync_repository.py의 success_rate_window 참고). 상한을
+        배타적(<)으로 두면 "방금 만든 건이 방금 조회한 통계에 안 잡히는"
+        결함이 생긴다."""
+        now = datetime.now(timezone.utc)
+        db_session.add(_make_command(platform, "SUCCESS", created_at=now.replace(tzinfo=None)))
+        db_session.commit()
+
+        summary = OperationsDashboardService(db_session).summary(now=now)
+        assert summary["success_rate"]["last_24h"]["total"] == 1
+        assert summary["success_rate"]["last_24h"]["success"] == 1
+
     def test_scope_limited_to_write_command_types(self, db_session, platform):
         """WRITE_COMMAND_TYPES 밖의 명령종류는 성공률 계산에 섞이지 않는다."""
         now = datetime.now(timezone.utc)
