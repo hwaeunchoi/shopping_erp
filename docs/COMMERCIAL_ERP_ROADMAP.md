@@ -148,27 +148,54 @@
   실패/외부성공-로컬커밋실패)은 절대 자동 재시도하지 않고 UNKNOWN/RECONCILIATION_REQUIRED로
   전환" 원칙과 DB-atomic claim/lease 동시성 제어를 그대로 적용해야 한다.
 
-### 3단계 - 상품/재고 동기화
+### 3단계 - 상품/재고 동기화 (구현 완료 - 네이버·쿠팡 MockTransport 계약 검증, 실계정 미검증)
 
-- **범위**: 네이버 상품 "수집"(`fetch_products`/`product_sync_job`)은 이미 운영 중이나
-  (capability matrix 참고, 1단계에서 변경 없음), 내부→채널 방향 "쓰기"(재고/가격/
-  품절 반영)와 나머지 채널의 상품 연동은 아직 없다. 이 단계에서 내부 상품/옵션/
-  재고를 채널별 상품 등록/수정/재고 동기화 API와 연동하고, 품절/가격 변경 시
-  다채널 반영, 채널 상품코드-내부 SKU 매칭 규칙을 정비한다.
-- **의존성**: `models/product.py`의 기존 `ProductOption`/`platform_option_id` 매칭
-  구조를 확장. 재고 동기화는 다건 배치 처리가 필요하므로 1단계의
-  `session.begin_nested()` 부분성공/격리 패턴을 재사용.
-- **완료 기준**: 재고 변경 이벤트가 outbox를 통해 각 채널로 전파되고, 채널 응답
-  실패 시 내부 재고와 채널 표시 재고 간 불일치를 감지/알림할 수 있어야 한다.
+- **실제 구현된 범위**: 내부 상품/옵션 → 채널 "쓰기" 4종을 outbox(`ExternalCommand`)
+  기반으로 구현했다 - 재고 전송(`INVENTORY_UPDATE`)·판매상태 전송
+  (`SALE_STATUS_UPDATE`)·단일 상품 등록(`PRODUCT_CREATE`)·옵션조합 상품 등록
+  (`PRODUCT_OPTION_CREATE`), 그리고 상품정보(이름/판매가/설명) 수정
+  (`PRODUCT_INFO_UPDATE`, **네이버만** - 쿠팡은 공식 계약 미확인으로
+  `supports_product_info_update`가 base 기본값 False를 그대로 상속). 네이버
+  상품 "수집"(`fetch_products`/`product_sync_job`)은 1단계 이전부터 운영 중이던
+  기능을 그대로 재사용했다(이번 단계에서 변경 없음).
+- **서비스/대량처리**: `services/product_sync_dispatch_service.py`(재고·판매상태·
+  정보수정)/`product_publish_service.py`(단일 등록)/
+  `product_option_publish_service.py`(옵션조합 등록) + 이 넷을 대량 접수·재처리로
+  묶는 `services/product_bulk_service.py`(항목별 독립 커밋/롤백, UNKNOWN 대량
+  재처리 차단, `/products-bulk` 화면).
+- **검증**: MockTransport 기반 커넥터 계약 테스트 + 서비스 단위테스트 + 격리
+  PostgreSQL 동시성 테스트(대상 잠금 경합, `acquire_target_lock`)로 확인했다 -
+  **실제 네이버·쿠팡 판매자 계정으로는 검증하지 않았다**(아래 "실계정 검증 전
+  필요 조건" 그대로 적용, 관련 기능 플래그
+  `product_channel_sync_enabled`/`product_publish_enabled`/
+  `product_info_update_enabled`/`product_option_publish_enabled` 모두 기본
+  False 유지).
+- **완료 기준(재확인)**: 재고 변경이 outbox를 통해 채널로 전파되고 채널 응답
+  실패 시 `RETRY_WAIT`/`FAILED`/`UNKNOWN`으로 안전하게 분류되는 것까지 확인했다 -
+  이 기준은 충족됐다(mock 계약 기준).
 
-### 4단계 - ESM/11번가/카카오 채널 확장
+### 4단계 - ESM/11번가/카카오 채널 확장 (부분 구현 - capability 투명성 화면만 완료, 실연동 전부 보류)
 
-- **범위**: 이미 `BaseMallConnector`를 상속한 `EsmConnector`/`ElevenstConnector`/
-  `KakaoShoppingConnector` 스텁에 실제 연동(주문 수집, 1~3단계 기능)을 채운다.
-- **의존성**: 1~3단계 패턴이 안정화된 이후 진행 - 신규 채널마다 동일한 outbox/
-  상태전이/캐패빌리티 설계를 반복 적용하면 되므로, 반드로 1~3단계 완료 후 시작.
-- **완료 기준**: 각 채널 공식 문서 기준 MockTransport 계약 테스트, capability
-  matrix의 해당 열이 실제 구현 항목만 True로 표시.
+- **실제 구현된 범위**: `GET /api/platforms/capability-matrix` + 설정 화면의
+  "채널 연동 현황" 탭 - 채널별 활성상태·공식 계약 확인 여부·확인된 기능
+  목록·마지막 성공/실패 시각을 있는 그대로 보여주는 **조회 전용** 기능이다.
+  11번가는 이 화면에서 비활성 + "공식 계약 미확인"으로 표시되고 어떤 capability도
+  True로 주장하지 않는다.
+  API Credential 등록 화면의 플랫폼 목록도 이 matrix를 쓰도록 바꿔 11번가가
+  선택은 가능해졌지만, 기존 "이 플랫폼은 아직 지원하지 않습니다" 가드가 그대로
+  걸려 Credential 저장 자체는 여전히 막혀 있다(11번가용 필드 정의를 추측해
+  만들지 않았다).
+- **11번가/ESM/카카오쇼핑 실연동은 전혀 구현하지 않았다**: `EsmConnector`/
+  `ElevenstConnector`/`KakaoShoppingConnector`는 여전히 `BaseMallConnector`의
+  더미 구현(`fetch_orders`가 고정된 가짜 데이터를 반환)뿐이고, `supports_*`
+  capability 플래그를 하나도 override하지 않아(전부 base 기본값 False 상속)
+  주문 수집을 포함한 어떤 기능도 실제로 채널을 호출하지 않는다 - 호출을
+  시도하면 `MarketplaceCapabilityUnsupportedError`로 명시적으로 거부된다.
+  `scripts/init_db.py`의 `DEFAULT_PLATFORMS`도 이 세 채널을 `is_active=False`로
+  시딩한다. 공식 판매자 API 문서가 확보되기 전까지는 이 상태를 유지한다.
+- **완료 기준(원안 대비)**: "각 채널 공식 문서 기준 MockTransport 계약 테스트"는
+  세 채널 모두 아직 시작하지 못했다 - 공식 문서 확보가 선행 조건이며 이번
+  범위에서 임의로 계약을 추정해 구현하지 않았다.
 
 ### 5-A단계 - 출고·택배 처리 통합 (구현 완료 - 창고 내부 워크플로우 한정)
 
@@ -580,6 +607,22 @@
   않았다). (4) scheduler "다음 실행 예정 시각"은 제공하지 않는다 - 그
   값은 스케줄러 프로세스 내부 상태(APScheduler)이고 이 API를 서비스하는
   프로세스에서 조회할 수 없다.
+- **릴리스 준비 상태(release candidate 통합 검증)**: `release/commercial-erp-candidate`
+  브랜치에서 1~6단계 전체를 대상으로 격리 환경(운영 Compose project와 완전히
+  분리된 고유 이름의 컨테이너·네트워크·PostgreSQL/Redis volume·호스트 포트)에
+  API/scheduler/web 이미지를 새 고유 태그로 빌드해 기동까지 확인했다 -
+  `alembic upgrade head`(단일 head)와 `scripts/init_db.py`가 성공하고, 신규
+  권한(`OPERATIONS_RETRY` 등) 백필 마이그레이션이 정상 동작하며, API/web
+  `/health`가 200을 반환하고, 로그인·운영 대시보드 요약·출고·CS API 기본
+  조회가 실제 DB 값을 반영함을 확인했다. 플랫폼 5개를 전부 비활성으로 두고
+  모든 외부 쓰기·동기화 기능 플래그를 기본값(False)으로 유지한 채 scheduler
+  잡이 실제로 도는 것까지 지켜봤고, 2분 주기 잡들이 전부
+  `{"skipped_disabled": 1}`로 종료되는 것을 로그로 직접 확인했다 - 이번
+  검증 동안 외부 채널로 나간 HTTP 요청은 0건이다. 검증 후 격리 자원은 전부
+  제거했고 운영 컨테이너 5개는 컨테이너ID/이미지ID/시작시각/재시작횟수가
+  검증 전후 동일함을 확인했다. **네이버·쿠팡 실계정 검증과 ESM·11번가·
+  카카오쇼핑 공식 계약 확인은 여전히 남아있다** - 이 문서의 각 단계 절에
+  명시된 그대로다.
 
 ## Capability Matrix (2-A단계 진행 현황)
 
