@@ -433,22 +433,153 @@
 - **완료 기준**: 택배사 실시간 조회 API 연동, 검증된 채널 답변 전송(outbox
   기반), CS 문의-주문라인 자동 매칭 화면.
 
-### 6단계 - 대량처리/대시보드 고도화
+### 6단계 - 통합 운영 대시보드·실패 재처리·통계 (구현 완료 - 조회·안전 재처리 한정)
 
-- **범위**: 대량 주문/송장/재고 일괄 처리 UI, 채널 통합 대시보드(동기화 실패율,
-  충돌 건수, 재시도 대기 건수 등 운영 지표).
-- **의존성**: `ExternalCommand` 아웃박스에 이미 쌓이는 상태/재시도 데이터를
-  집계하는 것이 핵심이므로, 1~5단계에서 쌓인 데이터가 있어야 의미 있는
-  대시보드가 된다.
-- **완료 기준**: 실패/재시도 대기 건수 대시보드, 대량 재처리(`submit_many`류) UI.
-- **알려진 한계(완결 검토에서 발견, 6단계에서 반드시 재검토)**:
-  `ShipmentDispatchService.submit_many()`는 건별로 SAVEPOINT(`session.begin_nested()`)로
-  격리하는데, 실패한 건은 `savepoint.rollback()`으로 그 건의 `ExternalCommand` 행
-  자체(INSERT 포함)까지 되돌아간다 - 즉 대량 처리에서 실패한 건은 outbox에 이력이
-  남지 않는다(반대로 API 엔드포인트가 쓰는 `enqueue()`+`outbox_dispatch_job` 경로는
-  건별로 독립 커밋하므로 이 문제가 없다). 대량처리 API를 만들 때는 SAVEPOINT
-  방식 대신 건별 독립 커밋(또는 실패해도 outbox 행은 보존하고 도메인 변경만
-  롤백하는 방식)으로 재설계해야 한다.
+- **범위**: 채널별 연동 상태/주문 수집/상품·재고 동기화/송장 전송/클레임·정산
+  수집/출고 진행/CS 처리/scheduler 잡 상태를 한 화면(`/operations`)에서 보고,
+  실패·재시도대기·UNKNOWN 건을 한 목록(통합 실패 작업함)에서 조회·안전하게
+  재처리한다. 기존 화면(출고관리/상품 대량처리/CS 관리/설정)은 그대로 두고
+  이 화면은 요약 + 진입점 역할만 한다 - 어떤 기존 기능도 재설계하지 않았다.
+- **새 집계 테이블을 만들지 않았다**: 전부 기존 테이블(`ExternalCommand`/
+  `IntegrationStatus`/`TaskExecutionHistory`/`OrderStatusConflict`/`CsCase`/
+  `FulfillmentBatchItem`/`Settlement`) 조회·`GROUP BY`로 계산한다 -
+  `services/operations_dashboard_service.py` 참고. 스키마 변경/마이그레이션
+  없음.
+- **명령 단위 이력이 있는 도메인 vs 없는 도메인**: 송장 전송/상품 등록/옵션조합
+  등록/재고 전송/판매상태 전송/상품정보 수정(`ExternalCommand` 6종)만 매
+  시도가 명령 행으로 남아 시도횟수·성공·실패·재시도대기·UNKNOWN을 명령
+  단위로 정확히 집계할 수 있다 - "최근 24시간/7일 명령 성공률"은 이 6종만
+  대상이다. 주문 수집/클레임 수집/정산 수집/채널 상태 재조회/CS 문의 수집은
+  읽기 전용 배치라 명령 단위 이력이 없고, 대신 플랫폼당 하나의 스냅샷
+  (`IntegrationStatus`)만 있다 - 이번 단계에서 `claim_sync_job`/
+  `settlement_sync_job`/`channel_status_sync_job`/`cs_inquiry_sync_job` 4개
+  잡에 `IntegrationStatus` 기록을 추가해(`order_collect_job`/`ad_collect_job`/
+  `product_sync_job`은 이미 기록 중이었다) 7개 integration_type(MALL/AD/
+  MALL_PRODUCT/CLAIM/SETTLEMENT/ORDER_STATUS_SYNC/CS_INQUIRY) 전체에서
+  "플랫폼별 마지막 성공·실패 시각"을 볼 수 있게 했다 - 그 잡들의 수집 로직
+  자체(중복방지/미매칭 보존/SAVEPOINT 격리 등)는 전혀 바꾸지 않았다.
+  "성공/부분성공/실패"의 "부분성공"은 CLAIM(취소/반품/교환 3종 중 일부만
+  성공)과 SETTLEMENT(회차 요약/상세 중 일부만 성공)에서만 실제로 관측되고,
+  ORDER_STATUS_SYNC/CS_INQUIRY 중 채널상태 재조회는 성공/실패 이분법이다
+  (한 플랫폼 처리 중 예외가 나면 그 플랫폼의 나머지 주문 전체를 건너뛰는
+  구조라 부분성공을 세분화할 근거가 없다 - 억지로 만들어내지 않았다).
+- **성공률 계산 기준**: `[since, now)` 구간에 **생성**(`created_at`)된 명령 중
+  SUCCESS/FAILED로 **확정**된 것만 분자·분모에 넣는다 - PENDING/RUNNING/
+  RETRY_WAIT/UNKNOWN/CANCELLED는 둘 다에서 제외한다(아직 처리 중이거나
+  최종 결과가 아님). 분모(성공+실패)가 0이면 0%가 아니라 `null`(화면
+  "N/A")을 반환한다. `completed_at`은 FAILED/RETRY_WAIT 경로에서 기록되지
+  않아(SUCCESS 확정 시에만 채워짐) 창구 경계 판정 기준으로 쓸 수 없어
+  `created_at`을 썼다 - `services/operations_dashboard_service.py` 모듈
+  docstring 및 `success_rate_window()` 참고.
+- **시간 기준**: 이 앱은 사용자별 timezone 설정이 없다(`users.theme_preference`는
+  있어도 timezone 컬럼은 없다) - 임의로 새 설정 화면을 만들지 않고, API는
+  항상 UTC 기준으로만 계산·응답한다(`utc_day_bounds()`). "오늘"은 UTC
+  캘린더일(자정~다음 자정, KST는 UTC+9라 KST 자정과 다르다 - 화면에 "UTC
+  기준"으로 명시), "최근 24시간/7일"은 now 기준 rolling window다. "오늘
+  수집된 주문"은 채널 주문일자(`order_date`)가 아니라 우리 DB 적재 시각
+  (`created_at`) 기준이다 - 늦게 수집된 주문은 채널 주문일자가 오늘이 아닐
+  수 있고 그 반대도 마찬가지라, "수집"의 의미에는 적재 시각이 맞다.
+  `end_date` 필터가 미래 시각으로 들어오면 서버가 현재 시각으로 자른다.
+- **통합 실패 작업함**: `GET /api/operations/failures`가 `ExternalCommand`
+  6종만 대상으로(향후 추가될 무관한 command_type이 섞이지 않게) `status`를
+  지정하지 않으면 FAILED/RETRY_WAIT/UNKNOWN/RUNNING만(정상 대기/성공/취소는
+  "실패"가 아니므로 기본 목록에서 제외) `limit`/`offset` 페이지네이션과
+  `id desc` 안정 정렬로 반환한다(limit 상한 200 - 무제한 전체 조회 없음).
+  통계(summary/timeseries)와 목록(failures)은 분리된 API라 자동 새로고침이
+  실패 행 전체를 다시 가져오지 않는다. 행에는 기능유형/채널/대상(내부 ID)/
+  상태/시도횟수/마지막 시도/다음 재시도/안전한 오류코드/상세화면 링크만
+  담는다 - 전화번호·주소·문의본문·답변초안·Authorization·자격증명·DB
+  연결정보·stack trace는 `ExternalCommand`에 애초에 저장되지 않는 값들이라
+  이 라우터의 어떤 응답에도 나타나지 않는다(모델 설계 자체가 안전한 요약만
+  저장 - `models/integration_sync.py` 참고).
+- **재처리 정책(기능별 상태로 다르게)**: FAILED만 `POST
+  /api/operations/failures/bulk-retry`로 선택 재처리할 수 있다 - 새 검증
+  로직을 만들지 않고 command_type별 기존 서비스(`ShipmentDispatchService`/
+  `ProductPublishService`/`ProductOptionPublishService`/
+  `ProductSyncDispatchService`)의 `retry_failed_command()`를 그대로 호출하는
+  라우팅 계층(`services/operations_retry_service.py`)만 새로 만들었다(검증을
+  우회하는 범용 DB 상태변경 없음). RETRY_WAIT은 예약된 `next_retry_at`만
+  표시하고 이 API로 조기 재시도할 수 없다(이번 단계 범위 밖 - 필요해지면
+  기존 outbox worker의 claim 경로를 통해서만 허용해야 한다). UNKNOWN은 이
+  API로 절대 재처리하지 않는다(outcome=`UNKNOWN_REQUIRES_RESOLUTION`) -
+  `POST /api/operations/failures/{id}/resolve-unknown`으로 운영자가 세 가지
+  해소값(CONFIRMED_SUCCESS/CONFIRMED_NOT_SENT/CONFIRMED_FAILED) 중 하나를
+  골라야만 벗어날 수 있고, 5자 이상의 확인 근거(evidence_note)를 반드시
+  입력해야 하며 이 근거는 `AuditLog`(command=`operations.resolve_unknown`)에
+  그대로 남는다(각 도메인 서비스 자체의 감사로그는 상태 전이만 기록하므로,
+  "왜 그렇게 판단했는가"는 이 서비스가 별도로 남긴다). RUNNING(정상이든
+  stale이든)은 이 API로 재처리하지 않는다 - stale 회수는 기존
+  `recover_stale_running()`(각 도메인 서비스, outbox worker가 매 실행 시작
+  시 호출)만의 몫이고, 대시보드는 읽기 전용으로 stale 여부만 표시할 뿐 회수
+  자체를 트리거하지 않는다.
+- **대량 재처리 트랜잭션·멱등 정책**: 항목마다 진짜
+  `commit()`/`rollback()`을 쓴다(SAVEPOINT 아님) - 뒤 항목의 rollback이 앞서
+  커밋된 항목의 결과를 지우지 않는다(이 절 상단에 있던 "알려진 한계" 그대로
+  반영 - `ShipmentDispatchService.submit_many()`의 SAVEPOINT 방식은 쓰지
+  않았다). 이미 처리 로직이 다루는 예상된 실패(`ValueError` - 대상 없음,
+  상태가 이미 바뀜 등)는 그 항목만 실패로 기록하고 배치를 계속 진행한다.
+  그 외 예외(DB 오류 등 세션 상태를 신뢰할 수 없는 경우)는 배치를 즉시
+  중단하고 아직 시도하지 않은 나머지 항목을 전부
+  `FAILED_TO_ENQUEUE(ABORTED_DUE_TO_PRIOR_ERROR)`로 명시적으로 표시한다 -
+  부분성공을 전체성공으로 위장하지 않는다. 같은 command_id를 중복 선택해도
+  한 번만 처리한다(요청 내 de-dup). 이미 PENDING으로 바뀐 명령을 다시
+  재처리 요청하면(중복 클릭/경합) 두 번째 시도는 `NOT_RETRYABLE
+  (CURRENT_STATUS_PENDING)`로 안전하게 거부된다(재처리 자체가 FAILED
+  상태만 대상으로 하는 조건부 검사이기 때문 - 별도 원자적 UPDATE...WHERE는
+  없지만, 두 번째 호출의 사전 상태 확인이 이미 막는다). 한 번에 최대
+  50건(`MAX_BULK_RETRY_ITEMS`), 선택 항목이 없거나 초과하면 400. 지원하지
+  않는 command_type은 `NOT_RETRYABLE(UNSUPPORTED_COMMAND_TYPE)`로 명시적으로
+  막는다. 작업 이력은 성공 시 `AuditLog`(command=`operations.bulk_retry`)에
+  수행자(`changed_by`)와 함께 남는다.
+- **권한**(`scripts/init_db.py` `DEFAULT_PERMISSIONS`): 조회는 새 권한을
+  만들지 않고 기존 `DASHBOARD_VIEW`(요약/시계열/연동상태/실패목록/실패상세)
+  와 `SYSTEM_MONITOR_VIEW`(scheduler 잡 상태)를 재사용한다(`api/routers/
+  tasks.py`가 기존 권한을 재사용하는 관례와 동일 - 조회 권한 신설 최소화).
+  상태를 바꾸는 두 동작만 신규 권한으로 분리했다: `OPERATIONS_RETRY`(대량
+  재처리), `OPERATIONS_UNKNOWN_RESOLVE`(UNKNOWN 해소) - CS_ASSIGN/CS_CLOSE를
+  CS_MANAGE와 분리한 관례와 동일하다. 둘 다 `_VIEW`로 끝나지 않아 Viewer
+  역할에 자동 부여되지 않는다(`code.endswith("_VIEW")` 휴리스틱 - CS_PII_DETAIL과
+  동일 관례). 조회 권한만 있고 이 두 권한이 없는 사용자는 실제로 403을
+  받는다(`tests/integration/test_api_operations.py`로 고정).
+- **심각도(INFO/WARNING/ERROR/CRITICAL)**: 오류 문자열 검색이 아니라
+  구조화된 필드(상태값·경과시간)와 `config/settings.py`의 숫자 임계값
+  (`ops_unknown_critical_after_hours`=24, `ops_stale_running_warning_after_minutes`=15,
+  `ops_integration_down_after_days`=3)만으로 분류한다
+  (`classify_integration_severity`/`_retry_one` 주변 로직 참고) - 이 값들은
+  화면 표시 전용이고 실제 재시도/회수 동작에는 영향을 주지 않는다.
+- **기능 플래그**: 이번 단계는 새 외부 채널 호출을 추가하지 않았다(조회
+  전용 + 기존에 이미 안전장치가 있는 재처리/해소 라우팅) - 그래서 새
+  기능 플래그가 없다. 4개 잡에 추가한 `IntegrationStatus` 기록도 그 잡들의
+  기존 기능 플래그(`claims_settlement_sync_enabled`/
+  `channel_status_sync_enabled`/`cs_inquiry_sync_enabled`, 전부 기본 False)
+  안에서만 실행되며, 플래그가 꺼져 있으면 그 잡들은 여전히 세션도 열지
+  않고 즉시 반환한다(이번 단계에서 그 가드 자체는 건드리지 않았다).
+- **프론트엔드**(`frontend/src/pages/OperationsDashboardPage.tsx`, `/operations`,
+  나비게이션 권한 `DASHBOARD_VIEW`): KPI 카드, 24시간/7일 성공률, 채널별
+  연동 상태 표, scheduler 잡 상태 표(권한 없으면 섹션 자체를 숨김), 7일
+  성공/실패 추이(기존 `MiniBarChart` 재사용 - 새 차트 라이브러리 추가 안
+  함), 통합 실패 작업함(필터/페이지네이션/대량선택/UNKNOWN 경고와 근거
+  입력/상세화면 링크). 새 훅 `useAutoRefreshData`(30초 간격)를 만들어
+  기존 `useApiData`는 건드리지 않았다(다른 화면 영향 없음) - 자동
+  새로고침 중 이전 요청보다 늦게 도착한 응답은 요청 ID 비교로 무시하고,
+  언마운트 후에는 `setState`를 호출하지 않으며, interval은 언마운트/자동
+  새로고침 끄기 시 정리된다. 실제 API(격리된 스크래치 SQLite)를 띄워
+  FAILED/UNKNOWN/SUCCESS 명령을 심어 라이브로 확인했다: 요약·목록이 실제
+  DB 값을 반영하고, UNKNOWN 해소와 대량 재처리 둘 다 실제로 상태를 바꾸고
+  대시보드가 즉시 갱신되며, 페이지를 떠난 뒤 폴링이 멈춘다. 375/768/1280px
+  확인 완료 - 375px의 사이드바 고정폭 오버플로는 다른 모든 화면과 공유하는
+  기존 전역 문제라 이번 커밋에서 손대지 않았다.
+- **알려진 제한사항(구현 안 함, 완료로 표현하지 않음)**: (1) 실패 행에서
+  해당 대상까지의 딥링크는 없다 - 기능유형에 맞는 화면(출고관리/상품
+  대량처리)으로만 이동하고 그 화면이 해당 행을 자동으로 열어주지는 않는다
+  (그 화면들이 URL 쿼리 파라미터로 초기 필터를 받지 않기 때문 -
+  `OrdersPage`만 지원). (2) RETRY_WAIT 조기 재시도(권한자 수동 트리거)는
+  만들지 않았다. (3) 클레임/정산의 "부분성공"은 잡 실행 단위로만 구분되고
+  플랫폼의 어느 하위 항목이 실패했는지는 이 대시보드에서 알 수 없다(작업
+  이력의 `result_summary` 원문을 봐야 한다 - 문자열 파싱으로 세분화하지
+  않았다). (4) scheduler "다음 실행 예정 시각"은 제공하지 않는다 - 그
+  값은 스케줄러 프로세스 내부 상태(APScheduler)이고 이 API를 서비스하는
+  프로세스에서 조회할 수 없다.
 
 ## Capability Matrix (2-A단계 진행 현황)
 
