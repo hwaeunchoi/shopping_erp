@@ -12,6 +12,7 @@ pydantic-settings를 사용하여 타입 검증과 기본값을 함께 관리한
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -126,6 +127,24 @@ class Settings(BaseSettings):
     ops_unknown_critical_after_hours: int = 24
     ops_stale_running_warning_after_minutes: int = 15
     ops_integration_down_after_days: int = 3
+
+    # PostgreSQL 예약 백업(scheduler/jobs/backup_job.py, services/postgres_backup_service.py) -
+    # database_url이 PostgreSQL일 때만 의미가 있다. False(기본값)면 pg_dump를 실행하지도,
+    # DB 세션을 열지도, backup 디렉터리에 쓰지도 않고 즉시 skipped_disabled를 반환한다
+    # (다른 상용 ERP 확장 플래그와 동일한 fail-closed 원칙). 기존 SQLite 백업
+    # (backup_dir/backup_retention_days/backup_max_count)과는 완전히 독립된 별도
+    # 설정이다 - 이 플래그를 켜도 SQLite 백업 로직은 전혀 영향받지 않는다.
+    postgres_backup_enabled: bool = False
+    # 컨테이너 내부 경로. docker-compose.yml에서 scheduler 서비스에만 이 경로로 호스트
+    # 디렉터리를 마운트한다(운영 활성화 절차는 DEPLOYMENT.md 참고). 저장소 내부
+    # 기본값(BASE_DIR/backup/postgres)은 기존 backup/*/ .gitignore 규칙에 이미 포함된다.
+    postgres_backup_dir: Path = BASE_DIR / "backup" / "postgres"
+    # 최신 N개만 보존한다 - 최소 2 미만은 "새 백업 검증 직후 마지막 정상 백업까지
+    # 동시에 사라질 위험"이 있어 fail-closed로 차단한다(services/postgres_backup_service.py
+    # 참고, 아래 ge=2).
+    postgres_backup_retention_count: int = Field(default=5, ge=2)
+    # pg_dump 실행 제한시간(초). 초과 시 자식 프로세스를 종료하고 DUMP_TIMEOUT으로 기록한다.
+    postgres_backup_timeout_seconds: int = Field(default=600, gt=0)
 
     model_config = SettingsConfigDict(env_file=str(BASE_DIR / ".env"), env_file_encoding="utf-8", extra="ignore")
 

@@ -1,14 +1,19 @@
 """
 scheduler/jobs/backup_job.py
 ---------------------------------
-DB 파일을 backup_dir로 복사하고 backup_history에 기록한 뒤, 보관정책
-(backup_retention_days/backup_max_count, config/settings.py)에 따라
-오래된 백업을 정리한다.
+DB 종류에 따라 백업 구현을 분기하는 얇은 진입점.
 
-현재는 SQLite 파일 복사 방식으로만 구현되어 있다. PostgreSQL로 전환하면
-이 구현은 pg_dump 기반으로 교체해야 한다(설계 방침: core/database.py의
-DATABASE_URL 교체만으로 나머지 계층은 그대로 두는 것과 동일한 원칙이지만,
-백업은 DB 엔진에 종속적인 작업이라 이 잡만 별도로 교체가 필요하다).
+- SQLite: DB 파일을 backup_dir로 복사하고 backup_history에 기록한 뒤, 보관정책
+  (backup_retention_days/backup_max_count, config/settings.py)에 따라 오래된
+  백업을 정리한다(기존 구현 그대로 - 상용 ERP 확장(PostgreSQL 예약 백업)
+  작업으로 동작을 바꾸지 않았다).
+- PostgreSQL: services/postgres_backup_service.py로 위임한다(pg_dump
+  --format=custom + pg_restore --list 구조 검증 + SHA-256 + 원자적 전환 +
+  보존정책 + advisory lock 기반 동시 실행 방지). settings.postgres_backup_enabled가
+  기본 False라 별도 활성화 전에는 이 분기도 즉시 skipped_disabled를 반환한다
+  (import도 postgres_backup_service.run_backup_job() 안에서 첫 줄에 플래그를
+  확인하므로, OFF 상태에서 DB 세션·pg_dump 실행·backup 디렉터리 접근이 전혀
+  없다는 보장은 그 모듈이 그대로 진다).
 """
 
 import shutil
@@ -23,9 +28,20 @@ from repositories.system_repository import BackupHistoryRepository
 
 
 def run() -> dict:
-    if not settings.database_url.startswith("sqlite"):
-        raise NotImplementedError("SQLite 이외 DB의 백업은 아직 지원하지 않습니다 (pg_dump 등으로 교체 필요).")
+    if settings.database_url.startswith("sqlite"):
+        return _run_sqlite_backup()
 
+    if settings.database_url.startswith(("postgresql", "postgres")):
+        from services import postgres_backup_service
+
+        return postgres_backup_service.run_backup_job()
+
+    raise NotImplementedError(
+        f"지원하지 않는 DB 엔진입니다: {settings.database_url.split(':', 1)[0]} (SQLite/PostgreSQL만 지원)."
+    )
+
+
+def _run_sqlite_backup() -> dict:
     db_path = Path(settings.database_url.replace("sqlite:///", "", 1))
     now = datetime.now(timezone.utc)
     # .gitignore의 backup/*/ 패턴(하위 디렉터리만 무시)에 맞춰 날짜별 하위 디렉터리에 저장한다.
@@ -51,14 +67,15 @@ def run() -> dict:
                 status=status_,
                 error_message=error_message,
                 created_at=now,
+                engine="SQLITE",
             )
         )
 
-    removed = _apply_retention()
+    removed = _apply_sqlite_retention()
     return {"status": status_, "file_path": str(backup_path), "removed_old_backups": removed}
 
 
-def _apply_retention() -> int:
+def _apply_sqlite_retention() -> int:
     """backup_retention_days보다 오래됐거나 backup_max_count를 초과하는 백업 파일을 삭제한다."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=settings.backup_retention_days)
     backups = sorted(settings.backup_dir.glob("*/erp_*.db"), key=lambda p: p.stat().st_mtime, reverse=True)

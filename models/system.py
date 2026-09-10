@@ -35,16 +35,32 @@ class SystemLog(Base):
 
 
 class BackupHistory(Base):
-    """DB 백업 이력."""
+    """DB 백업 이력.
+
+    engine/sha256/error_code/retained_count는 상용 ERP 확장(PostgreSQL 예약 백업,
+    services/postgres_backup_service.py)에서 추가했다 - 기존 SQLite 백업 경로
+    (scheduler/jobs/backup_job.py의 _run_sqlite_backup)는 이 신규 컬럼들을 채우지
+    않는다(전부 nullable, 기존 행과 하위호환). status는 SQLite 경로가 쓰는
+    SUCCESS/FAILED에 PostgreSQL 경로가 쓰는 PARTIAL_SUCCESS(백업 자체는 성공했지만
+    보존정책 정리만 실패)/ALREADY_RUNNING(동시 실행 방지 lock에 막혀 건너뜀)이
+    추가된다 - 이 두 값은 "실패"로 집계하지 않는다(services/alert_evaluation_service.py의
+    BACKUP_FAILURE 지표는 status=="FAILED"만 실패로 본다). error_message에는 예외
+    메시지 원문 대신 항상 안전하게 요약된 문자열만 저장한다(DB URL/비밀번호/dump
+    내용/테이블 데이터/실제 PII/stderr 원문 전체 금지 - services/postgres_backup_service.py
+    모듈 docstring 참고)."""
 
     __tablename__ = "backup_history"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     file_path: Mapped[str] = mapped_column(String(255), nullable=False)
     file_size_bytes: Mapped[Optional[int]] = mapped_column(nullable=True)
-    status: Mapped[str] = mapped_column(String(20), nullable=False)  # SUCCESS/FAILED
+    status: Mapped[str] = mapped_column(String(20), nullable=False)  # SUCCESS/FAILED/PARTIAL_SUCCESS/ALREADY_RUNNING
     error_message: Mapped[Optional[str]] = mapped_column(String(2000), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    engine: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)  # SQLITE/POSTGRES
+    sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    error_code: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    retained_count: Mapped[Optional[int]] = mapped_column(nullable=True)
 
 
 class SystemSetting(Base):
