@@ -123,14 +123,131 @@ Redis를 실제로 활용하는 것은 새 기능 추가에 해당해 이번 "�
 ## 7. 백업/복구
 
 - `scheduler` 컨테이너가 매일 새벽 3시(UTC) `backup_job.run()`으로 DB를
-  백업합니다(`erp_backup` named volume, 보관정책은 `BACKUP_RETENTION_DAYS`/
-  `BACKUP_MAX_COUNT` 환경변수로 설정).
-- PostgreSQL 전환 후에는 `backup_job.py`가 SQLite 파일 복사 방식이 아니라
-  `pg_dump` 등으로 교체되어야 합니다 — 현재 `backup_job.py`는 SQLite 외
-  DB에서는 `NotImplementedError`를 발생시키도록 명시적으로 막아뒀습니다
-  (자세한 내용은 해당 파일 주석 참고). **PostgreSQL 운영 전환 시 반드시
-  이 부분을 `pg_dump` 기반으로 교체해야 자동 백업이 동작합니다** — 이번
-  "신규 기능 추가 금지" 범위상 구현하지 않고 리스크로 남깁니다.
+  백업합니다. DB 엔진에 따라 자동으로 구현이 갈립니다(`scheduler/jobs/backup_job.py`):
+  - **SQLite**: 기존 그대로 DB 파일을 `erp_backup` named volume에 복사합니다
+    (보관정책은 `BACKUP_RETENTION_DAYS`/`BACKUP_MAX_COUNT`).
+  - **PostgreSQL**: `services/postgres_backup_service.py`가 `pg_dump
+    --format=custom`으로 백업하고 `pg_restore --list`로 구조를 검증합니다
+    (아래 7.1 참고). **기본값은 비활성화(OFF)입니다** — 운영자가 명시적으로
+    켜기 전에는 scheduler가 매일 이 잡을 실행은 하지만 즉시
+    `skipped_disabled`로 끝나고, DB 세션도 pg_dump도 전혀 실행하지 않습니다.
+
+### 7.1 PostgreSQL 예약 백업 활성화 절차
+
+**기본 OFF입니다.** 아래 절차를 완료하기 전까지는 `POSTGRES_BACKUP_ENABLED`를
+`true`로 바꾸지 마십시오.
+
+**1) 호스트 백업 디렉터리 준비 (Windows)**
+
+저장소 안(`./backup/postgres`, 기본값)이 아니라 **저장소 밖의 전용 디렉터리**를
+쓰는 것을 권장합니다. 예: `C:\erp_backups\postgres`.
+
+```powershell
+New-Item -ItemType Directory -Force -Path "C:\erp_backups\postgres"
+$acl = Get-Acl "C:\erp_backups\postgres"
+$acl.SetAccessRuleProtection($true, $false)
+$acl.SetOwner([System.Security.Principal.WindowsIdentity]::GetCurrent().User)
+foreach ($id in @($env:USERNAME, 'NT AUTHORITY\SYSTEM', 'BUILTIN\Administrators')) {
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($id, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+    $acl.AddAccessRule($rule)
+}
+Set-Acl -Path "C:\erp_backups\postgres" -AclObject $acl
+```
+
+> Docker Desktop(Windows)에서 컨테이너는 이 디렉터리에 `appuser`(uid 1000)
+> 권한으로 씁니다. 컨테이너 내부 `chmod 0700`은 이 모듈이 시도하지만
+> **Windows 호스트 bind mount는 컨테이너 내부 chmod만으로 완전히 제어되지
+> 않습니다** — 위 ACL 설정(관리자·SYSTEM·현재 사용자로 제한)이 실질적인
+> 접근 통제입니다. 이 디렉터리를 다른 사용자와 공유하거나 클라우드 동기화
+> 폴더(OneDrive 등) 안에 두지 마십시오 — 백업에는 전체 DB 스키마와 데이터가
+> 들어 있습니다(암호화되지 않은 custom-format dump).
+
+**2) `.env`에 값 추가**
+
+```
+POSTGRES_BACKUP_ENABLED=true
+POSTGRES_BACKUP_HOST_DIR=C:\erp_backups\postgres
+POSTGRES_BACKUP_RETENTION_COUNT=5
+POSTGRES_BACKUP_TIMEOUT_SECONDS=600
+```
+
+- `POSTGRES_BACKUP_RETENTION_COUNT`는 최소 2 이상이어야 합니다(1 이하는
+  `services/postgres_backup_service.py`가 fail-closed로 거부합니다 - 방금
+  만든 백업 검증 직후 직전 정상 백업까지 한꺼번에 사라질 위험을 막기
+  위함입니다).
+- `POSTGRES_BACKUP_TIMEOUT_SECONDS`는 실제 DB 크기에 맞춰 넉넉하게
+  잡으십시오 - 초과 시 `pg_dump` 자식 프로세스가 즉시 종료되고
+  `DUMP_TIMEOUT`으로 기록됩니다.
+
+**3) candidate 이미지 재빌드 및 scheduler만 재기동**
+
+이 기능은 Dockerfile에 `postgresql-client-16`(운영 db와 동일한 major
+version)을 추가했으므로, 기존 이미지를 그대로 쓰면 `pg_dump`/`pg_restore`가
+없어 `TOOL_MISSING`으로 실패합니다. candidate 이미지를 새로 빌드하고
+scheduler 컨테이너에 적용해야 합니다(release-candidate 검증 절차와 동일 -
+기존 rollback 태그 보존, 운영 DB/컨테이너 나머지는 그대로).
+
+**4) 수동 1회 dry-run 검증 (운영 활성화 전 필수)**
+
+운영 컨테이너를 재기동하기 전에, **격리된 임시 PostgreSQL**로 먼저
+확인하십시오(운영 DB에는 어떤 검증 단계에서도 연결하지 마십시오):
+
+```bash
+python -m pytest tests/integration/test_postgres_backup_restore_pg.py -v
+```
+
+이 테스트가 실제로 하는 일:
+1. 격리 네트워크에 SOURCE/TARGET PostgreSQL 컨테이너 두 개를 만든다.
+2. SOURCE에 `alembic upgrade head` + 합성 시드 데이터를 넣는다.
+3. 이 저장소의 Dockerfile로 빌드한 러너 이미지 안에서
+   `postgres_backup_service.run_backup_job()`을 실제로 실행한다.
+4. 만들어진 dump에 `pg_restore --list`가 통과했는지 확인한다(백업 자체가
+   이미 이 단계를 거치지만, 테스트가 독립적으로 다시 확인한다).
+5. **별도의 빈 TARGET DB로 실제 복원**을 수행하고, Alembic revision·테이블
+   수·권한 코드 집합 해시·역할별 권한 개수·플랫폼 활성 상태가 SOURCE와
+   완전히 일치하는지 비교한다.
+6. 동시 실행 방지(advisory lock)를 검증한다.
+7. 끝나면 컨테이너·네트워크·볼륨·이미지를 전부 삭제한다.
+
+운영 전환 전에는 **반드시** 이 테스트가 통과함을 확인하고, 운영과 최대한
+비슷한 조건(비슷한 DB 크기)에서 한 번 더 별도 격리 환경으로 재현해보는
+것을 권장합니다.
+
+**5) 첫 실제 백업 후 확인**
+
+- 운영 대시보드(스케줄러 잡 상태)에서 `backup` job이 더 이상 FAILED가
+  아닌지 확인합니다.
+- `POSTGRES_BACKUP_HOST_DIR`에 `erp_postgres_<타임스탬프>_UTC.dump` +
+  `.sha256` + `.manifest.json` 세 파일이 생겼는지 확인합니다.
+- `.sha256` 파일의 해시가 실제 dump 파일과 일치하는지
+  (`sha256sum -c` 또는 동등한 도구로) 별도로 재확인하는 것을 권장합니다.
+
+### 7.2 용량 모니터링
+
+- `POSTGRES_BACKUP_RETENTION_COUNT`개까지만 보존되지만, 각 dump 크기는
+  DB가 커질수록 늘어납니다 - 호스트 디스크 여유 공간을 정기적으로
+  확인하십시오(`erp_backup` named volume/Docker 전체 디스크 사용량과는
+  별개입니다).
+- retention 정리가 실패해도(예: 파일 잠금) 백업 자체는 `PARTIAL_SUCCESS`로
+  성공 처리되고 새 백업 파일은 보존됩니다 - 이 경우 오래된 백업이 계속
+  쌓일 수 있으므로 `backup_history` 테이블의 `status='PARTIAL_SUCCESS'`
+  행과 `error_code='RETENTION_FAILURE'`를 주기적으로 확인하십시오.
+
+### 7.3 중요 - 백업 성공이 복원 성공을 보장하지 않는다
+
+이 기능은 `pg_dump` 종료코드 확인, 결과 파일이 비어 있지 않은지 확인,
+`pg_restore --list`로 아카이브 구조가 읽히는지 확인, SHA-256 무결성까지
+확인합니다 - 그러나 이는 **"복원 가능한 형태로 파일이 만들어졌다"**는
+것만 보증할 뿐, 실제 재해복구 시나리오에서 정상 복원되어 서비스가
+재개된다는 것까지 자동으로 보증하지 않습니다. 실제 운영 DB의 복원은:
+
+- 반드시 별도 승인을 받은 별개 작업으로 진행하십시오(이 기능 자체는
+  복원을 수행하지 않습니다 - `pg_restore`를 운영 DB에 실행하는 코드는
+  이 저장소 어디에도 없습니다).
+- 주기적으로(예: 분기 1회) 실제 백업 파일 하나를 골라 격리된 임시
+  PostgreSQL에 복원해보고 애플리케이션이 정상 기동하는지까지 확인하는
+  것을 권장합니다(위 7.1의 dry-run 테스트와 같은 방식이되, 실제 최신
+  운영 백업 파일을 입력으로 사용).
 
 ## 8. Secret 회전 절차 (JWT / Credential 암호화 키)
 
