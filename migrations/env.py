@@ -23,7 +23,18 @@ from config.settings import settings  # noqa: E402
 from models import Base  # noqa: E402  (모든 모델을 import하는 models/__init__.py)
 
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.database_url)
+# Alembic Config는 내부적으로 configparser.ConfigParser(BasicInterpolation)를
+# 쓴다 - percent-encoded 비밀번호가 포함된 DATABASE_URL(예: %40, %3A)을 그대로
+# set_main_option()에 넘기면, 이후 run_migrations_offline()의
+# get_main_option()이나 run_migrations_online()의 get_section()이 값을
+# 읽어올 때(둘 다 동일한 interpolation 엔진을 거친다) 단독 "%" 문자를 보간
+# 참조(%(name)s)의 시작으로 오인해 InterpolationSyntaxError를 던진다.
+# alembic.ini의 file_template(%%(year)d...)이 이미 쓰는 것과 동일한 "%%는
+# 리터럴 %"라는 ConfigParser 공식 이스케이프 규칙을 여기서도 그대로 적용한다 -
+# 저장 시 한 번만 이스케이프해두면 아래 두 함수는 수정 없이 원래 URL을 그대로
+# 돌려받는다(비밀번호 문자를 제한/제거/재인코딩하지 않는다 - % 자체만
+# 이스케이프해 ConfigParser를 통과시킬 뿐, 값 자체는 그대로다).
+config.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
