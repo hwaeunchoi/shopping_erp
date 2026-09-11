@@ -66,6 +66,16 @@ services:
 
   api:
     build: .
+    # API_IMAGE 미설정 시 `shopping_erp-api`(compose 프로젝트명-서비스명 기본
+    # 규칙, 기존 개발용 docker compose build/up과 완전히 동일)로 폴백한다.
+    # 운영에서는 .env에 API_IMAGE=shopping_erp_candidate/api:<태그>를 넣어
+    # immutable candidate 이미지를 명시적으로 고정한다 - base compose 파일만
+    # 다시 적용해도(override 없이) 이 값이 그대로 선택되어, migration은
+    # 새 이미지로 실행했는데 컨테이너 재기동 시 구 이미지로 되돌아가는
+    # 사고(2026-09-11 API 크래시 루프 원인)를 구조적으로 막는다. `:-`는
+    # 값이 비어 있어도(빈 문자열) 기본값으로 폴백한다 - 실수로 빈 줄만
+    # 남겨도 안전하게 개발용 기본값을 쓴다(DEPLOYMENT.md 참고).
+    image: ${API_IMAGE:-shopping_erp-api}
     container_name: erp-api
     restart: unless-stopped
     depends_on:
@@ -89,6 +99,11 @@ services:
 
   scheduler:
     build: .
+    # SCHEDULER_IMAGE 미설정 시 `shopping_erp-scheduler`로 폴백한다(api와 동일한
+    # 원리 - 위 api 서비스 주석 참고). 운영에서는 SCHEDULER_IMAGE를 API_IMAGE와
+    # 반드시 같은 커밋의 candidate 태그로 맞춰야 한다 - scripts/verify_deploy_images.py로
+    # 배포 절차에서 이 둘이 다른 커밋을 가리키면 즉시 탐지한다(DEPLOYMENT.md 참고).
+    image: ${SCHEDULER_IMAGE:-shopping_erp-scheduler}
     container_name: erp-scheduler
     restart: unless-stopped
     depends_on:
@@ -122,6 +137,11 @@ services:
 
   web:
     build: ./frontend
+    # WEB_IMAGE 미설정 시 `shopping_erp-web`로 폴백한다(api/scheduler와 동일한
+    # 원리). web은 api/scheduler와 독립적으로 배포될 수 있으므로(정적 파일만
+    # 서빙, DB migration과 무관) 같은 커밋일 필요는 없지만, revision 라벨은
+    # 배포 절차에서 별도로 확인한다(DEPLOYMENT.md 참고).
+    image: ${WEB_IMAGE:-shopping_erp-web}
     container_name: erp-web
     restart: unless-stopped
     depends_on:

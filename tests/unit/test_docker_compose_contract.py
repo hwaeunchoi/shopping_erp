@@ -68,6 +68,57 @@ class TestWebHasNoBackendSecret:
         assert "environment" not in web
 
 
+class TestImagePinningFallback:
+    """운영 이미지 암묵적 선택 사고(2026-09-11 API 크래시 루프 - migration은
+    새 candidate 이미지로 실행했는데 api 컨테이너는 build: .의 기본 이미지
+    이름으로 재기동되어, 운영 DB가 이미 그 이미지의 migration 스크립트에
+    없는 revision에 있던 사고) 재발 방지 계약을 정적으로 검증한다."""
+
+    _IMAGE_VARS = {"api": "API_IMAGE", "scheduler": "SCHEDULER_IMAGE", "web": "WEB_IMAGE"}
+    _DEFAULT_NAMES = {"api": "shopping_erp-api", "scheduler": "shopping_erp-scheduler", "web": "shopping_erp-web"}
+
+    def test_each_service_has_fallback_image_with_dash_default_syntax(self):
+        """`${VAR:-default}` 문법이어야 한다(`:-`는 빈 문자열도 기본값으로
+        폴백한다 - `-`만 쓰면 "설정은 됐지만 빈 문자열"인 경우 빈 문자열이
+        그대로 쓰여 위험한 image: 빈 값이 될 수 있다)."""
+        compose = _load_compose()
+        for service, var in self._IMAGE_VARS.items():
+            image_expr = compose["services"][service]["image"]
+            assert (
+                image_expr == f"${{{var}:-{self._DEFAULT_NAMES[service]}}}"
+            ), f"{service}.image이 예상한 폴백 표현식이 아닙니다: {image_expr!r}"
+
+    def test_build_directive_still_present_for_dev_workflow(self):
+        """`build:`를 지우지 않는다 - 기존 `docker compose build/up --build`
+        개발 워크플로가 그대로 동작해야 한다(image:는 병행 - build 결과물의
+        태그 이름만 명시적으로 고정한다)."""
+        compose = _load_compose()
+        assert compose["services"]["api"]["build"] == "."
+        assert compose["services"]["scheduler"]["build"] == "."
+        assert compose["services"]["web"]["build"] == "./frontend"
+
+    def test_no_literal_candidate_or_operational_image_tag_hardcoded(self):
+        """실제 운영 이미지 값(타임스탬프-커밋SHA 형태의 candidate 태그)을
+        `image:` 필드 자체에 하드코딩하지 않는다 - 오직 폴백용 기본 이름
+        (shopping_erp-*)과 환경변수 참조만 있어야 한다. 설명 주석에서
+        candidate 태그 형태를 예시로 언급하는 것은 허용한다(주석은 검사
+        대상이 아니다 - 파싱된 image: 값만 본다)."""
+        compose = _load_compose()
+        for service in self._IMAGE_VARS:
+            image_expr = compose["services"][service]["image"]
+            assert "shopping_erp_candidate/" not in image_expr
+            assert "shopping_erp_rollback/" not in image_expr
+
+    def test_default_names_match_actual_compose_project_derivation(self):
+        """폴백 기본값(shopping_erp-api 등)이 실제 compose 프로젝트명-서비스명
+        자동 파생 규칙과 일치해야 한다 - 그래야 API_IMAGE 등을 아예 설정하지
+        않은 기존 개발 환경의 이미지 이름이 이번 변경 전후로 완전히 동일하다
+        (project name은 docker-compose.yml이 위치한 디렉터리명 'shopping_erp'
+        에서 온다)."""
+        for service, default_name in self._DEFAULT_NAMES.items():
+            assert default_name == f"shopping_erp-{service}"
+
+
 class TestNoDemoDefaultsLeaked:
     def test_no_known_demo_secret_literal_in_file(self):
         text = _raw_text()
