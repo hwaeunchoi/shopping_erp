@@ -37,12 +37,53 @@ from sqlalchemy import create_engine, event  # noqa: E402
 from sqlalchemy.engine import Engine  # noqa: E402
 from sqlalchemy.orm import Session, sessionmaker  # noqa: E402
 
+from config.settings import Settings  # noqa: E402
 from models import Base  # noqa: E402
 from models.customer import Customer  # noqa: E402
 from models.inventory import Inventory, Warehouse  # noqa: E402
 from models.platform import Platform, PlatformFeeRule  # noqa: E402
 from models.product import Product, ProductOption, ProductPlatformMap  # noqa: E402
 from models.supplier import Supplier  # noqa: E402
+
+
+@pytest.fixture()
+def isolated_default_settings(monkeypatch) -> Settings:
+    """config.settings.Settings 필드의 "기본값"을 로컬 개발자·운영자의 실제
+    .env 파일이나 셸 환경변수와 완전히 무관하게 검증하려는 테스트 전용
+    픽스처(예: "OFF가 기본값" 계열 테스트 - tests/unit/test_postgres_backup_service.py
+    TestDisabledByDefault 참고).
+
+    왜 필요한가: config.settings.settings는 get_settings()의 @lru_cache로
+    프로세스당 정확히 한 번만 만들어지는 모듈 싱글턴이고, 그 인스턴스화 시점에
+    실제 저장소 루트의 .env 파일(model_config의 env_file - 애플리케이션의
+    정상 운영 동작이라 이 파일 자체는 건드리지 않는다)을 그대로 읽는다. 로컬
+    개발/운영 작업 중 그 .env에 예: POSTGRES_BACKUP_ENABLED=true처럼 실제
+    운영 승인을 받아 켜둔 플래그가 있으면, "기본값은 False"라고 주장하는
+    테스트가 실제 파일 내용을 그대로 보고 실패한다(회귀가 아니라 테스트
+    격리 결함 - 개발자마다, 시점마다 결과가 달라진다).
+
+    이 픽스처는 매번 새 Settings 인스턴스를 만들되:
+    - `_env_file=None`으로 그 인스턴스만 .env 파일을 읽지 않게 한다
+      (pydantic-settings가 공식 지원하는 인스턴스별 오버라이드 - Settings의
+      model_config 자체나 애플리케이션이 실제로 쓰는 config.settings.settings
+      싱글턴에는 전혀 영향이 없다).
+    - Settings의 모든 필드 이름에 대응하는 환경변수(대문자 변환)를 monkeypatch로
+      제거해, 혹시 셸에 같은 이름의 환경변수가 실제로 export돼 있어도(파일이
+      아니라 셸 환경 오염) 함께 차단한다 - POSTGRES_BACKUP_ENABLED 하나만이
+      아니라 모든 필드를 일괄 대상으로 하므로 이후 이런 종류의 "기본값" 테스트가
+      늘어나도 같은 오염 위험이 자동으로 차단된다.
+    - get_settings()의 lru_cache는 건드리지 않는다 - 이 픽스처가 만드는 것은
+      그 캐시와 무관한 완전히 별개의 인스턴스라 초기화할 대상 자체가 없다
+      (애플리케이션이 실제로 쓰는 config.settings.settings 싱글턴은 이 테스트
+      전후로 조금도 바뀌지 않는다).
+    - monkeypatch만 쓰므로 테스트 종료 시 pytest가 환경변수를 자동으로
+      원상복구한다(cwd는 이 픽스처가 아예 바꾸지 않는다) - 테스트 실행 순서와
+      무관하게 항상 클래스 필드 기본값 그대로를 돌려준다.
+    """
+    for field_name in Settings.model_fields:
+        monkeypatch.delenv(field_name.upper(), raising=False)
+
+    return Settings(_env_file=None)  # type: ignore[call-arg]
 
 
 @pytest.fixture()

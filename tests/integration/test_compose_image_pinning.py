@@ -37,7 +37,11 @@ _KNOWN_MATCHING_PAIR = {
     "api": "shopping_erp_candidate/api:20260910_041113-b5d9485",
     "scheduler": "shopping_erp_candidate/scheduler:20260910_041113-b5d9485",
 }
+_KNOWN_BACKEND_REVISION = "b5d94851b6c44a9e52feea3f3dd95351c9573d93"
 _KNOWN_MISMATCHED_SCHEDULER = "shopping_erp_candidate/scheduler:20260909_110251-f87295b"
+# 프론트 변경이 없어 backend보다 이전 커밋 이미지를 그대로 쓰는 실제 시나리오.
+_KNOWN_WEB_IMAGE = "shopping_erp_candidate/web:20260909_054605-434a3d0"
+_KNOWN_WEB_REVISION = "434a3d040259a022504299440474b85a6fc8dd64"
 
 
 def _docker_available() -> bool:
@@ -207,17 +211,9 @@ class TestRealCandidateImageRevisionVerification:
         if missing:
             pytest.skip(f"이 테스트에 필요한 로컬 이미지가 없어 skip합니다: {missing}")
 
-    def test_known_matching_pair_passes_verification_script(self, docker_ready):
-        self._require_images(*_KNOWN_MATCHING_PAIR.values())
-        result = subprocess.run(
-            [
-                "python",
-                "scripts/verify_deploy_images.py",
-                "--api-image",
-                _KNOWN_MATCHING_PAIR["api"],
-                "--scheduler-image",
-                _KNOWN_MATCHING_PAIR["scheduler"],
-            ],
+    def _run_script(self, args: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["python", "scripts/verify_deploy_images.py", *args],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
@@ -225,31 +221,94 @@ class TestRealCandidateImageRevisionVerification:
             errors="replace",
             timeout=30,
             env={**__import__("os").environ, "PYTHONUTF8": "1"},
+        )
+
+    def test_known_matching_pair_passes_verification_script(self, docker_ready):
+        """--expected-backend-revision을 명시한다 - 생략하면 git HEAD를 자동
+        추론하는데, 이 저장소의 HEAD는 이미지가 빌드된 시점 이후로 계속
+        앞서가므로(커밋마다 값이 달라짐) 이 테스트는 "그 시점의 특정 커밋
+        쌍"을 검증하는 것이지 "지금 이 순간의 HEAD"를 검증하는 게 아니다."""
+        self._require_images(*_KNOWN_MATCHING_PAIR.values())
+        result = self._run_script(
+            [
+                "--api-image",
+                _KNOWN_MATCHING_PAIR["api"],
+                "--scheduler-image",
+                _KNOWN_MATCHING_PAIR["scheduler"],
+                "--expected-backend-revision",
+                _KNOWN_BACKEND_REVISION,
+            ]
         )
         assert result.returncode == 0, result.stdout + result.stderr
         assert "[PASS]" in result.stdout
 
     def test_known_mismatched_pair_fails_verification_script(self, docker_ready):
         self._require_images(_KNOWN_MATCHING_PAIR["api"], _KNOWN_MISMATCHED_SCHEDULER)
-        result = subprocess.run(
-            [
-                "python",
-                "scripts/verify_deploy_images.py",
-                "--api-image",
-                _KNOWN_MATCHING_PAIR["api"],
-                "--scheduler-image",
-                _KNOWN_MISMATCHED_SCHEDULER,
-            ],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=30,
-            env={**__import__("os").environ, "PYTHONUTF8": "1"},
+        result = self._run_script(
+            ["--api-image", _KNOWN_MATCHING_PAIR["api"], "--scheduler-image", _KNOWN_MISMATCHED_SCHEDULER]
         )
         assert result.returncode == 1
         assert "다른 커밋" in result.stdout
+
+    def test_known_backend_and_web_from_different_commits_both_pass(self, docker_ready):
+        """실제 운영 시나리오: backend는 새 커밋(b5d9485)으로 배포하지만
+        web은 프론트 변경이 없어 이전 커밋(434a3d0) 이미지를 그대로 쓴다 -
+        서로 다른 커밋이어도 각자 자신의 기대값과 일치하면 통과해야 한다."""
+        self._require_images(*_KNOWN_MATCHING_PAIR.values(), _KNOWN_WEB_IMAGE)
+        result = self._run_script(
+            [
+                "--api-image",
+                _KNOWN_MATCHING_PAIR["api"],
+                "--scheduler-image",
+                _KNOWN_MATCHING_PAIR["scheduler"],
+                "--web-image",
+                _KNOWN_WEB_IMAGE,
+                "--expected-backend-revision",
+                _KNOWN_BACKEND_REVISION,
+                "--expected-web-revision",
+                _KNOWN_WEB_REVISION,
+            ]
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "[PASS]" in result.stdout
+
+    def test_known_web_revision_mismatch_fails(self, docker_ready):
+        self._require_images(*_KNOWN_MATCHING_PAIR.values(), _KNOWN_WEB_IMAGE)
+        result = self._run_script(
+            [
+                "--api-image",
+                _KNOWN_MATCHING_PAIR["api"],
+                "--scheduler-image",
+                _KNOWN_MATCHING_PAIR["scheduler"],
+                "--web-image",
+                _KNOWN_WEB_IMAGE,
+                "--expected-backend-revision",
+                _KNOWN_BACKEND_REVISION,
+                "--expected-web-revision",
+                "0000000000000000000000000000000000000000",
+            ]
+        )
+        assert result.returncode == 1
+        assert "web 이미지의 revision" in result.stdout
+
+    def test_web_image_missing_fails(self, docker_ready):
+        self._require_images(*_KNOWN_MATCHING_PAIR.values())
+        result = self._run_script(
+            [
+                "--api-image",
+                _KNOWN_MATCHING_PAIR["api"],
+                "--scheduler-image",
+                _KNOWN_MATCHING_PAIR["scheduler"],
+                "--web-image",
+                "shopping_erp_candidate/web:TESTONLY-does-not-exist",
+                "--expected-backend-revision",
+                _KNOWN_BACKEND_REVISION,
+                "--expected-web-revision",
+                _KNOWN_WEB_REVISION,
+            ]
+        )
+        assert result.returncode == 1
+        assert "web 이미지가 로컬에 없습니다" in result.stdout
 
     def test_api_and_scheduler_share_identical_image_id(self, docker_ready):
         """api/scheduler는 완전히 동일한 Dockerfile로 빌드되므로, 같은

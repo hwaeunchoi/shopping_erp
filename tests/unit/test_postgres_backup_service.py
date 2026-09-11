@@ -30,8 +30,13 @@ from services import postgres_backup_service as svc
 
 
 class TestDisabledByDefault:
-    def test_default_is_disabled(self):
-        assert settings.postgres_backup_enabled is False
+    def test_default_is_disabled(self, isolated_default_settings):
+        """실제 config.settings.settings 싱글턴이 아니라 tests/conftest.py의
+        isolated_default_settings 픽스처(실 .env·셸 환경변수 영향을 차단한
+        새 Settings 인스턴스)로 클래스 필드 기본값 자체를 확인한다 - 로컬
+        .env에 이미 POSTGRES_BACKUP_ENABLED=true(운영 승인을 받아 켜둔 값)가
+        있어도 이 테스트는 항상 클래스 기본값(False)만 본다."""
+        assert isolated_default_settings.postgres_backup_enabled is False
 
     def test_run_backup_job_returns_immediately_without_any_db_or_fs_access(self, monkeypatch):
         monkeypatch.setattr(settings, "postgres_backup_enabled", False)
