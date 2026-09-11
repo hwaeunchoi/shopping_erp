@@ -409,3 +409,126 @@ password"인 상태(연결 실패)가 아예 생기지 않습니다.
   이번 작업 범위에서는 `.env` 파일 기반 주입까지만 다룹니다.
 - 구키 폐기(완전 삭제)는 신키로의 전환이 충분히 검증된 뒤, 별도의 명시적
   승인을 받은 다음 단계에서 진행합니다.
+
+## 9. 배포 이미지 고정과 revision 호환성 검증
+
+### 9.1 사고 배경 (2026-09-11 API 크래시 루프)
+
+`docker-compose.yml`의 `api`/`scheduler`/`web`은 `build: .`(또는
+`./frontend`)만 있고 `image:`를 명시하지 않았습니다 — 이 상태에서는 compose가
+프로젝트명-서비스명 규칙으로 이미지 이름을 자동으로 정합니다(예:
+`shopping_erp-api`). candidate 이미지를 만들어 **컨테이너를 직접
+`docker compose ... up -d --no-build --no-deps <서비스>` + override 파일로
+교체**하면 그 순간은 정상 동작하지만, 이후 누군가(또는 같은 운영자가 나중에)
+override 파일 없이 base `docker-compose.yml`만으로 `up`/재적용을 하면
+compose는 다시 자동 이름(`shopping_erp-api` 등)을 선택합니다 — 이미 다른
+서비스(예: scheduler, 또는 운영 DB)는 새 candidate로 앞서가 있는데 이 서비스만
+구 이미지로 되돌아가는 **버전 불일치**가 생깁니다.
+
+실제로 이 문제가 발생한 경로: scheduler만 candidate로 교체하고 운영 DB를
+`0b2fdb82091c → 54810f29bf6a`로 migration했으나, `api` 컨테이너는 재기동되지
+않아 불일치가 잠복했습니다. 이후 호스트/Docker 재시작으로 `api`의 시작
+커맨드(`alembic upgrade head && ...`)가 재실행되며, **구 이미지의 migration
+스크립트에는 `54810f29bf6a`가 없어** `Can't locate revision identified by
+'54810f29bf6a'`로 즉시 크래시 루프에 빠졌습니다. **API만 migration을 포함하지
+않은 구 이미지로 남으면 이런 장애가 발생합니다** — scheduler/DB가 앞서가고
+API만 뒤처지는 어떤 조합도 잠재적으로 같은 문제를 일으킬 수 있습니다.
+
+### 9.2 이미지 고정 절차 (운영 `.env`)
+
+`docker-compose.yml`의 api/scheduler/web은 이제 아래처럼 환경변수로 이미지를
+선택합니다(변수 미설정 시 기존 개발용 기본 이름 그대로 - 회귀 없음):
+
+```yaml
+api:
+  image: ${API_IMAGE:-shopping_erp-api}
+scheduler:
+  image: ${SCHEDULER_IMAGE:-shopping_erp-scheduler}
+web:
+  image: ${WEB_IMAGE:-shopping_erp-web}
+```
+
+운영 활성화 시 `.env`에 세 값을 **정확한 immutable candidate 태그**로
+명시적으로 고정하십시오:
+
+```dotenv
+API_IMAGE=shopping_erp_candidate/api:<타임스탬프>-<커밋SHA 짧은형>
+SCHEDULER_IMAGE=shopping_erp_candidate/scheduler:<타임스탬프>-<커밋SHA 짧은형>
+WEB_IMAGE=shopping_erp_candidate/web:<타임스탬프>-<커밋SHA 짧은형>
+```
+
+- **api와 scheduler는 반드시 같은 커밋의 태그**여야 합니다(둘 다 같은
+  Dockerfile·migration 스크립트를 담고 있어야 함 - 9.1 사고가 정확히 이
+  둘의 불일치 때문에 발생했습니다).
+- web은 정적 파일만 서빙하고 DB migration과 무관하므로, api/scheduler와
+  다른 커밋이어도 구조적으로는 안전하지만 의도한 배포인지 반드시 확인하십시오.
+- `:` 태그를 생략하거나(`latest`처럼 매 빌드마다 바뀌는 이름) 빈 문자열을
+  넣지 마십시오 — 빈 문자열은 안전하게 기본값(`shopping_erp-api` 등)으로
+  폴백하지만, 그 순간 다시 9.1의 위험한 상태로 돌아갑니다.
+
+### 9.3 배포 후 필수 확인 - api/scheduler/web Image ID·revision
+
+`scripts/verify_deploy_images.py`로 **컨테이너를 재기동하기 전에** 반드시
+확인하십시오(읽기 전용 - `docker image inspect`만 호출, 어떤 컨테이너도
+건드리지 않습니다):
+
+```bash
+python scripts/verify_deploy_images.py \
+  --api-image "$API_IMAGE" \
+  --scheduler-image "$SCHEDULER_IMAGE" \
+  --web-image "$WEB_IMAGE"
+echo $?   # 0 = api/scheduler revision 일치 및 (지정 시) 기대 커밋과 일치. 1 = 배포 중단.
+```
+
+이 스크립트가 확인하는 것:
+- api/scheduler 이미지가 로컬에 실제로 존재하는지
+- 둘 다 `release_candidate_sha` 라벨을 갖고 있는지
+- 그 라벨 값이 **서로 일치**하는지(다르면 즉시 ERROR - 9.1과 같은 사고를
+  배포 전에 차단)
+- `--expected-sha`(생략 시 현재 저장소의 `git rev-parse HEAD`)와 일치하는지
+- web의 revision도 함께 출력합니다(ERROR 판정 대상은 아니며 참고용 - web은
+  독립 배포 가능하기 때문입니다).
+
+배포 후에도 실제 컨테이너가 그 이미지로 기동됐는지 다시 확인하십시오:
+
+```bash
+docker inspect -f '{{.Config.Image}} {{.Image}}' erp-api erp-scheduler erp-web
+```
+
+### 9.4 base compose 재적용 시 유지 조건
+
+`.env`에 9.2의 세 값이 설정되어 있는 한, override 파일 없이
+`docker compose -f docker-compose.yml up -d`(또는 데몬/호스트 재시작에 따른
+컨테이너 자동 재기동)를 다시 실행해도 **같은 candidate 이미지가 그대로
+선택됩니다** — 9.1의 사고가 재발하지 않습니다. 단, 이 조건은 `.env`에 값이
+실제로 존재할 때만 성립합니다 — `.env`를 초기화하거나 이 세 키를 지우면
+다시 개발용 기본 이미지로 폴백합니다.
+
+### 9.5 Rollback 시 주의 - DB revision과 애플리케이션 migration 호환성
+
+**운영 DB가 이미 새 revision으로 migration된 뒤에는, 그 revision을 모르는
+구 이미지로 단순히 되돌리면 안 됩니다** — 정확히 9.1과 같은 크래시 루프가
+재현됩니다. Rollback하기 전에 반드시:
+
+1. 되돌리려는 이미지(rollback 태그)에 담긴 Alembic 코드 head를 확인하십시오
+   (`docker run --rm --entrypoint python <rollback-image> -c "from alembic.config import Config; from alembic.script import ScriptDirectory; print(ScriptDirectory.from_config(Config('alembic.ini')).get_heads())"`).
+2. 그 값이 현재 운영 DB revision(`SELECT version_num FROM alembic_version`)과
+   **호환되는지**(즉 그 이미지의 migration 체인에 현재 DB revision이
+   존재하는지) 확인하십시오.
+3. 호환되지 않으면(DB가 rollback 이미지보다 앞서 있으면) **DB downgrade
+   없이 구 이미지로 rollback하지 마십시오** — 구 이미지는 그 revision을
+   인식하지 못해 즉시 다시 크래시합니다. 이 경우의 올바른 조치는 forward
+   recovery(현재 DB revision을 아는 더 최신 candidate 이미지로 진행)이지,
+   구 이미지로의 단순 rollback이 아닙니다.
+4. DB downgrade는 이 문서의 다른 어떤 섹션에서도 자동/기본 조치로 취급하지
+   않습니다 — 별도 승인과 별도 절차가 필요합니다.
+
+### 9.6 기존 override 파일을 안전하게 폐기할 수 있는 시점
+
+과거 배포 라운드에서 만든 저장소 밖 override 파일(예:
+`candidate-override.yml`, `api-recovery-override.yml`)은 9.2의 `.env`
+이미지 고정이 실제로 적용되고, 9.3의 검증을 통과하고, 9.4의 "base compose
+재적용" 조건이 최소 한 번 이상 실제로 재확인된 뒤에만 폐기(삭제)를
+고려하십시오. 그 전에 폐기하면, 아직 `.env`에 값이 없는 상태에서 누군가
+base compose만 재적용할 경우 다시 9.1의 위험한 상태로 되돌아갑니다. 폐기는
+이 문서의 범위가 아니라 별도 운영 판단 사항입니다.
