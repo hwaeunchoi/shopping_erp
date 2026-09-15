@@ -61,9 +61,9 @@ import subprocess
 import tempfile
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
@@ -323,6 +323,7 @@ def _record_history(
     started_at: datetime,
     status: str,
     file_path: str,
+    trigger_type: str = "SCHEDULE",
     file_size_bytes: Optional[int] = None,
     sha256: Optional[str] = None,
     error_code: Optional[str] = None,
@@ -341,11 +342,12 @@ def _record_history(
                 sha256=sha256,
                 error_code=error_code,
                 retained_count=retained_count,
+                trigger_type=trigger_type,
             )
         )
 
 
-def _run_backup_locked(started_at: datetime) -> dict:
+def _run_backup_locked(started_at: datetime, trigger_type: str = "SCHEDULE") -> dict:
     parsed = parse_postgres_url(settings.database_url)
 
     backup_dir = settings.postgres_backup_dir
@@ -422,6 +424,7 @@ def _run_backup_locked(started_at: datetime) -> dict:
         started_at=started_at,
         status=finished_status,
         file_path=str(final_dump_path),
+        trigger_type=trigger_type,
         file_size_bytes=file_size,
         sha256=sha256_hex,
         error_code=retention_error_code,
@@ -439,9 +442,16 @@ def _run_backup_locked(started_at: datetime) -> dict:
     }
 
 
-def run_backup_job() -> dict:
+def run_backup_job(trigger_type: str = "SCHEDULE") -> dict:
     """scheduler/jobs/backup_job.py에서 호출하는 진입점. database_url이
-    PostgreSQL일 때만 호출된다(SQLite 판단은 backup_job.run()이 먼저 한다)."""
+    PostgreSQL일 때만 호출된다(SQLite 판단은 backup_job.run()이 먼저 한다).
+
+    trigger_type은 BackupHistory.trigger_type에 그대로 기록된다 - 정기
+    03:00 cron은 기본값 "SCHEDULE", 재기동 후 보충 실행은 run_catchup_if_needed()가
+    "CATCHUP"을 넘긴다. 이 함수 자체의 advisory lock/재시도-금지/에러 코드 분류
+    로직은 호출자가 누구든 완전히 동일하다 - trigger_type은 사후 감사(어떤
+    경로로 이 백업이 만들어졌는지 구분)에만 쓰이고 실제 동작 분기에는 관여하지
+    않는다."""
     if not settings.postgres_backup_enabled:
         logger.debug("PostgreSQL 예약 백업이 비활성화(OFF) 상태라 건너뜁니다.")
         return {"skipped_disabled": 1}
@@ -456,6 +466,7 @@ def run_backup_job() -> dict:
             started_at=started_at,
             status="FAILED",
             file_path="-",
+            trigger_type=trigger_type,
             error_code=error.error_code,
             error_message=error.safe_message,
         )
@@ -472,16 +483,17 @@ def run_backup_job() -> dict:
         )
         if not lock_acquired:
             logger.info("PostgreSQL 백업이 이미 실행 중이라 이번 회차는 건너뜁니다(advisory lock busy).")
-            _record_history(started_at=started_at, status="ALREADY_RUNNING", file_path="-")
+            _record_history(started_at=started_at, status="ALREADY_RUNNING", file_path="-", trigger_type=trigger_type)
             return {"status": "ALREADY_RUNNING"}
 
         try:
-            return _run_backup_locked(started_at)
+            return _run_backup_locked(started_at, trigger_type=trigger_type)
         except PostgresBackupError as err:
             _record_history(
                 started_at=started_at,
                 status="FAILED",
                 file_path="-",
+                trigger_type=trigger_type,
                 error_code=err.error_code,
                 error_message=err.safe_message,
             )
@@ -496,3 +508,86 @@ def run_backup_job() -> dict:
             except Exception:  # noqa: BLE001 - 연결이 이미 끊겼어도 무시한다(아래 close가 세션 lock을 어차피 해제).
                 logger.warning("advisory unlock 호출에 실패했습니다 - 커넥션 종료로 세션 lock은 함께 해제됩니다.")
         conn.close()
+
+
+# --------------------------------------------------------------------------
+# 재기동 후 놓친 예약 실행 보충(catch-up)
+# --------------------------------------------------------------------------
+#
+# 배경(scheduler/scheduler.py의 build_scheduler()가 쓰는 BlockingScheduler는
+# jobstore를 지정하지 않아 기본 MemoryJobStore다 - 잡 상태가 프로세스 메모리
+# 안에만 있고 어떤 파일/DB에도 영속화되지 않는다): 호스트나 컨테이너가
+# 03:00 UTC를 걸쳐 완전히 꺼져 있었다면, 그 시간에 scheduler 프로세스 자체가
+# 존재하지 않으므로 "backup" cron job의 트리거를 평가할 주체가 없다 - 이건
+# APScheduler의 misfire(지각 실행) 처리 대상이 아니다. misfire_grace_time은
+# "이미 떠 있는 프로세스가 GIL/이벤트루프 지연으로 트리거 시각을 넘긴" 경우만
+# 구제하며, 그 값 자체도 이 프로젝트는 BlockingScheduler()에 job_defaults를
+# 넘기지 않아 APScheduler 라이브러리 기본값(misfire_grace_time=1초,
+# coalesce=True)을 그대로 쓴다 - 즉 프로세스가 계속 떠 있었다 해도 1초 넘게
+# 지각하면 그냥 건너뛴다. 프로세스 자체가 부재했던 기간은 이 메커니즘이 아예
+# 관여할 수 없다(실측: task_execution_history에 2026-09-12/09-13 03:00 UTC
+# 행 자체가 없음 - "실행됐지만 실패"가 아니라 "실행 자체가 없었다").
+#
+# 그래서 이 catch-up은 APScheduler의 misfire 처리에 기대지 않고, scheduler
+# 프로세스가 새로 뜰 때마다 애플리케이션 레벨에서 "가장 최근 예정 시각
+# 이후 성공한 백업이 있는가"를 직접 확인해 없을 때만 정확히 1회 보충한다.
+def _most_recent_scheduled_time(now: datetime, hour: int = 3, minute: int = 0) -> datetime:
+    """매일 hour:minute UTC 정기 백업(scheduler.py의 CronTrigger(hour=3,
+    minute=0)과 반드시 같은 값)의 "가장 최근 예정 시각"을 계산한다. now가 그
+    시각 이후(같은 순간 포함)면 오늘 그 시각을, 이전이면 어제 그 시각을
+    반환한다. now는 반드시 timezone-aware UTC여야 한다(호출부가 보장)."""
+    scheduled_today = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if now >= scheduled_today:
+        return scheduled_today
+    return scheduled_today - timedelta(days=1)
+
+
+def run_catchup_if_needed(now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> dict:
+    """scheduler 시작 시 1회 호출된다(scheduler/scheduler.py에 "date" 트리거로
+    즉시 실행되게 등록된 backup_catchup job이 호출부 - _run_job()의 기존
+    TaskExecutionHistory 시작/종료 경계와 예외 처리를 그대로 재사용한다).
+
+    postgres_backup_enabled와 postgres_backup_catchup_enabled가 모두 True일
+    때만 실제로 확인한다 - 둘 중 하나라도 False면 이 함수의 첫 줄에서 즉시
+    반환하고 그 아래 어떤 코드도(DB 세션 생성, 파일 접근, pg_dump 실행) 실행
+    하지 않는다(다른 상용 ERP 확장 플래그와 동일한 fail-closed 계약).
+
+    "가장 최근 예정 시각(오늘 03:00 UTC, 아직 안 지났으면 어제 03:00 UTC)"
+    이후 성공(SUCCESS 또는 PARTIAL_SUCCESS - PARTIAL_SUCCESS는 dump 자체는
+    성공하고 보존정책 정리만 실패한 상태라 "백업 성공"으로 센다)한 PostgreSQL
+    백업이 이미 있으면 아무 것도 하지 않는다. 없으면 run_backup_job(trigger_type=
+    "CATCHUP")을 딱 한 번 호출한다 - 그 함수의 advisory lock이 예약 job(정각
+    03:00에 마침 동시에 도는 경우)이나 다른 scheduler 인스턴스의 catch-up과의
+    경합을 그대로 막아준다(이 함수는 lock을 별도로 잡지 않는다 - 잡을 필요가
+    없다, run_backup_job() 안에서 이미 잡는다). 락 경합으로 인한
+    ALREADY_RUNNING은 이 함수 레벨에서도 실패나 재시도로 취급하지 않고
+    run_backup_job()의 반환값을 그대로 돌려준다.
+
+    누락 일수가 여러 날이어도 "가장 최근 예정 시각" 하나만 기준으로 삼으므로
+    과거 날짜별로 여러 번 실행되지 않는다 - 최신 상태 백업 1개만 있으면
+    충분하기 때문이다(놓친 매일자 백업을 전부 재현하려는 기능이 아니다).
+
+    now_fn은 테스트에서 실제 시스템 시계를 바꾸지 않고도 임의 시각을 주입할
+    수 있게 분리했다(기본값은 실제 현재 UTC 시각)."""
+    if not settings.postgres_backup_enabled or not settings.postgres_backup_catchup_enabled:
+        logger.debug("PostgreSQL 예약 백업 보충 실행이 비활성화(OFF) 상태라 건너뜁니다.")
+        return {"skipped_disabled": 1}
+
+    now = now_fn()
+    scheduled_time = _most_recent_scheduled_time(now)
+    # BackupHistory.created_at은 naive UTC로 저장된다(core/database.py 컨벤션 -
+    # PostgreSQL timestamp without time zone 컬럼에 aware datetime을 쓰면 드라이버가
+    # tzinfo를 벗겨서 저장한다) - 비교 기준값도 동일하게 naive로 맞춘다.
+    scheduled_time_naive = scheduled_time.replace(tzinfo=None)
+
+    with session_scope() as db:
+        latest = BackupHistoryRepository(db).latest_success_since(scheduled_time_naive)
+
+    if latest is not None:
+        logger.info(
+            "최근 예정 시각(%s) 이후 이미 성공한 백업이 있어 보충 실행을 건너뜁니다.", scheduled_time.isoformat()
+        )
+        return {"skipped_up_to_date": 1}
+
+    logger.info("최근 예정 시각(%s) 이후 성공한 백업이 없어 1회 보충 실행합니다.", scheduled_time.isoformat())
+    return run_backup_job(trigger_type="CATCHUP")

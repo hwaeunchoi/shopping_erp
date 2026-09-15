@@ -41,6 +41,21 @@ def run() -> dict:
     )
 
 
+def run_catchup() -> dict:
+    """scheduler 시작 시 1회만 실행되는 "재기동 후 놓친 예약 백업 보충" 진입점
+    (scheduler/scheduler.py에 즉시 실행 "date" 트리거로 등록된 backup_catchup
+    job이 호출한다). PostgreSQL일 때만 의미가 있다 - SQLite는 컨테이너 시작
+    시점 스냅샷 복사 방식이라(scheduler/jobs/backup_job.py의 _run_sqlite_backup)
+    "떠 있지 않던 기간에 놓친 정기 실행"이라는 개념 자체가 없으므로, 다음
+    정기 03:00 cron이 정상 처리하도록 그대로 skipped_disabled를 반환한다."""
+    if settings.database_url.startswith(("postgresql", "postgres")):
+        from services import postgres_backup_service
+
+        return postgres_backup_service.run_catchup_if_needed()
+
+    return {"skipped_disabled": 1}
+
+
 def _run_sqlite_backup() -> dict:
     db_path = Path(settings.database_url.replace("sqlite:///", "", 1))
     now = datetime.now(timezone.utc)

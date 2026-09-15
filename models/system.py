@@ -47,7 +47,14 @@ class BackupHistory(Base):
     BACKUP_FAILURE 지표는 status=="FAILED"만 실패로 본다). error_message에는 예외
     메시지 원문 대신 항상 안전하게 요약된 문자열만 저장한다(DB URL/비밀번호/dump
     내용/테이블 데이터/실제 PII/stderr 원문 전체 금지 - services/postgres_backup_service.py
-    모듈 docstring 참고)."""
+    모듈 docstring 참고).
+
+    trigger_type(재기동 후 놓친 예약 실행 보충 기능에서 추가, nullable - 기존
+    행은 NULL로 남는다)은 이 백업이 어떤 경로로 만들어졌는지 구분한다:
+    SCHEDULE(정기 03:00 cron) / CATCHUP(재기동 직후 놓친 실행 보충,
+    postgres_backup_service.run_catchup_if_needed 참고) / MANUAL(운영자가 직접
+    호출). task_execution_history.trigger_type과 같은 값 집합을 쓴다 - 두
+    테이블을 target/trigger_type으로 교차 조회해 감사할 수 있다."""
 
     __tablename__ = "backup_history"
 
@@ -61,6 +68,7 @@ class BackupHistory(Base):
     sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     error_code: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     retained_count: Mapped[Optional[int]] = mapped_column(nullable=True)
+    trigger_type: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)  # SCHEDULE/CATCHUP/MANUAL
 
 
 class SystemSetting(Base):

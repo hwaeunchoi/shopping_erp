@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from apscheduler.schedulers.blocking import BlockingScheduler  # noqa: E402
 from apscheduler.triggers.cron import CronTrigger  # noqa: E402
+from apscheduler.triggers.date import DateTrigger  # noqa: E402
 from apscheduler.triggers.interval import IntervalTrigger  # noqa: E402
 
 from config.logging_config import setup_logging  # noqa: E402
@@ -51,11 +52,14 @@ from scheduler.jobs import (  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
-def _run_job(name: str, func: Callable[[], object], task_type: str) -> None:
+def _run_job(name: str, func: Callable[[], object], task_type: str, trigger_type: str = "SCHEDULE") -> None:
+    """trigger_type 기본값은 기존 모든 정기 cron/interval 잡과 동일한 "SCHEDULE" -
+    이 매개변수를 추가해도 기존 호출부(아래 run_* 함수들)는 전부 그대로다.
+    run_backup_catchup()만 "CATCHUP"을 명시적으로 넘긴다."""
     logger.info(f"[{name}] 작업을 시작합니다.")
     with session_scope() as db:
         history_id = (
-            TaskExecutionHistoryRepository(db).start(task_type=task_type, trigger_type="SCHEDULE", target=name).id
+            TaskExecutionHistoryRepository(db).start(task_type=task_type, trigger_type=trigger_type, target=name).id
         )
 
     try:
@@ -101,6 +105,16 @@ def run_customer_stats() -> None:
 
 def run_backup() -> None:
     _run_job("backup", backup_job.run, task_type="BACKUP")
+
+
+def run_backup_catchup() -> None:
+    """scheduler 시작 시 즉시 1회만 실행되는 "date" 트리거 job(아래
+    build_scheduler() 참고) - 재기동 후 놓친 정기 03:00 백업을 안전하게 최대
+    1회 보충한다(services/postgres_backup_service.py의 run_catchup_if_needed
+    참고). trigger_type="CATCHUP"으로 이력을 남겨 정기 실행(run_backup, target=
+    "backup")과 target="backup_catchup"으로도 이미 구분되고, TaskExecutionHistory.
+    trigger_type으로도 한 번 더 구분된다."""
+    _run_job("backup_catchup", backup_job.run_catchup, task_type="BACKUP", trigger_type="CATCHUP")
 
 
 def run_report_generate() -> None:
@@ -150,6 +164,19 @@ def build_scheduler() -> BlockingScheduler:
     scheduler.add_job(run_profit_calculation, CronTrigger(hour=1, minute=0), id="profit_calculation", max_instances=1)
     scheduler.add_job(run_customer_stats, CronTrigger(hour=1, minute=30), id="customer_stats", max_instances=1)
     scheduler.add_job(run_backup, CronTrigger(hour=3, minute=0), id="backup", max_instances=1)
+    # 재기동 후 놓친 예약 백업 보충 - scheduler.start() 직후 즉시(1회만) 실행되는
+    # "date" 트리거다. run_date를 지정하지 않으면 DateTrigger가 "지금"으로 잡는데,
+    # add_job() 호출 시점과 scheduler.start()의 실제 루프 시작 사이에는 항상 약간의
+    # 지연이 있어(다른 잡 등록/이벤트루프 초기화) 이 job은 등록 시점 기준으로 보면
+    # 이미 "약간 지각"한 상태로 발화한다 - misfire_grace_time=None(무제한)을 명시해
+    # BlockingScheduler(timezone="UTC")의 라이브러리 기본값(1초)에 걸려 건너뛰지
+    # 않게 한다(이 job 자체는 "정해진 시각에 맞춰 도는" 게 아니라 "뜨면 무조건 한 번
+    # 확인하는" 성격이라 misfire 개념 자체가 무의미하다 - services/
+    # postgres_backup_service.py의 run_catchup_if_needed가 실제로 백업이 필요한지는
+    # DB의 BackupHistory를 보고 스스로 판단하므로, 이 job이 몇 초 늦게 발화해도
+    # 정책에 전혀 영향이 없다). 실패해도(예: DB 아직 준비 안 됨) 정기 "backup" cron은
+    # 그대로 등록돼 있으므로 scheduler 자체는 계속 정상 동작한다.
+    scheduler.add_job(run_backup_catchup, DateTrigger(), id="backup_catchup", max_instances=1, misfire_grace_time=None)
     scheduler.add_job(run_report_generate, CronTrigger(hour=2, minute=0), id="report_generate", max_instances=1)
     scheduler.add_job(run_alert_evaluation, IntervalTrigger(minutes=30), id="alert_evaluation", max_instances=1)
     # outbox(ExternalCommand) 실행 - API는 enqueue()만 하고 실제 채널 호출은 이 잡이 한다.

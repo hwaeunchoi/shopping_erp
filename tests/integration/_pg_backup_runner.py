@@ -24,6 +24,20 @@ PGBACKUP_ACTION 환경변수로 동작을 고른다:
 - source_unchanged : SOURCE DB의 지문이 백업 전후로 그대로인지 fingerprint와
   동일한 계산을 한 번 더 수행해 호출부가 직접 비교하도록 한다(fingerprint와
   동작은 같지만 의도를 드러내는 별도 액션명).
+- seed_backup_history : fix/postgres-backup-missed-run-recovery 검증용.
+  PGBACKUP_SEED_CREATED_AT(ISO-8601 UTC, 예: "2026-09-11T03:00:05")와
+  PGBACKUP_SEED_STATUS(기본 SUCCESS)로 backup_history에 과거 성공 기록을
+  1건 직접 시딩한다("마지막 성공 시각을 과거로 시딩"하는 검증 1단계).
+- run_catchup : postgres_backup_service.run_catchup_if_needed()를 1회 호출한다.
+  PGBACKUP_CATCHUP_NOW(ISO-8601 UTC)가 있으면 그 시각을 now_fn으로 주입하고,
+  없으면 실제 UTC 현재 시각을 쓴다. 여러 컨테이너에서 이 액션을 동시에 실행해
+  "두 scheduler 프로세스 동시 시작"을 재현한다.
+- backup_history_summary : backup_history 테이블에서 engine/status/
+  trigger_type만 뽑아 목록으로 반환한다(민감정보 없음) - 정책대로 1건만
+  CATCHUP으로 기록됐는지 검증한다.
+- backup_dir_listing : POSTGRES_BACKUP_DIR 아래 실제 dump 파일 개수와
+  잔존 임시(.tmp)/PGPASSFILE 개수만 보고한다(경로 문자열 자체도 비밀번호를
+  담지 않으므로 그대로 반환 가능).
 """
 
 import hashlib
@@ -165,6 +179,82 @@ def _action_restore() -> dict:
     return {"ok": True, "returncode": result.returncode, "stderr_bytes": len(result.stderr or b"")}
 
 
+def _action_seed_backup_history() -> dict:
+    from datetime import datetime
+
+    from core.database import session_scope
+    from models.system import BackupHistory
+    from repositories.system_repository import BackupHistoryRepository
+
+    created_at = datetime.fromisoformat(os.environ["PGBACKUP_SEED_CREATED_AT"])
+    status = os.environ.get("PGBACKUP_SEED_STATUS", "SUCCESS")
+
+    with session_scope() as db:
+        BackupHistoryRepository(db).add(
+            BackupHistory(
+                file_path="/pgbackup/seeded-for-catchup-test.dump",
+                file_size_bytes=1,
+                status=status,
+                created_at=created_at,
+                engine="POSTGRES",
+                trigger_type="SCHEDULE",
+            )
+        )
+    return {"ok": True}
+
+
+def _action_run_catchup() -> dict:
+    from datetime import datetime, timezone
+
+    from services import postgres_backup_service as svc
+
+    now_override = os.environ.get("PGBACKUP_CATCHUP_NOW")
+    if now_override:
+        fixed_now = datetime.fromisoformat(now_override).replace(tzinfo=timezone.utc)
+        result = svc.run_catchup_if_needed(now_fn=lambda: fixed_now)
+    else:
+        result = svc.run_catchup_if_needed()
+    return {"ok": True, "result": result}
+
+
+def _action_backup_history_summary() -> dict:
+    from sqlalchemy import text
+
+    from core.database import engine
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT engine, status, trigger_type FROM backup_history "
+                "WHERE engine = 'POSTGRES' ORDER BY created_at"
+            )
+        ).all()
+    return {"ok": True, "rows": [list(r) for r in rows]}
+
+
+def _action_backup_dir_listing() -> dict:
+    import tempfile
+    from pathlib import Path
+
+    backup_dir = Path(os.environ.get("POSTGRES_BACKUP_DIR", "/pgbackup"))
+    all_files = [p.name for p in backup_dir.iterdir()] if backup_dir.exists() else []
+    dump_files = [n for n in all_files if n.endswith(".dump")]
+    tmp_files = [n for n in all_files if ".tmp" in n]
+
+    # PGPASSFILE은 backup_dir이 아니라 tempfile.mkstemp() 기본 임시 디렉터리(컨테이너
+    # 안에서는 보통 /tmp)에 ".pgpass_*.tmp"로 만들어졌다가 finally에서 unlink된다 -
+    # 두 위치 모두 잔존 여부를 확인해야 "PGPASSFILE 잔존 0건"을 실제로 증명한다.
+    tmp_root = Path(tempfile.gettempdir())
+    pgpass_files = [p.name for p in tmp_root.glob(".pgpass_*")] if tmp_root.exists() else []
+
+    return {
+        "ok": True,
+        "dump_file_count": len(dump_files),
+        "tmp_file_count": len(tmp_files),
+        "pgpass_file_count": len(pgpass_files),
+    }
+
+
 ACTIONS = {
     "migrate_and_seed": _action_migrate_and_seed,
     "run_backup": _action_run_backup,
@@ -172,6 +262,10 @@ ACTIONS = {
     "fingerprint": _fingerprint,
     "source_unchanged": _fingerprint,
     "restore": _action_restore,
+    "seed_backup_history": _action_seed_backup_history,
+    "run_catchup": _action_run_catchup,
+    "backup_history_summary": _action_backup_history_summary,
+    "backup_dir_listing": _action_backup_dir_listing,
 }
 
 

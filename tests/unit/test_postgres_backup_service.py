@@ -413,6 +413,22 @@ class FakeRepo:
         self.records.append(obj)
         return obj
 
+    def latest_success_since(self, since):
+        """실제 repositories/system_repository.py의 BackupHistoryRepository.
+        latest_success_since()와 동일한 필터링 로직을 self.records(이 fixture로
+        add()된 BackupHistory 객체들, DB에 실제로 저장되지 않은 순수 Python
+        객체) 위에서 흉내낸다 - run_catchup_if_needed() 테스트가 "이미 성공한
+        백업이 있다/없다"를 fixture 하나로 자연스럽게 표현할 수 있게 한다."""
+        candidates = [
+            r
+            for r in self.records
+            if getattr(r, "engine", None) == "POSTGRES"
+            and getattr(r, "status", None) in ("SUCCESS", "PARTIAL_SUCCESS")
+            and getattr(r, "created_at", None) is not None
+            and r.created_at >= since
+        ]
+        return max(candidates, key=lambda r: r.created_at) if candidates else None
+
 
 @pytest.fixture()
 def fake_history(monkeypatch):
@@ -454,8 +470,20 @@ class TestRunBackupLockedOrchestration:
         assert fake_history[0].status == "SUCCESS"
         assert fake_history[0].sha256 == result["sha256"]
         assert fake_history[0].engine == "POSTGRES"
+        assert fake_history[0].trigger_type == "SCHEDULE"  # 기본값(호출부가 명시하지 않음).
         # tmp 파일은 rename으로 사라졌어야 한다 - 잔여 .tmp-* 없음.
         assert not any(p.name.endswith(".tmp") or ".tmp-" in p.name for p in tmp_path.iterdir())
+
+    def test_trigger_type_is_recorded_verbatim_in_history(self, monkeypatch, tmp_path, fake_history):
+        """fix/postgres-backup-missed-run-recovery: _run_backup_locked에 넘긴
+        trigger_type이 BackupHistory.trigger_type에 그대로 저장되는지."""
+        self._setup_common(monkeypatch, tmp_path)
+        monkeypatch.setattr(svc.subprocess, "run", _fake_dump_success(tmp_path))
+
+        started_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        svc._run_backup_locked(started_at, trigger_type="CATCHUP")
+
+        assert fake_history[0].trigger_type == "CATCHUP"
 
     def test_existing_final_file_blocks_overwrite(self, monkeypatch, tmp_path, fake_history):
         self._setup_common(monkeypatch, tmp_path)
@@ -593,7 +621,9 @@ class TestRunBackupJobLocking:
         monkeypatch.setattr(settings, "postgres_backup_enabled", True)
         fake_conn = FakeConnection(lock_available=True)
         monkeypatch.setattr(svc, "engine", FakeEngine(fake_conn))
-        monkeypatch.setattr(svc, "_run_backup_locked", lambda started_at: {"status": "SUCCESS"})
+        monkeypatch.setattr(
+            svc, "_run_backup_locked", lambda started_at, trigger_type="SCHEDULE": {"status": "SUCCESS"}
+        )
 
         result = svc.run_backup_job()
 
@@ -607,7 +637,7 @@ class TestRunBackupJobLocking:
         fake_conn = FakeConnection(lock_available=True)
         monkeypatch.setattr(svc, "engine", FakeEngine(fake_conn))
 
-        def raise_dump_failure(started_at):
+        def raise_dump_failure(started_at, trigger_type="SCHEDULE"):
             raise svc.PostgresBackupError(svc.ERR_DUMP_FAILURE, "pg_dump가 실패했습니다.")
 
         monkeypatch.setattr(svc, "_run_backup_locked", raise_dump_failure)
@@ -635,3 +665,175 @@ class TestRunBackupJobLocking:
         assert exc_info.value.error_code == svc.ERR_CONNECTION_FAILURE
         assert fake_history[0].status == "FAILED"
         assert fake_history[0].error_code == svc.ERR_CONNECTION_FAILURE
+
+
+# --------------------------------------------------------------------------
+# fix/postgres-backup-missed-run-recovery: 재기동 후 놓친 예약 백업 보충
+# --------------------------------------------------------------------------
+
+
+class TestMostRecentScheduledTime:
+    """순수 함수 - UTC 자정/경계 계산만 검증한다(DB·시계 접근 없음)."""
+
+    def test_before_todays_scheduled_time_returns_yesterday(self):
+        now = datetime(2026, 9, 14, 2, 59, 59, tzinfo=timezone.utc)
+        result = svc._most_recent_scheduled_time(now)
+        assert result == datetime(2026, 9, 13, 3, 0, 0, tzinfo=timezone.utc)
+
+    def test_exactly_at_scheduled_time_returns_today(self):
+        now = datetime(2026, 9, 14, 3, 0, 0, tzinfo=timezone.utc)
+        result = svc._most_recent_scheduled_time(now)
+        assert result == datetime(2026, 9, 14, 3, 0, 0, tzinfo=timezone.utc)
+
+    def test_after_todays_scheduled_time_returns_today(self):
+        now = datetime(2026, 9, 14, 23, 59, 59, tzinfo=timezone.utc)
+        result = svc._most_recent_scheduled_time(now)
+        assert result == datetime(2026, 9, 14, 3, 0, 0, tzinfo=timezone.utc)
+
+    def test_midnight_rolls_over_to_previous_day(self):
+        """UTC 자정(00:00) 직후는 아직 당일 03:00 이전이므로 전날 기준이어야
+        한다 - 날짜 경계(달/연도 롤오버 포함) 계산이 timedelta로 정확히
+        이뤄지는지 확인한다."""
+        now = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        result = svc._most_recent_scheduled_time(now)
+        assert result == datetime(2025, 12, 31, 3, 0, 0, tzinfo=timezone.utc)
+
+
+def _history_record(*, engine="POSTGRES", status="SUCCESS", created_at):
+    record = MagicMock()
+    record.engine = engine
+    record.status = status
+    record.created_at = created_at
+    return record
+
+
+class TestRunCatchupIfNeeded:
+    def _disable_catchup_flags(self, monkeypatch, *, backup_enabled=True, catchup_enabled=True):
+        monkeypatch.setattr(settings, "postgres_backup_enabled", backup_enabled)
+        monkeypatch.setattr(settings, "postgres_backup_catchup_enabled", catchup_enabled)
+
+    def test_feature_off_skips_without_any_db_or_process_access(self, monkeypatch):
+        """catch-up 플래그 자체가 OFF - session_scope/run_backup_job 어느 것도
+        호출되면 안 된다."""
+        self._disable_catchup_flags(monkeypatch, backup_enabled=True, catchup_enabled=False)
+
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError("catch-up이 OFF인데 DB/백업 실행 경로가 호출되었습니다.")
+
+        monkeypatch.setattr(svc, "session_scope", _fail_if_called)
+        monkeypatch.setattr(svc, "run_backup_job", _fail_if_called)
+
+        result = svc.run_catchup_if_needed(now_fn=lambda: datetime(2026, 9, 14, 5, tzinfo=timezone.utc))
+
+        assert result == {"skipped_disabled": 1}
+
+    def test_base_backup_feature_off_also_skips_without_any_access(self, monkeypatch):
+        """POSTGRES_BACKUP_ENABLED가 OFF면 catch-up 플래그가 true여도 아무 것도
+        하지 않는다(기반 기능 OFF에 종속)."""
+        self._disable_catchup_flags(monkeypatch, backup_enabled=False, catchup_enabled=True)
+
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError("기반 백업 기능이 OFF인데 DB/백업 실행 경로가 호출되었습니다.")
+
+        monkeypatch.setattr(svc, "session_scope", _fail_if_called)
+        monkeypatch.setattr(svc, "run_backup_job", _fail_if_called)
+
+        result = svc.run_catchup_if_needed(now_fn=lambda: datetime(2026, 9, 14, 5, tzinfo=timezone.utc))
+
+        assert result == {"skipped_disabled": 1}
+
+    def test_before_0300_with_prior_day_success_does_not_run(self, monkeypatch, fake_history):
+        """03:00 이전 시작 + 전날 성공 있음 -> 실행 안 함."""
+        self._disable_catchup_flags(monkeypatch)
+        fake_history.append(_history_record(created_at=datetime(2026, 9, 13, 3, 0, 5)))
+        stub = MagicMock()
+        monkeypatch.setattr(svc, "run_backup_job", stub)
+
+        result = svc.run_catchup_if_needed(now_fn=lambda: datetime(2026, 9, 14, 2, 0, 0, tzinfo=timezone.utc))
+
+        stub.assert_not_called()
+        assert result == {"skipped_up_to_date": 1}
+
+    def test_before_0300_without_prior_day_success_is_one_candidate(self, monkeypatch, fake_history):
+        """03:00 이전 시작 + 전날 성공 없음 -> 1회 후보(실제로 run_backup_job 위임)."""
+        self._disable_catchup_flags(monkeypatch)
+        stub = MagicMock(return_value={"status": "SUCCESS"})
+        monkeypatch.setattr(svc, "run_backup_job", stub)
+
+        result = svc.run_catchup_if_needed(now_fn=lambda: datetime(2026, 9, 14, 2, 0, 0, tzinfo=timezone.utc))
+
+        stub.assert_called_once_with(trigger_type="CATCHUP")
+        assert result == {"status": "SUCCESS"}
+
+    def test_after_0300_with_todays_success_does_not_run(self, monkeypatch, fake_history):
+        """03:00 이후 시작 + 오늘 성공 있음 -> 실행 안 함."""
+        self._disable_catchup_flags(monkeypatch)
+        fake_history.append(_history_record(created_at=datetime(2026, 9, 14, 3, 0, 5)))
+        stub = MagicMock()
+        monkeypatch.setattr(svc, "run_backup_job", stub)
+
+        result = svc.run_catchup_if_needed(now_fn=lambda: datetime(2026, 9, 14, 10, 0, 0, tzinfo=timezone.utc))
+
+        stub.assert_not_called()
+        assert result == {"skipped_up_to_date": 1}
+
+    def test_after_0300_without_todays_success_runs_exactly_once(self, monkeypatch, fake_history):
+        """03:00 이후 시작 + 오늘 성공 없음 -> 정확히 1회."""
+        self._disable_catchup_flags(monkeypatch)
+        stub = MagicMock(return_value={"status": "SUCCESS"})
+        monkeypatch.setattr(svc, "run_backup_job", stub)
+
+        result = svc.run_catchup_if_needed(now_fn=lambda: datetime(2026, 9, 14, 10, 0, 0, tzinfo=timezone.utc))
+
+        stub.assert_called_once_with(trigger_type="CATCHUP")
+        assert result == {"status": "SUCCESS"}
+
+    def test_multiple_days_missed_still_runs_only_once(self, monkeypatch, fake_history):
+        """마지막 성공이 3일 전이어도 run_backup_job은 정확히 1번만 호출된다
+        (누락 일수만큼 반복 실행하지 않는다 - _most_recent_scheduled_time()이
+        "가장 최근" 기준 시각 하나만 계산하므로 애초에 날짜별 반복 구조 자체가
+        없다)."""
+        self._disable_catchup_flags(monkeypatch)
+        fake_history.append(_history_record(created_at=datetime(2026, 9, 11, 3, 0, 5)))
+        stub = MagicMock(return_value={"status": "SUCCESS"})
+        monkeypatch.setattr(svc, "run_backup_job", stub)
+
+        result = svc.run_catchup_if_needed(now_fn=lambda: datetime(2026, 9, 14, 10, 0, 0, tzinfo=timezone.utc))
+
+        assert stub.call_count == 1
+        stub.assert_called_once_with(trigger_type="CATCHUP")
+        assert result == {"status": "SUCCESS"}
+
+    def test_manual_success_after_reference_time_prevents_duplicate_run(self, monkeypatch, fake_history):
+        """수동(MANUAL) 성공 백업이라도 기준 시각 이후에 존재하면 중복 실행하지
+        않는다 - latest_success_since()는 trigger_type이 아니라 engine/status/
+        created_at만으로 판단하므로 수동·예약·catch-up 어느 트리거든 동일하게
+        "이미 최신 상태"로 인정된다."""
+        self._disable_catchup_flags(monkeypatch)
+        manual_record = _history_record(created_at=datetime(2026, 9, 14, 8, 0, 0))
+        manual_record.trigger_type = "MANUAL"
+        fake_history.append(manual_record)
+        stub = MagicMock()
+        monkeypatch.setattr(svc, "run_backup_job", stub)
+
+        result = svc.run_catchup_if_needed(now_fn=lambda: datetime(2026, 9, 14, 10, 0, 0, tzinfo=timezone.utc))
+
+        stub.assert_not_called()
+        assert result == {"skipped_up_to_date": 1}
+
+    def test_already_running_from_concurrent_job_is_passed_through_not_retried(self, monkeypatch, fake_history):
+        """예약 job과 catch-up이 advisory lock에서 경합해 ALREADY_RUNNING이
+        나와도 run_catchup_if_needed()는 그 결과를 그대로 반환할 뿐 재시도하지
+        않는다(run_backup_job() 자체가 ALREADY_RUNNING을 예외로 던지지 않고
+        정상 dict로 반환하는 기존 계약을 그대로 위임한다) - 실제 두 프로세스
+        동시성은 tests/integration에서 진짜 PostgreSQL advisory lock으로
+        검증한다."""
+        self._disable_catchup_flags(monkeypatch)
+        stub = MagicMock(return_value={"status": "ALREADY_RUNNING"})
+        monkeypatch.setattr(svc, "run_backup_job", stub)
+
+        result = svc.run_catchup_if_needed(now_fn=lambda: datetime(2026, 9, 14, 10, 0, 0, tzinfo=timezone.utc))
+
+        stub.assert_called_once_with(trigger_type="CATCHUP")
+        assert result == {"status": "ALREADY_RUNNING"}
+        assert "FAILED" not in str(result)

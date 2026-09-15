@@ -27,6 +27,25 @@ class BackupHistoryRepository(BaseRepository[BackupHistory]):
         stmt = select(BackupHistory).order_by(BackupHistory.created_at.desc()).limit(limit)
         return list(self.session.execute(stmt).scalars().all())
 
+    def latest_success_since(self, since: datetime) -> Optional[BackupHistory]:
+        """engine=POSTGRES이고 since(naive UTC) 이후 생성된 성공 백업 중 가장
+        최근 것 1건을 반환한다(services/postgres_backup_service.py의
+        run_catchup_if_needed 전용 - "이미 보충할 필요가 없는지" 판단).
+        SUCCESS/PARTIAL_SUCCESS 둘 다 "백업 성공"으로 센다 - PARTIAL_SUCCESS는
+        dump 자체는 성공하고 보존정책(retention) 정리만 실패한 상태라, 실제
+        복원 가능한 백업 파일은 이미 만들어져 있기 때문이다."""
+        stmt = (
+            select(BackupHistory)
+            .where(
+                BackupHistory.engine == "POSTGRES",
+                BackupHistory.status.in_(("SUCCESS", "PARTIAL_SUCCESS")),
+                BackupHistory.created_at >= since,
+            )
+            .order_by(BackupHistory.created_at.desc())
+            .limit(1)
+        )
+        return self.session.execute(stmt).scalars().first()
+
 
 class SystemLogRepository(BaseRepository[SystemLog]):
     """SRS FR-LOG-01(API 수집이력/사용자활동/시스템오류 로그) 대응."""

@@ -145,6 +145,15 @@ class Settings(BaseSettings):
     postgres_backup_retention_count: int = Field(default=5, ge=2)
     # pg_dump 실행 제한시간(초). 초과 시 자식 프로세스를 종료하고 DUMP_TIMEOUT으로 기록한다.
     postgres_backup_timeout_seconds: int = Field(default=600, gt=0)
+    # 재기동 후 놓친 예약 백업(매일 03:00 UTC) 보충 - postgres_backup_enabled와
+    # 이 플래그가 "둘 다" True일 때만 작동한다(fail-closed, 다른 확장 플래그와
+    # 동일 원칙). scheduler.py가 BlockingScheduler를 기본 MemoryJobStore로
+    # 쓰기 때문에(jobstore 미지정) 프로세스가 03:00을 걸쳐 완전히 꺼져 있던
+    # 기간은 APScheduler의 misfire_grace_time으로 구제되지 않는다 - 이 플래그가
+    # 켜져 있을 때만 scheduler 시작 시 "가장 최근 예정 시각 이후 성공한 백업이
+    # 있는가"를 애플리케이션 레벨에서 직접 확인해 없으면 정확히 1회 보충한다
+    # (services/postgres_backup_service.py의 run_catchup_if_needed 참고).
+    postgres_backup_catchup_enabled: bool = False
 
     model_config = SettingsConfigDict(env_file=str(BASE_DIR / ".env"), env_file_encoding="utf-8", extra="ignore")
 
