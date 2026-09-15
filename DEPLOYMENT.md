@@ -265,6 +265,13 @@ POSTGRES_BACKUP_ENABLED=true
 POSTGRES_BACKUP_CATCHUP_ENABLED=true
 ```
 
+- `docker-compose.yml`의 `scheduler.environment`가 이 값을 실제로
+  전달합니다(`POSTGRES_BACKUP_CATCHUP_ENABLED: ${POSTGRES_BACKUP_CATCHUP_ENABLED:-false}`) -
+  이 배선이 없던 시점에는 `.env`에 값을 넣어도 컨테이너 안에서는 항상
+  기본값(`false`)만 보여 기능이 켜지지 않았다(운영에는 이 문제가 있는 채로
+  배포된 적이 없다 - 이 플래그는 아직 운영 `.env`에 추가되지 않았다).
+  `api`/`web`/`db`/`redis`에는 이 변수를 전달하지 않는다(백업·보충 실행은
+  scheduler만 수행한다).
 - `POSTGRES_BACKUP_CATCHUP_ENABLED`는 `POSTGRES_BACKUP_ENABLED`가 `true`일
   때만 의미가 있습니다(기반 기능이 꺼져 있으면 catch-up 플래그가 `true`여도
   아무 것도 하지 않습니다).
@@ -287,11 +294,22 @@ POSTGRES_BACKUP_CATCHUP_ENABLED=true
   나머지는 `ALREADY_RUNNING`으로 안전하게 종료 - 재시도하지 않습니다).
 - catch-up 실행이 실패해도(DB 미기동, mount 미준비 등) scheduler 프로세스
   자체는 계속 정상 기동하며, 다음 정기 03:00 cron이 그대로 실행됩니다.
+- 정기 `backup` cron은 `misfire_grace_time=None`(무제한)으로 등록됩니다 -
+  scheduler 프로세스가 죽지 않은 채 이벤트 루프가 지연돼(다른 job 처리 등)
+  03:00 UTC 실행이 몇 초~몇 분 늦어져도 건너뛰지 않고 반드시 실행됩니다
+  (설치된 apscheduler==3.10.4의 라이브러리 기본값 `misfire_grace_time=1`을
+  그대로 뒀다면, 프로세스가 살아있는데도 1초 넘게 지연된 실행이 조용히
+  skip되고 - startup catch-up은 재시작 시에만 동작하므로 이 경우를 감지하지
+  못합니다). `coalesce=True`를 함께 유지해 지연이 누적돼도 실제 실행은
+  1회뿐입니다. 이 정책은 `backup` cron에만 적용되며 다른 15개 job의 기본
+  설정은 그대로입니다.
 
 **이력 구분.** `backup_history.trigger_type` 컬럼(`SCHEDULE`/`CATCHUP`/
 `MANUAL`)으로 정기 실행·재기동 보충 실행·수동 실행을 구분할 수 있습니다.
-운영자는 다음과 같이 조회해 재기동 보충이 실제로 몇 번 일어났는지 확인할
-수 있습니다.
+대시보드 빠른실행(`POST /api/tasks/trigger`, `task_type=BACKUP`)으로 실행한
+백업도 `MANUAL`로 정확히 기록됩니다(SQLite/PostgreSQL 엔진 모두). 운영자는
+다음과 같이 조회해 재기동 보충이 실제로 몇 번 일어났는지 확인할 수
+있습니다.
 
 ```sql
 SELECT created_at, status, trigger_type, error_code
