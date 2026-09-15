@@ -163,7 +163,26 @@ def build_scheduler() -> BlockingScheduler:
     scheduler.add_job(run_settlement_sync, CronTrigger(hour=7, minute=30), id="settlement_sync", max_instances=1)
     scheduler.add_job(run_profit_calculation, CronTrigger(hour=1, minute=0), id="profit_calculation", max_instances=1)
     scheduler.add_job(run_customer_stats, CronTrigger(hour=1, minute=30), id="customer_stats", max_instances=1)
-    scheduler.add_job(run_backup, CronTrigger(hour=3, minute=0), id="backup", max_instances=1)
+    # backup cron만 misfire_grace_time=None(무제한)을 명시한다 - 라이브러리 기본값
+    # (job_defaults={'misfire_grace_time': 1, 'coalesce': True, 'max_instances': 1},
+    # apscheduler/schedulers/base.py) 그대로 두면, 프로세스가 죽지 않고 살아 있는
+    # 상태에서도 이벤트 루프가 단 1초만 지연돼 03:00 UTC를 넘기면
+    # executors/base.py의 run_job()이 "job.misfire_grace_time is not None" 분기에서
+    # 그 실행을 통째로 건너뛴다(EVENT_JOB_MISSED) - 이 경우 프로세스는 계속 살아
+    # 있으므로 backup_catchup(재기동 시 1회 실행)도 다음 재시작 전까지 이 누락을
+    # 감지하지 못한다. misfire_grace_time=None은 이 grace-time 체크 자체를 완전히
+    # 끈다(공식 docstring: "None means allow the job to run no matter how late it
+    # is" - apscheduler/job.py) - 즉 프로세스가 살아만 있으면 아무리 늦게라도 반드시
+    # 실행된다. coalesce=True(라이브러리 기본값을 그대로 유지)는
+    # base.py의 _process_jobs()에서 "run_times[-1:] if job.coalesce else run_times"로
+    # 누적된 여러 due 시각을 최신 1개로 합치므로, 장시간 정지로 03:00이 여러 번
+    # 누적돼도 실제로는 1회만 실행된다. max_instances=1도 라이브러리 기본값과
+    # 동일하지만 backup_catchup과의 advisory lock 경합 상황을 명확히 하기 위해
+    # 명시적으로 남긴다. 다른 15개 job은 기존 라이브러리 기본값(misfire_grace_time=1)을
+    # 그대로 유지한다 - 이 변경은 backup cron에만 적용한다.
+    scheduler.add_job(
+        run_backup, CronTrigger(hour=3, minute=0), id="backup", max_instances=1, misfire_grace_time=None, coalesce=True
+    )
     # 재기동 후 놓친 예약 백업 보충 - scheduler.start() 직후 즉시(1회만) 실행되는
     # "date" 트리거다. run_date를 지정하지 않으면 DateTrigger가 "지금"으로 잡는데,
     # add_job() 호출 시점과 scheduler.start()의 실제 루프 시작 사이에는 항상 약간의

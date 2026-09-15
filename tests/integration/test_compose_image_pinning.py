@@ -201,6 +201,55 @@ class TestConfigQuietAndSecretSafety:
         assert _BASE_ENV["POSTGRES_PASSWORD"] not in result.stdout
 
 
+class TestCatchupFlagComposeWiring:
+    """fix/postgres-backup-missed-run-recovery 후속: POSTGRES_BACKUP_CATCHUP_ENABLED가
+    config/settings.py에만 있고 docker-compose.yml의 scheduler.environment에
+    전달되지 않으면, 운영 .env에 값을 넣어도 컨테이너 안에서는 항상 기본값
+    (false)만 보여 기능이 절대 켜지지 않는다 - 정적 YAML 파싱이 아니라 실제
+    `docker compose config`가 최종 렌더링한 값을 검증해야 이 배선 누락을
+    확실히 잡을 수 있다."""
+
+    def test_unset_env_var_selects_false_on_scheduler_only(self, docker_ready):
+        cfg = _compose_config(_env())
+        scheduler_env = cfg["services"]["scheduler"]["environment"]
+        assert scheduler_env["POSTGRES_BACKUP_CATCHUP_ENABLED"] == "false"
+
+    def test_true_override_propagates_to_scheduler(self, docker_ready):
+        cfg = _compose_config(_env(POSTGRES_BACKUP_CATCHUP_ENABLED="true"))
+        scheduler_env = cfg["services"]["scheduler"]["environment"]
+        assert scheduler_env["POSTGRES_BACKUP_CATCHUP_ENABLED"] == "true"
+
+    def test_false_override_still_renders_as_false(self, docker_ready):
+        cfg = _compose_config(_env(POSTGRES_BACKUP_CATCHUP_ENABLED="false"))
+        scheduler_env = cfg["services"]["scheduler"]["environment"]
+        assert scheduler_env["POSTGRES_BACKUP_CATCHUP_ENABLED"] == "false"
+
+    def test_other_services_never_receive_the_catchup_flag(self, docker_ready):
+        """백업(및 그 보충 실행)은 scheduler만 수행한다 - api/web/db/redis에는
+        이 변수 자체가 존재하면 안 된다(값이 false인 것과 "아예 없음"은
+        다르다 - 실수로 다른 서비스에 잘못 옮겨붙는 회귀를 잡는다)."""
+        cfg = _compose_config(_env(POSTGRES_BACKUP_CATCHUP_ENABLED="true"))
+        for service in ("api", "web", "db", "redis"):
+            env = cfg["services"][service].get("environment") or {}
+            assert "POSTGRES_BACKUP_CATCHUP_ENABLED" not in env, f"{service}에 catch-up 플래그가 전달되면 안 됩니다."
+
+    def test_existing_backup_settings_and_image_pinning_preserved(self, docker_ready):
+        """catch-up 배선을 추가하면서 기존 POSTGRES_BACKUP_* 설정이나 이미지
+        고정(${SCHEDULER_IMAGE:-...}) 계약을 깨지 않았는지 함께 확인한다."""
+        cfg = _compose_config(
+            _env(
+                POSTGRES_BACKUP_CATCHUP_ENABLED="true",
+                POSTGRES_BACKUP_ENABLED="true",
+                POSTGRES_BACKUP_RETENTION_COUNT="7",
+                SCHEDULER_IMAGE="shopping_erp_candidate/scheduler:TESTONLY-catchupwiring",
+            )
+        )
+        scheduler = cfg["services"]["scheduler"]
+        assert scheduler["environment"]["POSTGRES_BACKUP_ENABLED"] == "true"
+        assert scheduler["environment"]["POSTGRES_BACKUP_RETENTION_COUNT"] == "7"
+        assert scheduler["image"] == "shopping_erp_candidate/scheduler:TESTONLY-catchupwiring"
+
+
 class TestRealCandidateImageRevisionVerification:
     """이전 라운드에서 실제로 만들어 둔 candidate 이미지가 로컬에 남아있을
     때만 실행되는 실제(mock 아닌) revision 검증 - 없으면 skip한다(이

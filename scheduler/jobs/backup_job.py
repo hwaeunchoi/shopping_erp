@@ -27,14 +27,20 @@ from models.system import BackupHistory
 from repositories.system_repository import BackupHistoryRepository
 
 
-def run() -> dict:
+def run(trigger_type: str = "SCHEDULE") -> dict:
+    """trigger_type은 이 백업을 누가/무엇이 호출했는지(SCHEDULE/CATCHUP/MANUAL)를
+    backup_history에 그대로 남기기 위한 것이다 - 기본값 SCHEDULE은 기존
+    scheduler/scheduler.py의 03:00 cron 호출부(인자 없이 run() 호출)가 이전과
+    동일하게 동작하도록 하기 위함이고, api/routers/tasks.py의 운영자 수동
+    트리거(POST /api/tasks/trigger)만 명시적으로 trigger_type="MANUAL"을
+    넘긴다."""
     if settings.database_url.startswith("sqlite"):
-        return _run_sqlite_backup()
+        return _run_sqlite_backup(trigger_type)
 
     if settings.database_url.startswith(("postgresql", "postgres")):
         from services import postgres_backup_service
 
-        return postgres_backup_service.run_backup_job()
+        return postgres_backup_service.run_backup_job(trigger_type=trigger_type)
 
     raise NotImplementedError(
         f"지원하지 않는 DB 엔진입니다: {settings.database_url.split(':', 1)[0]} (SQLite/PostgreSQL만 지원)."
@@ -56,7 +62,7 @@ def run_catchup() -> dict:
     return {"skipped_disabled": 1}
 
 
-def _run_sqlite_backup() -> dict:
+def _run_sqlite_backup(trigger_type: str = "SCHEDULE") -> dict:
     db_path = Path(settings.database_url.replace("sqlite:///", "", 1))
     now = datetime.now(timezone.utc)
     # .gitignore의 backup/*/ 패턴(하위 디렉터리만 무시)에 맞춰 날짜별 하위 디렉터리에 저장한다.
@@ -83,6 +89,7 @@ def _run_sqlite_backup() -> dict:
                 error_message=error_message,
                 created_at=now,
                 engine="SQLITE",
+                trigger_type=trigger_type,
             )
         )
 

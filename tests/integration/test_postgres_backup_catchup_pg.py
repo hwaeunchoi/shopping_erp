@@ -354,10 +354,20 @@ class TestCatchupConcurrency:
 
     def test_manual_success_after_reference_time_prevents_catchup_duplicate(self, runner_image, seeded_source):
         """이미 (수동이든 예약이든) 최근 성공 기록이 기준 시각 이후에 있으면
-        catch-up이 중복 백업을 만들지 않는다."""
+        catch-up이 중복 백업을 만들지 않는다.
+
+        "N분 전"처럼 실제 벽시계에 의존하는 값으로 시딩하면, 테스트 실행
+        시각이 마침 03:00 UTC를 막 넘긴 직후(예: 03:02)일 때 "5분 전"이
+        전날 03:00 UTC보다 더 이전이 되어 버려(당일 새 기준 시각보다
+        이전이라 latest_success_since가 이 행을 못 찾음) 실제로 catch-up이
+        새 백업을 만들어버리는 경계값 flaky가 있었다(2026-09-15 전체
+        스위트 실행 중 실제로 이 경계를 넘겨 재현됨). _most_recent_scheduled_time_utc로
+        먼저 계산한 기준 시각 그 자체를 시딩하면(latest_success_since는
+        `created_at >= since`를 쓰므로) 실행 시각과 무관하게 항상 결정적이다."""
         sandbox = seeded_source
 
-        recent_success_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
+        reference = _most_recent_scheduled_time_utc(datetime.now(timezone.utc))
+        recent_success_at = reference.replace(tzinfo=None)
         _run_runner(
             runner_image,
             sandbox,
@@ -386,3 +396,77 @@ class TestCatchupConcurrency:
 
         listing = _run_runner(runner_image, sandbox, "backup_dir_listing", sandbox["source_url"])
         assert listing["dump_file_count"] == 0
+
+    def test_cron_and_catchup_racing_produce_exactly_one_dump(self, runner_image, seeded_source):
+        """운영 시나리오 재현: 03:00 UTC 정기 cron(backup_job.run(), trigger_type
+        기본값 SCHEDULE)과 재기동 직후 startup catch-up(run_catchup_if_needed(),
+        trigger_type CATCHUP)이 우연히 같은 순간 실행되는 경우 - 서로 다른
+        진입점(run() vs run_catchup_if_needed())이지만 결국 같은
+        _run_backup_locked()/advisory lock을 공유하므로, 두 진입점을 진짜
+        서로 다른 두 프로세스(docker run 컨테이너)로 동시에 실행해도 실제
+        dump는 정확히 1건만 만들어져야 한다."""
+        sandbox = seeded_source
+
+        reference = _most_recent_scheduled_time_utc(datetime.now(timezone.utc))
+        seeded_at = (reference - timedelta(days=2)).replace(tzinfo=None)
+        _run_runner(
+            runner_image,
+            sandbox,
+            "seed_backup_history",
+            sandbox["source_url"],
+            extra_env={"PGBACKUP_SEED_CREATED_AT": seeded_at.isoformat()},
+        )
+
+        before_fp = _run_runner(runner_image, sandbox, "fingerprint", sandbox["source_url"])
+
+        results: list = [None, None]
+        errors: list[Exception] = []
+
+        def _start(idx: int, action: str) -> None:
+            try:
+                results[idx] = _run_runner(
+                    runner_image, sandbox, action, sandbox["source_url"], extra_env=_CATCHUP_ENV, timeout=150
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=_start, args=(0, "run_backup")),
+            threading.Thread(target=_start, args=(1, "run_catchup")),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=170)
+
+        assert not errors, f"cron/catch-up 동시 실행 중 예외 발생: {errors}"
+        assert all(r is not None for r in results), "두 컨테이너 중 하나가 제한 시간 내에 끝나지 않았습니다."
+
+        # run_backup 액션의 결과는 항상 dict(SUCCESS/ALREADY_RUNNING)이고,
+        # run_catchup 액션의 결과는 정책상 후보가 아니면 skipped_up_to_date일
+        # 수도 있다 - 실제 dump 파일 개수와 history로 최종 판정한다.
+        listing = _run_runner(runner_image, sandbox, "backup_dir_listing", sandbox["source_url"])
+        assert listing["dump_file_count"] == 1, f"cron/catch-up 경합으로 dump가 1건이 아닙니다: {listing}, {results}"
+        assert listing["tmp_file_count"] == 0
+        assert listing["pgpass_file_count"] == 0
+
+        # backup_history_summary는 engine=POSTGRES인 모든 행을 반환한다 - 여기에는
+        # 이번 레이스가 만든 새 행뿐 아니라 이 테스트가 맨 앞에서 seed_backup_history로
+        # 미리 심어둔 과거 SUCCESS/SCHEDULE 행도 포함된다("아직 보충되지 않은 상태"를
+        # 만들기 위한 사전조건이었다). 따라서 "새로 생성된 성공 백업이 정확히 1건"은
+        # 전체 SUCCESS 개수가 (시딩 1건 + 레이스 결과 1건) = 2여야 한다는 것으로
+        # 검증한다 - 만약 레이스가 dump를 2번 만들었다면 SUCCESS가 3건이 됐을 것이다.
+        history = _run_runner(runner_image, sandbox, "backup_history_summary", sandbox["source_url"])
+        rows = history["rows"]
+        success_rows = [r for r in rows if r[1] == "SUCCESS"]
+        assert len(success_rows) == 2, f"SUCCESS 이력이 (시딩 1건 + 새 백업 1건) 2건이어야 합니다: {rows}"
+        non_success_rows = [r for r in rows if r[1] != "SUCCESS"]
+        assert all(
+            r[1] == "ALREADY_RUNNING" for r in non_success_rows
+        ), f"SUCCESS/ALREADY_RUNNING 외 상태가 있습니다: {rows}"
+        assert (
+            len(rows) == 3
+        ), f"seed 1건 + cron/catch-up 경합 결과(SUCCESS 1건 + ALREADY_RUNNING 1건)=3건이어야 합니다: {rows}"
+
+        after_fp = _run_runner(runner_image, sandbox, "fingerprint", sandbox["source_url"])
+        assert after_fp == before_fp

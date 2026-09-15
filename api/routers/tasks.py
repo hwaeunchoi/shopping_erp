@@ -57,7 +57,13 @@ def _run_task(task_type: str, db: Session) -> object:
     if task_type == "AD_COLLECT":
         return ad_collect_job.run()
     if task_type == "BACKUP":
-        return backup_job.run()
+        # task_execution_history에는 이미 trigger_type="MANUAL"로 기록되지만
+        # (trigger_task()의 history_repo.start() 호출부), backup_job.run()을
+        # 인자 없이 호출하면 postgres_backup_service.run_backup_job()의 기본값
+        # (trigger_type="SCHEDULE")이 그대로 backup_history에 남아 "운영자가
+        # 직접 실행한 백업"이 "정기 실행"으로 잘못 분류된다 - 여기서 명시적으로
+        # MANUAL을 전달해 두 테이블의 trigger_type이 항상 일치하게 한다.
+        return backup_job.run(trigger_type="MANUAL")
     if task_type == "REPORT_GENERATE":
         today = date.today()
         report = ReportService(db).generate_monthly_report(today.year, today.month)

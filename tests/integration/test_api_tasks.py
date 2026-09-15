@@ -92,6 +92,30 @@ class TestTriggerTask:
 
         assert resp.status_code == 500
 
+    def test_backup_task_passes_manual_trigger_type_through_to_backup_job(
+        self, client, auth_headers, seed_data, api_session_factory
+    ):
+        """fix/postgres-backup-missed-run-recovery 후속 감사 - task_execution_history는
+        이미 trigger_type="MANUAL"로 기록되지만(아래 assert), backup_job.run()을
+        인자 없이 호출하면 backup_history 쪽 trigger_type은 기본값(SCHEDULE)으로
+        잘못 남는 누락 경로가 있었다. api/routers/tasks.py의 BACKUP 분기가
+        backup_job.run(trigger_type="MANUAL")을 실제로 호출하는지 여기서 고정한다."""
+        with patch("api.routers.tasks.backup_job.run", return_value={"status": "SUCCESS"}) as backup_run:
+            resp = client.post("/api/tasks/trigger", json={"task_type": "BACKUP"}, headers=auth_headers)
+
+        assert resp.status_code == 200
+        backup_run.assert_called_once_with(trigger_type="MANUAL")
+
+        from models.extra import TaskExecutionHistory
+
+        db = api_session_factory()
+        try:
+            history = db.query(TaskExecutionHistory).filter_by(id=resp.json()["id"]).one()
+            assert history.trigger_type == "MANUAL"
+            assert history.task_type == "BACKUP"
+        finally:
+            db.close()
+
     def test_full_sync_runs_all_sub_jobs(self, client, auth_headers, seed_data):
         with (
             patch("api.routers.tasks.order_collect_job.run", return_value={}) as order_run,

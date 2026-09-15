@@ -123,6 +123,13 @@ services:
       POSTGRES_BACKUP_ENABLED: ${POSTGRES_BACKUP_ENABLED:-false}
       POSTGRES_BACKUP_RETENTION_COUNT: ${POSTGRES_BACKUP_RETENTION_COUNT:-5}
       POSTGRES_BACKUP_TIMEOUT_SECONDS: ${POSTGRES_BACKUP_TIMEOUT_SECONDS:-600}
+      # 재기동 후 놓친 예약 백업 보충(fix/postgres-backup-missed-run-recovery) -
+      # 기본 false. config/settings.py에 필드만 있고 여기서 전달하지 않으면
+      # 운영 .env에 값을 넣어도 컨테이너 안에서는 항상 기본값(false)만 보여
+      # 기능이 켜지지 않는다 - POSTGRES_BACKUP_ENABLED와 마찬가지로 scheduler
+      # 에만 전달한다(api/web/db/redis에는 두지 않는다 - 보충 실행도 scheduler만
+      # 수행한다).
+      POSTGRES_BACKUP_CATCHUP_ENABLED: ${POSTGRES_BACKUP_CATCHUP_ENABLED:-false}
     command: python scheduler/scheduler.py
     volumes:
       - erp_logs:/app/logs
