@@ -249,6 +249,58 @@ python -m pytest tests/integration/test_postgres_backup_restore_pg.py -v
   것을 권장합니다(위 7.1의 dry-run 테스트와 같은 방식이되, 실제 최신
   운영 백업 파일을 입력으로 사용).
 
+### 7.4 재기동 후 놓친 예약 백업 보충(catch-up)
+
+**배경.** APScheduler의 기본 job store는 메모리형(`MemoryJobStore`)이라
+scheduler 프로세스가 재시작되면 예약된 실행 시각 정보 자체가 사라집니다.
+`misfire_grace_time`은 "프로세스가 살아 있는데 실행이 약간 지연된 경우"만
+구제하며, 호스트·Docker가 며칠씩 정지돼 있던 기간의 누락된 실행은 misfire
+설정만으로는 복구되지 않습니다. `POSTGRES_BACKUP_CATCHUP_ENABLED`는 이
+공백을 메우기 위한 별도 보조 기능입니다.
+
+**활성화 조건 (기본 OFF).**
+
+```
+POSTGRES_BACKUP_ENABLED=true
+POSTGRES_BACKUP_CATCHUP_ENABLED=true
+```
+
+- `POSTGRES_BACKUP_CATCHUP_ENABLED`는 `POSTGRES_BACKUP_ENABLED`가 `true`일
+  때만 의미가 있습니다(기반 기능이 꺼져 있으면 catch-up 플래그가 `true`여도
+  아무 것도 하지 않습니다).
+- 7.1 절차로 기존 예약 백업을 먼저 안정적으로 운영한 뒤에 이 플래그를
+  켜는 것을 권장합니다.
+
+**동작 정책.**
+
+- scheduler 시작 시 즉시(one-shot) `backup_catchup` job이 등록·실행됩니다
+  (`scheduler/scheduler.py`) - 기존 03:00 UTC 정기 `backup` cron job은
+  전혀 바꾸지 않습니다.
+- 현재 UTC 시각 기준 "가장 최근 예정 시각"(당일 03:00 UTC, 아직 지나지
+  않았다면 전날 03:00 UTC)을 계산해, 그 시각 이후 성공(`SUCCESS` 또는
+  `PARTIAL_SUCCESS`)한 PostgreSQL 백업 기록이 있는지 확인합니다.
+- 있으면 아무 작업도 하지 않습니다. 없으면 **정확히 1회** 보충 백업을
+  실행합니다 - 여러 날이 누락됐어도 날짜별로 반복 실행하지 않고 최신
+  상태로 1회만 맞춥니다.
+- 기존 advisory lock을 그대로 재사용하므로, 정기 실행·수동 실행과 동시에
+  겹쳐도 실제 dump는 한 번만 만들어집니다(먼저 lock을 잡은 쪽만 실행,
+  나머지는 `ALREADY_RUNNING`으로 안전하게 종료 - 재시도하지 않습니다).
+- catch-up 실행이 실패해도(DB 미기동, mount 미준비 등) scheduler 프로세스
+  자체는 계속 정상 기동하며, 다음 정기 03:00 cron이 그대로 실행됩니다.
+
+**이력 구분.** `backup_history.trigger_type` 컬럼(`SCHEDULE`/`CATCHUP`/
+`MANUAL`)으로 정기 실행·재기동 보충 실행·수동 실행을 구분할 수 있습니다.
+운영자는 다음과 같이 조회해 재기동 보충이 실제로 몇 번 일어났는지 확인할
+수 있습니다.
+
+```sql
+SELECT created_at, status, trigger_type, error_code
+FROM backup_history
+WHERE engine = 'POSTGRES'
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
 ## 8. Secret 회전 절차 (JWT / Credential 암호화 키)
 
 ### 8.1 암호화 계약 (변경 금지)
