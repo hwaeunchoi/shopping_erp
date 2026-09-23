@@ -47,7 +47,8 @@ RUNNER_SCRIPT_REL = "tests/integration/_pg_backup_runner.py"
 # 이 브랜치의 alembic 코드 head - migrations/versions에 새 revision을 추가하지
 # 않는 한 고정값이다. fix/postgres-backup-missed-run-recovery가 backup_history에
 # trigger_type 컬럼을 추가하는 560dd2f4b2ba 리비전을 새로 얹었으므로 갱신한다.
-EXPECTED_ALEMBIC_HEAD = "560dd2f4b2ba"
+# 9162c416e673은 cs_cases 유니크 인덱스에 external_source를 포함시키는 리비전이다.
+EXPECTED_ALEMBIC_HEAD = "9162c416e673"
 
 pytestmark = pytest.mark.skipif(shutil.which("docker") is None, reason="Docker CLI가 없는 환경 - 통합 테스트 skip")
 
