@@ -17,8 +17,11 @@ build: .의 기본 이미지 이름으로 재기동되어 migration이 이미 �
 프로세스의 임시 환경변수로만 렌더링한다.
 """
 
+import os
+import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -60,17 +63,31 @@ def _image_exists(ref: str) -> bool:
         return False
 
 
+def _run_compose(env: dict[str, str], *args: str) -> subprocess.CompletedProcess:
+    """저장소 .env를 읽지 않도록 빈 --env-file을 명시해 `docker compose`를 실행한다.
+
+    compose는 기본적으로 프로젝트 디렉터리의 .env를 자동 로드하고 이 값이 프로세스
+    환경변수로 지우지 못한 변수를 채운다 - 로컬 운영 .env에 이미지가 고정돼 있으면
+    "변수 미설정" 전제 테스트가 실제 .env 내용에 따라 달라진다. 임시 빈 env 파일을
+    --env-file로 넘기면 .env 자동 로드가 대체돼 테스트가 이 프로세스의 env dict만으로
+    결정된다(임시 파일은 실행 직후 자동 삭제)."""
+    with tempfile.TemporaryDirectory(prefix="compose_isolated_env_") as tmp:
+        empty_env_file = Path(tmp) / "isolated.env"
+        empty_env_file.write_text("", encoding="utf-8")
+        return subprocess.run(
+            ["docker", "compose", "--env-file", str(empty_env_file), "-f", str(COMPOSE_FILE), *args],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+
+
 def _compose_config(env: dict[str, str]) -> dict:
-    result = subprocess.run(
-        ["docker", "compose", "-f", str(COMPOSE_FILE), "config"],
-        cwd=REPO_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=30,
-    )
+    result = _run_compose(env, "config")
     assert result.returncode == 0, f"docker compose config 실패:\n{result.stderr}"
     return yaml.safe_load(result.stdout)
 
@@ -90,15 +107,18 @@ _BASE_ENV = {
 }
 
 
-def _env(**overrides: str) -> dict[str, str]:
-    import os
+def _compose_referenced_vars() -> set[str]:
+    return set(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)", COMPOSE_FILE.read_text(encoding="utf-8")))
 
+
+def _env(**overrides: str) -> dict[str, str]:
     env = dict(os.environ)
-    env.update(_BASE_ENV)
-    # 이전 실행에서 남을 수 있는 실제 override용 변수를 이 프로세스 환경에서는
-    # 절대 갖고 오지 않는다 - 매 테스트가 원하는 조합만 명시적으로 설정한다.
-    for key in ("API_IMAGE", "SCHEDULER_IMAGE", "WEB_IMAGE"):
+    # docker-compose.yml이 ${VAR}로 참조하는 모든 변수를 호스트 환경에서 제거한다 -
+    # 호스트 셸에 남은 실제 값(이미지 고정·백업 경로·플래그 등)이 테스트 결과에
+    # 섞이지 않게 하고, 매 테스트가 원하는 조합만 명시적으로 설정한다.
+    for key in _compose_referenced_vars():
         env.pop(key, None)
+    env.update(_BASE_ENV)
     env.update(overrides)
     return env
 
@@ -174,28 +194,14 @@ class TestConfigQuietAndSecretSafety:
             API_IMAGE="shopping_erp_candidate/api:TESTONLY-quiet",
             SCHEDULER_IMAGE="shopping_erp_candidate/scheduler:TESTONLY-quiet",
         )
-        result = subprocess.run(
-            ["docker", "compose", "-f", str(COMPOSE_FILE), "config", "--quiet"],
-            cwd=REPO_ROOT,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+        result = _run_compose(env, "config", "--quiet")
         assert result.returncode == 0
 
     def test_rendered_config_does_not_echo_secret_values(self, docker_ready):
         """config --images 결과에는 이미지 이름만 담겨야 한다 - Secret 값이
         섞여 나오지 않는지 대표적으로 확인한다."""
         env = _env(API_IMAGE="shopping_erp_candidate/api:TESTONLY-secretcheck")
-        result = subprocess.run(
-            ["docker", "compose", "-f", str(COMPOSE_FILE), "config", "--images"],
-            cwd=REPO_ROOT,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+        result = _run_compose(env, "config", "--images")
         assert _BASE_ENV["JWT_SECRET_KEY"] not in result.stdout
         assert _BASE_ENV["CREDENTIAL_ENCRYPTION_KEY"] not in result.stdout
         assert _BASE_ENV["POSTGRES_PASSWORD"] not in result.stdout
