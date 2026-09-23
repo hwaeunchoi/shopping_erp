@@ -223,6 +223,12 @@ class BaseMallConnector(ABC):
     # COMMERCIAL_ERP_ROADMAP.md 5-B단계 절 참고 - 실계정에 잘못된 값으로 답변을
     # 보내는 위험을 피하기 위함). CS 케이스는 답변 초안 저장까지만 지원한다.
     supports_inquiry_sync: bool = False
+    # 상품별 문의(예: 쿠팡 onlineInquiries) 조회 지원 여부 - supports_inquiry_sync
+    # (콜센터/CS문의)와는 별개 capability다. 채널마다 완전히 다른 엔드포인트·응답
+    # 스키마를 쓰므로(공식 문서 별도 확인 필요) 한쪽을 지원해도 다른 쪽은 여전히
+    # 미지원일 수 있다. 답변(쓰기) 전송은 이 인터페이스에 없다 - supports_inquiry_sync
+    # 위 주석과 동일한 이유(신규 답변의 요청 바디 필드 의미를 안전하게 확정할 수 없음).
+    supports_product_inquiry_sync: bool = False
 
     def _marketplace_code(self) -> str:
         """오류 메시지용 안전한 채널 식별자(Secret/PII 아님). platform_code가 없으면 클래스명."""
@@ -360,6 +366,16 @@ class BaseMallConnector(ABC):
              "customer_phone": Optional[str]}    # PII - 호출부는 로그에 남기지 않는다
         """
         raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "inquiry_sync")
+
+    def fetch_product_inquiries(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+        """기간 내 채널 상품별 문의(예: 쿠팡 onlineInquiries) 목록을 정규화된 형식으로
+        조회한다(기본: 미지원 오류 - 빈 목록으로 위장하지 않는다).
+        supports_product_inquiry_sync=True인 커넥터만 오버라이드한다.
+
+        반환 형식(정규화)은 fetch_inquiries()와 동일한 키를 쓴다 - CsChannelSyncService가
+        두 소스를 같은 upsert 경로로 처리하기 위함. 채널마다 응답에 실제로 존재하지
+        않는 필드는 None으로 채운다(예: PII 필드가 없는 채널은 customer_phone=None)."""
+        raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "product_inquiry_sync")
 
     def fetch_settlement_details(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
         """기간 내 정산 상세(주문 단위) 내역을 정규화된 형식으로 조회한다(기본: 미지원

@@ -4,8 +4,9 @@ scheduler/jobs/cs_inquiry_sync_job.py
 전체 활성 쇼핑몰 플랫폼의 채널 CS(고객문의)를 자동으로 조회 동기화한다
 (services.cs_channel_sync_service.CsChannelSyncService 참고 - capability
 인지 + 항목별 SAVEPOINT 격리 + 외부 문의ID 기반 멱등 저장). 상용 ERP
-확장(5단계, B묶음). 공식 계약이 확인된 쿠팡 콜센터 문의만 실제로 동기화되고
-(CoupangConnector.supports_inquiry_sync=True), 나머지 채널은 capability가
+확장(5단계, B묶음). 공식 계약이 확인된 쿠팡 콜센터 문의·상품별 문의 모두 실제로
+동기화되고(CoupangConnector.supports_inquiry_sync/supports_product_inquiry_sync=True,
+sync_all_inquiries()가 두 소스를 모두 순회), 나머지 채널은 두 capability가 모두
 False라 자동으로 건너뛴다(미지원과 "결과 0건"을 구분 - results에
 skipped: unsupported로 남는다).
 
@@ -20,8 +21,8 @@ skipped: unsupported로 남는다).
 전용 - services/cs_channel_sync_service.py 모듈 docstring 참고).
 
 상용 ERP 확장(6단계): 운영 대시보드 근거로 integration_status(integration_type=
-"CS_INQUIRY")를 갱신한다 - sync_inquiries()가 이미 반환하던 status(SUCCESS/
-PARTIAL_SUCCESS/FAILED/UNSUPPORTED, 이 잡 안에서는 DISABLED가 나오지 않는다 -
+"CS_INQUIRY")를 갱신한다 - sync_all_inquiries()가 두 소스를 합산해 반환하는
+status(SUCCESS/PARTIAL_SUCCESS/FAILED/UNSUPPORTED, 이 잡 안에서는 DISABLED가 나오지 않는다 -
 전역 플래그가 꺼져 있으면 위에서 이미 반환했다)를 그대로 옮겨 적을 뿐이고,
 CsChannelSyncService의 동기화 로직(멱등 저장/로컬 데이터 보존/SAVEPOINT
 격리)은 전혀 바꾸지 않았다.
@@ -75,7 +76,7 @@ def run() -> dict[str, dict]:
         for platform in PlatformRepository(db).list_active():
             try:
                 connector = get_mall_connector(platform.connector_class, session=db, platform_id=platform.id)
-                result = sync_service.sync_inquiries(connector, platform.id, start_date, end_date)
+                result = sync_service.sync_all_inquiries(connector, platform.id, start_date, end_date)
                 results[platform.code] = result
                 _record_integration_status(integration_status_repo, platform.code, result.get("status"))
                 db.commit()

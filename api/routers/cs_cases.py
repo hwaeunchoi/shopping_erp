@@ -317,6 +317,11 @@ class SyncResultOut(BaseModel):
     updated: int = 0
     failed: int = 0
     reason_code: Optional[str] = None
+    # 소스별(콜센터 문의/상품별 문의) 세부 결과 - 기존 필드(status/created/updated/
+    # failed)는 항상 합산값이라 하위호환은 유지되고, 어느 소스가 실패/미지원인지는
+    # 이 필드로 구분한다(services.cs_channel_sync_service.CsChannelSyncService.
+    # sync_all_inquiries()의 by_source 그대로).
+    by_source: dict = {}
 
 
 @router.post(
@@ -324,10 +329,11 @@ class SyncResultOut(BaseModel):
     response_model=SyncResultOut,
     dependencies=[Depends(require_permission("CS_MANAGE"))],
     summary="채널 CS(고객문의) 수동 동기화 - 공식 계약이 확인된 채널만 실제로 조회한다",
-    description="현재는 쿠팡 콜센터 문의만 실제로 동기화된다(공식 계약 확인됨) - 다른"
-    " 채널/문의유형은 UNSUPPORTED로 반환된다. settings.cs_inquiry_sync_enabled가"
-    " False(기본값)면 DISABLED를 반환하고 외부 채널을 호출하지 않는다. 실제 채널"
-    " 답변 전송은 이 엔드포인트를 포함해 어디에도 없다(조회 전용).",
+    description="현재는 쿠팡 콜센터 문의·상품별 문의가 함께 동기화된다(둘 다 공식 계약"
+    " 확인됨, by_source에 소스별 결과가 나뉘어 담긴다) - 다른 채널/미지원 소스는"
+    " UNSUPPORTED로 반환된다. settings.cs_inquiry_sync_enabled가 False(기본값)면"
+    " DISABLED를 반환하고 외부 채널을 호출하지 않는다. 실제 채널 답변 전송은 이"
+    " 엔드포인트를 포함해 어디에도 없다(조회 전용).",
     responses={404: {"description": "플랫폼을 찾을 수 없습니다."}},
 )
 def sync_channel_inquiries(payload: SyncRequest, db=Depends(get_db)) -> SyncResultOut:
@@ -339,7 +345,7 @@ def sync_channel_inquiries(payload: SyncRequest, db=Depends(get_db)) -> SyncResu
     start_date = end_date - timedelta(days=payload.days)
     try:
         connector = get_mall_connector(platform.connector_class, session=db, platform_id=platform.id)
-        result = CsChannelSyncService(db).sync_inquiries(connector, platform.id, start_date, end_date)
+        result = CsChannelSyncService(db).sync_all_inquiries(connector, platform.id, start_date, end_date)
     except MarketplaceCapabilityUnsupportedError:
         db.rollback()
         return SyncResultOut(platform_code=platform.code, status="UNSUPPORTED")

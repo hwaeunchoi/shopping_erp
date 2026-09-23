@@ -114,18 +114,49 @@ RETURN_MAX_RANGE_DAYS = 31
 
 # --- 콜센터 문의(CS) 조회 (공식 문서: developers.coupang.com/hc/en-us/articles/
 # 360033645354-Query-of-Coupang-Contact-Center-Inquiries, 2026-09 조회) ---
-# 상품별 문의(onlineInquiries)도 조회 계약 자체는 같은 문서군에서 확인되지만, 이번
-# 단계는 콜센터 문의만 구현한다(범위 관리 - docs/COMMERCIAL_ERP_ROADMAP.md 5-B단계
-# 절 참고). 답변(쓰기) API(POST .../replies)의 요청 바디 필드(vendorId/inquiryId/
-# content/replyBy/parentAnswerId)는 존재가 확인되지만, parentAnswerId가 "신규
-# 답변(transfer 아님)" 케이스에서 어떤 값이어야 하는지는 문서에서 확정할 수 없어
-# 이번 단계에서 답변 전송은 구현하지 않는다(fetch만, 조회 전용).
+# 상품별 문의(onlineInquiries)는 같은 문서군의 별도 API로 공식 문서
+# (developers.coupang.com/hc/en-us/articles/360033400754-Customer-Inquiry-Query-by-Product,
+# 2026-09 재조회 - 아래 ONLINE_INQUIRY_PATH_TMPL 주석 참고)로 재확인한 뒤 이번
+# 라운드에서 함께 구현했다. 답변(쓰기) API(POST .../replies)의 요청 바디 필드
+# (vendorId/inquiryId/content/replyBy/parentAnswerId)는 존재가 확인되지만, parentAnswerId가
+# "신규 답변(transfer 아님)" 케이스에서 어떤 값이어야 하는지는 문서에서 확정할 수
+# 없어 이번 단계에서도 답변 전송은 구현하지 않는다(콜센터/상품별 문의 둘 다 fetch만,
+# 조회 전용).
 CALL_CENTER_INQUIRY_PATH_TMPL = "/v2/providers/openapi/apis/api/v5/vendors/{vendor_id}/callCenterInquiries"
 # partnerCounselingStatus는 필수 파라미터이며 한 번에 한 상태만 준다(공식 문서
 # 파라미터 표: NONE/ANSWER/NO_ANSWER/TRANSFER) - 그래서 4종을 순회해 합친다.
 CALL_CENTER_INQUIRY_STATUSES = ["NONE", "ANSWER", "NO_ANSWER", "TRANSFER"]
 CALL_CENTER_INQUIRY_MAX_PER_PAGE = 30
 CALL_CENTER_INQUIRY_MAX_RANGE_DAYS = 7
+
+# --- 상품별 문의(onlineInquiries) 조회 (공식 문서: developers.coupang.com/hc/en-us/
+# articles/360033400754-Customer-Inquiry-Query-by-Product, 2026-09 재조회) ---
+# 경로/파라미터/응답 필드를 공식 문서에서 직접 재확인했다(코드 주석만으로 계약을
+# 확정하지 않는다 - 이전 라운드에서 이 문서 재확인을 요구받아 다시 조회함):
+# - GET /v2/providers/openapi/apis/api/v5/vendors/{vendorId}/onlineInquiries
+# - 쿼리: vendorId(필수)/answeredType(필수, ALL|ANSWERED|NOANSWER)/
+#   inquiryStartAt·inquiryEndAt(필수, yyyy-MM-dd, 기간 <= 7일)/pageNum(선택, 기본 1)/
+#   pageSize(선택, 기본 10, 최대 50).
+# - answeredType=ALL이 유효값이라(콜센터 문의의 4개 상태 순회와 달리) 상태를
+#   나누지 않고 단일 값으로 전체를 조회한다.
+# - 응답 data.content[]: inquiryId(Number)/productId/sellerProductId/content/
+#   inquiryAt(ISO-8601)/orderIds(문서상 List - 콜센터 문의의 단일 orderId와 다름)/
+#   commentDtoList[](inquiryCommentId/inquiryId/content/inquiryCommentAt). 그 외
+#   sellerItemId/vendorItemId 필드도 존재하나 이번 단계에서는 사용하지 않는다.
+#   항목별 "답변여부"를 나타내는 별도 상태 필드는 응답 스키마에 없다.
+#   [공식 명시 아님 - 구현상 보수적 추론] commentDtoList가 비어있지 않으면 답변이
+#   있다고 간주한다. 공식 문서는 이 해석을 명시하지 않으므로 실계정 응답으로 확인 전까지
+#   추론으로 취급한다(아래 _normalize_online_inquiries 참고).
+# - inquiryId의 고유 범위(콜센터 문의와 별개 ID 공간인지)는 공식 문서에 명시돼 있지
+#   않다 - 그래서 dedup 키에 external_source를 포함한다.
+# - 이 응답에는 고객 이름/전화번호 등 어떤 PII 필드도 없다(콜센터 문의의 buyerPhone과
+#   다름) - 공식 문서 재확인으로 없음을 확인했다(추측 아님).
+# - 인증(HMAC 서명)은 콜센터 문의와 동일한 API 버전(v5)·동일한 vendors 경로 패턴이라
+#   같은 _authorization()을 그대로 재사용한다(신규 인증 조사 불필요).
+ONLINE_INQUIRY_PATH_TMPL = "/v2/providers/openapi/apis/api/v5/vendors/{vendor_id}/onlineInquiries"
+ONLINE_INQUIRY_ANSWERED_TYPE_ALL = "ALL"
+ONLINE_INQUIRY_MAX_PER_PAGE = 50
+ONLINE_INQUIRY_MAX_RANGE_DAYS = 7
 
 # 응답 필드 receiptStatus(응답 예시로 확인, 파라미터 표의 코드와는 다른 표기) -> 내부
 # 정규화 상태. 실 응답 예시에서 확인된 값만 매핑하고 나머지는 REVIEW로 보존한다(완료로
@@ -404,6 +435,7 @@ class CoupangConnector(BaseMallConnector):
     supports_product_create = True
     supports_product_option_create = True
     supports_inquiry_sync = True
+    supports_product_inquiry_sync = True
 
     def __init__(
         self, session: Any = None, platform_id: Optional[int] = None, http_client: Optional[httpx.Client] = None
@@ -526,14 +558,24 @@ class CoupangConnector(BaseMallConnector):
         return normalized[0] if normalized else None
 
     def fetch_inquiries(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
-        """콜센터 문의(CS) 목록 조회 - 상품별 문의(onlineInquiries)는 이번 단계
-        범위 밖(모듈 상단 CALL_CENTER_INQUIRY_PATH_TMPL 주석 참고)."""
+        """콜센터 문의(CS) 목록 조회 - 상품별 문의(onlineInquiries)는 fetch_product_inquiries()가
+        별도로 담당한다(모듈 상단 ONLINE_INQUIRY_PATH_TMPL 주석 참고)."""
         credentials = self._get_credentials()
         if credentials is None:
             raise MarketplaceCredentialMissingError("coupang")
         access_key, secret_key, vendor_id = credentials
         raw_items = self._fetch_raw_call_center_inquiries(start_date, end_date, access_key, secret_key, vendor_id)
         return self._normalize_call_center_inquiries(raw_items)
+
+    def fetch_product_inquiries(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+        """상품별 문의(onlineInquiries) 목록 조회(모듈 상단 ONLINE_INQUIRY_PATH_TMPL
+        주석의 공식 문서 재확인 근거 참고)."""
+        credentials = self._get_credentials()
+        if credentials is None:
+            raise MarketplaceCredentialMissingError("coupang")
+        access_key, secret_key, vendor_id = credentials
+        raw_items = self._fetch_raw_online_inquiries(start_date, end_date, access_key, secret_key, vendor_id)
+        return self._normalize_online_inquiries(raw_items)
 
     def fetch_exchanges(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
         """교환 목록 조회(공식 문서: developers.coupang.com/ko/api/exchanges/
@@ -1168,6 +1210,80 @@ class CoupangConnector(BaseMallConnector):
                     "needs_answer": item.get("csPartnerCounselingStatus") == "requestAnswer",
                     "platform_order_no": str(order_id) if order_id is not None else None,
                     "customer_phone": item.get("buyerPhone"),
+                }
+            )
+        return normalized
+
+    def _fetch_raw_online_inquiries(
+        self, start_date: date, end_date: date, access_key: str, secret_key: str, vendor_id: str
+    ) -> list[dict[str, Any]]:
+        """answeredType=ALL 단일 값으로 조회한다(모듈 상단 ONLINE_INQUIRY_PATH_TMPL
+        주석 - 공식 문서에 ALL이 유효값으로 명시돼 있어 콜센터 문의처럼 상태별
+        순회가 필요 없다)."""
+        path = ONLINE_INQUIRY_PATH_TMPL.format(vendor_id=vendor_id)
+        raw_items: list[dict[str, Any]] = []
+
+        window_start = start_date
+        while window_start <= end_date:
+            window_end = min(window_start + timedelta(days=ONLINE_INQUIRY_MAX_RANGE_DAYS - 1), end_date)
+            page_num = 1
+            while True:
+                params: list[tuple[str, str]] = [
+                    ("vendorId", vendor_id),
+                    ("answeredType", ONLINE_INQUIRY_ANSWERED_TYPE_ALL),
+                    ("inquiryStartAt", window_start.isoformat()),
+                    ("inquiryEndAt", window_end.isoformat()),
+                    ("pageNum", str(page_num)),
+                    ("pageSize", str(ONLINE_INQUIRY_MAX_PER_PAGE)),
+                ]
+                query = urlencode(params)
+                authorization = self._authorization(access_key, secret_key, "GET", path, query)
+                response = self._request_with_retry("GET", f"{path}?{query}", headers={"Authorization": authorization})
+                raise_for_status("coupang", response.status_code)
+                with external_call("coupang"):
+                    payload = response.json()
+                    data = payload.get("data") or {}
+                    raw_items.extend(data.get("content", []) or [])
+                    pagination = data.get("pagination") or {}
+                    current_page = pagination.get("currentPage") or page_num
+                    total_pages = pagination.get("totalPages") or page_num
+                if current_page >= total_pages:
+                    break
+                page_num += 1
+            window_start = window_end + timedelta(days=1)
+
+        return raw_items
+
+    @staticmethod
+    def _normalize_online_inquiries(raw_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """inquiryId가 없는 항목은 dedup 키가 없어 대상에서 제외한다(방어적, 콜센터
+        문의와 동일 관례). orderIds는 공식 문서상 List다(콜센터 문의의 단일 orderId와
+        다름) - 정확히 1건일 때만 platform_order_no로 채운다(0건이면 연결할 주문이
+        없고, 2건 이상이면 어느 주문이 "이" 문의와 진짜 관련 있는지 확인할 근거가
+        없어 임의로 첫 번째를 고르지 않는다 - 요구사항 "확인된 식별자가 있을 때만
+        연결"). 답변여부를 나타내는 별도 상태 필드가 응답에 없어(모듈 상단 주석)
+        commentDtoList가 비어있는지로 raw_status/needs_answer를 파생한다 - 이는
+        공식 명시가 아니라 구현상 보수적 추론이며, 실계정 응답으로 확인 전까지
+        raw_status는 조회 결과의 파생값(ANSWERED/NOANSWER)일 뿐이다.
+        이 API 응답에는 고객 PII 필드가 없어(모듈 상단 주석) customer_phone은 항상
+        None이다."""
+        normalized: list[dict[str, Any]] = []
+        for item in raw_items:
+            inquiry_id = item.get("inquiryId")
+            if inquiry_id is None:
+                continue
+            order_ids = item.get("orderIds") or []
+            platform_order_no = str(order_ids[0]) if len(order_ids) == 1 else None
+            has_comment = bool(item.get("commentDtoList"))
+            normalized.append(
+                {
+                    "platform_inquiry_id": str(inquiry_id),
+                    "content": item.get("content") or "",
+                    "inquiry_at": _parse_coupang_datetime(item.get("inquiryAt")),
+                    "raw_status": "ANSWERED" if has_comment else "NOANSWER",
+                    "needs_answer": not has_comment,
+                    "platform_order_no": platform_order_no,
+                    "customer_phone": None,
                 }
             )
         return normalized

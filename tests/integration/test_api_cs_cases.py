@@ -340,6 +340,35 @@ class TestDashboardAndSync:
         resp = client.post("/api/cs-cases/sync", json={"platform_id": 999999, "days": 7}, headers=auth_headers)
         assert resp.status_code == 404
 
+    def test_sync_reports_per_source_breakdown_when_enabled(self, client, auth_headers, seed_data):
+        """상용 ERP 확장(콜센터 문의 + 상품별 문의 동시 동기화) - /sync 응답의
+        by_source에 두 소스 각각의 결과가 담기는지 확인한다(실제 채널 호출은
+        모의 커넥터로 대체 - 외부 HTTP 요청 없음)."""
+        from unittest.mock import MagicMock, patch
+
+        from config.settings import settings
+
+        connector = MagicMock()
+        connector.supports_inquiry_sync = True
+        connector.supports_product_inquiry_sync = True
+        connector.fetch_inquiries.return_value = []
+        connector.fetch_product_inquiries.return_value = []
+
+        with (
+            patch.object(settings, "cs_inquiry_sync_enabled", True),
+            patch("api.routers.cs_cases.get_mall_connector", return_value=connector),
+        ):
+            resp = client.post(
+                "/api/cs-cases/sync", json={"platform_id": seed_data["platform_id"], "days": 7}, headers=auth_headers
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "SUCCESS"
+        assert set(body["by_source"].keys()) == {"COUPANG_CALL_CENTER", "COUPANG_PRODUCT_INQUIRY"}
+        assert body["by_source"]["COUPANG_CALL_CENTER"]["status"] == "SUCCESS"
+        assert body["by_source"]["COUPANG_PRODUCT_INQUIRY"]["status"] == "SUCCESS"
+
 
 class TestReference:
     def test_reference_lists_inquiry_types_and_priorities(self, client, auth_headers, seed_data):

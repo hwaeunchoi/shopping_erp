@@ -4,12 +4,16 @@ models/cs_case.py
 상용 ERP 확장(5단계, B묶음) - 문의·CS 통합 관리(cs_cases/cs_case_history).
 
 CS 케이스는 수기 생성(전화/채팅 등 채널 밖 문의)과 채널 문의 동기화(현재는
-쿠팡 콜센터 문의 조회만 공식 계약 확인됨 - services/cs_channel_sync_service.py
-참고) 양쪽 다 같은 테이블에 담긴다. 채널에서 들어온 건은 platform_id +
-external_inquiry_id가 채워지고, 이 둘의 조합이 유니크해 재수집 시 중복
-케이스를 만들지 않는다(수기 생성 건은 external_inquiry_id가 NULL이라
-서로 충돌하지 않는다 - SQLite/PostgreSQL 모두 NULL은 유니크 제약에서
-서로 다른 값으로 취급).
+쿠팡 콜센터 문의·상품별 문의 조회만 공식 계약 확인됨 - services/
+cs_channel_sync_service.py 참고) 양쪽 다 같은 테이블에 담긴다. 채널에서 들어온
+건은 platform_id + external_source + external_inquiry_id가 채워지고, 이 셋의
+조합이 유니크해 재수집 시 중복 케이스를 만들지 않는다(수기 생성 건은 셋 다
+NULL이라 서로 충돌하지 않는다 - SQLite/PostgreSQL 모두 NULL은 유니크 제약에서
+서로 다른 값으로 취급). external_source를 포함하는 이유: 같은 채널의 서로 다른
+문의 API(콜센터 문의/상품별 문의)가 독립된 inquiryId 공간을 쓸 수 있어, 이를
+빼면 서로 다른 문의를 같은 케이스로 오인하는 실제 버그가 있었다 - 아래
+`__table_args__`의 유니크 인덱스 주석과 `repositories/cs_case_repository.py`의
+`get_by_external()` 시그니처를 함께 참고.
 
 주문/주문라인/상품/배송/출고와의 연결은 전부 nullable FK다(하나의 CS
 케이스가 반드시 주문에 연결될 필요는 없다 - 배송 전 상품 문의 등). 클레임
@@ -51,10 +55,17 @@ class CsCase(Base, TimestampMixin):
 
     __tablename__ = "cs_cases"
     __table_args__ = (
-        # platform_id+external_inquiry_id 조합 유니크 - 채널 문의 재수집 시 중복 케이스
-        # 생성을 막는다. 수기 생성 건(둘 다 NULL)은 여러 건이 있어도 유니크 제약에 걸리지
-        # 않는다(NULL은 서로 다른 값으로 취급되는 표준 동작 - order_items의 동일 관례 참고).
-        Index("uq_cs_case_external_inquiry", "platform_id", "external_inquiry_id", unique=True),
+        # platform_id+external_source+external_inquiry_id 조합 유니크 - 채널 문의
+        # 재수집 시 중복 케이스 생성을 막는다. external_source를 포함하는 이유:
+        # 한 채널이 서로 다른 문의 API(예: 쿠팡 콜센터 문의 vs 상품별 문의)를 동시에
+        # 지원하게 되면서, 두 API의 inquiryId가 서로 다른 독립 ID 공간이라 우연히
+        # 같은 숫자값을 가질 수 있음이 확인됐다(공식 문서에 고유 범위가 명시돼 있지
+        # 않아 안전한 쪽으로 가정) - external_source를 빼면 한쪽 문의가 다른 쪽으로
+        # 오인되어 내용이 잘못 덮어써지거나 두 번째 문의가 아예 생성되지 않는 실제
+        # 버그가 있었다(services/cs_channel_sync_service.py 재작업 전 상태). 수기
+        # 생성 건(셋 다 NULL)은 여러 건이 있어도 유니크 제약에 걸리지 않는다(NULL은
+        # 서로 다른 값으로 취급되는 표준 동작 - order_items의 동일 관례 참고).
+        Index("uq_cs_case_external_inquiry", "platform_id", "external_source", "external_inquiry_id", unique=True),
         Index("idx_cs_cases_status", "status"),
         Index("idx_cs_cases_assignee", "assignee_id"),
         Index("idx_cs_cases_due_at", "due_at"),
@@ -66,8 +77,10 @@ class CsCase(Base, TimestampMixin):
     # 채널 연동 식별자(수기 생성 건은 전부 NULL).
     platform_id: Mapped[Optional[int]] = mapped_column(ForeignKey("platforms.id"), nullable=True)
     external_inquiry_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    # 채널 문의 종류 - 현재는 "COUPANG_CALL_CENTER"만 실제로 채워진다(공식 계약 확인된
-    # 유일한 조회 대상 - services/cs_channel_sync_service.py 참고). 수기 생성 건은 NULL.
+    # 채널 문의 종류 - 현재는 "COUPANG_CALL_CENTER"/"COUPANG_PRODUCT_INQUIRY"만
+    # 실제로 채워진다(공식 계약 확인된 조회 대상 - services/cs_channel_sync_service.py
+    # 참고). 수기 생성 건은 NULL. 위 __table_args__ 유니크 인덱스가 이 값을 포함하는
+    # 이유는 이 클래스 docstring 참고.
     external_source: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
     # 채널이 준 원본 상태 코드 그대로(예: 쿠팡 "progress:requestAnswer") - CsCase.status
     # (내부 CS 워크플로우 상태)와는 완전히 다른 값이다. 모르는 원본 상태를 내부

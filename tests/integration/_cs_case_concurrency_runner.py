@@ -14,12 +14,20 @@ CS(고객문의) 케이스의 두 경합 지점을 실제로 동시에 건드렸
 CsCaseConflictError로 막아야 한다.
 
 시나리오 2) concurrent_duplicate_external_inquiry:
-같은 (platform_id, external_inquiry_id) 조합의 채널 문의를 두 worker가 동시에
-"처음 보는 문의"로 판단해(_upsert_one의 get_by_external() 조회 시점엔 아직
-서로의 커밋을 못 봄) 각자 새 케이스를 만들려 하면, DB 유니크 제약
+같은 (platform_id, external_source, external_inquiry_id) 조합의 채널 문의를 두
+worker가 동시에 "처음 보는 문의"로 판단해(_upsert_one의 get_by_external() 조회
+시점엔 아직 서로의 커밋을 못 봄) 각자 새 케이스를 만들려 하면, DB 유니크 제약
 (uq_cs_case_external_inquiry)이 실제로 하나만 통과시키고 나머지는
 IntegrityError -> SAVEPOINT 롤백으로 안전하게 흡수돼야 한다(전체 동기화가
 깨지지 않고 그 항목만 failed로 카운트).
+
+시나리오 3) concurrent_same_numeric_id_different_source:
+콜센터 문의와 상품별 문의가 우연히 같은 숫자 inquiryId를 갖는 상황을 두
+worker가 서로 다른 소스로 동시에 동기화하면, 이번 마이그레이션으로 유니크
+제약에 external_source가 포함됐으므로 서로 경합하지 않고 둘 다 정상적으로
+케이스를 생성해야 한다(models.cs_case.CsCase 클래스 docstring에 기록된 실제
+버그의 동시성 조건에서의 회귀 테스트 - 시나리오 2와 반대로 "충돌해선 안
+되는" 경우를 검증한다).
 
 tests/integration/test_cs_case_concurrency_pg.py가 격리된 1회성 docker
 postgres 컨테이너를 띄우고, 이 스크립트를 그 postgres와 같은(--internal)
@@ -157,6 +165,7 @@ def scenario_concurrent_assignment_same_case() -> dict:
 
 class _StubInquiryConnector:
     supports_inquiry_sync = True
+    supports_product_inquiry_sync = True
 
     def __init__(self, item: dict[str, Any]) -> None:
         self.item = item
@@ -164,8 +173,18 @@ class _StubInquiryConnector:
     def fetch_inquiries(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
         return [self.item]
 
+    def fetch_product_inquiries(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+        return [self.item]
 
-def _worker_sync(platform_id: int, item: dict[str, Any], barrier: threading.Barrier, out: dict, key: str) -> None:
+
+def _worker_sync(
+    platform_id: int,
+    item: dict[str, Any],
+    barrier: threading.Barrier,
+    out: dict,
+    key: str,
+    source: str = "COUPANG_CALL_CENTER",
+) -> None:
     from config.settings import settings
 
     session = SessionLocal()
@@ -174,7 +193,7 @@ def _worker_sync(platform_id: int, item: dict[str, Any], barrier: threading.Barr
         service = CsChannelSyncService(session)
         connector = _StubInquiryConnector(item)
         barrier.wait(timeout=10)
-        result = service.sync_inquiries(connector, platform_id, date(2026, 1, 1), date(2026, 1, 7))
+        result = service.sync_inquiries(connector, platform_id, date(2026, 1, 1), date(2026, 1, 7), source=source)
         session.commit()
         out[key] = {"result": result, "exception": None}
     except Exception as e:  # noqa: BLE001 - 실패 자체를 결과로 보고해야 호스트에서 판정할 수 있다.
@@ -221,9 +240,58 @@ def scenario_concurrent_duplicate_external_inquiry() -> dict:
     }
 
 
+def scenario_concurrent_same_numeric_id_different_source() -> dict:
+    platform_id = _make_platform()
+    item = {
+        "platform_inquiry_id": "SAME-ID-7777",
+        "content": "동시성 테스트 - 소스만 다름",
+        "inquiry_at": datetime(2026, 1, 10, 9, 0, 0),
+        "raw_status": "NOANSWER",
+        "needs_answer": True,
+        "platform_order_no": None,
+        "customer_phone": None,
+    }
+
+    barrier = threading.Barrier(2)
+    out: dict = {}
+    t1 = threading.Thread(
+        target=_worker_sync,
+        args=(platform_id, item, barrier, out, "a"),
+        kwargs={"source": "COUPANG_CALL_CENTER"},
+        name="worker-A",
+    )
+    t2 = threading.Thread(
+        target=_worker_sync,
+        args=(platform_id, item, barrier, out, "b"),
+        kwargs={"source": "COUPANG_PRODUCT_INQUIRY"},
+        name="worker-B",
+    )
+    t1.start()
+    t2.start()
+    t1.join(timeout=20)
+    t2.join(timeout=20)
+
+    check = SessionLocal()
+    rows = list(
+        check.execute(
+            select(CsCase).where(CsCase.platform_id == platform_id, CsCase.external_inquiry_id == "SAME-ID-7777")
+        ).scalars()
+    )
+    check.close()
+
+    return {
+        "scenario": "concurrent_same_numeric_id_different_source",
+        "row_count": len(rows),
+        "sources": sorted(r.external_source for r in rows),
+        "a": out.get("a"),
+        "b": out.get("b"),
+    }
+
+
 SCENARIOS = {
     "concurrent_assignment_same_case": scenario_concurrent_assignment_same_case,
     "concurrent_duplicate_external_inquiry": scenario_concurrent_duplicate_external_inquiry,
+    "concurrent_same_numeric_id_different_source": scenario_concurrent_same_numeric_id_different_source,
 }
 
 

@@ -18,9 +18,15 @@ class CsCaseRepository(BaseRepository[CsCase]):
     def __init__(self, session: Session) -> None:
         super().__init__(session, CsCase)
 
-    def get_by_external(self, platform_id: int, external_inquiry_id: str) -> Optional[CsCase]:
+    def get_by_external(self, platform_id: int, external_source: str, external_inquiry_id: str) -> Optional[CsCase]:
+        """external_source를 반드시 함께 필터링한다 - 같은 채널의 서로 다른 문의
+        API(예: 쿠팡 콜센터 문의/상품별 문의)가 독립된 inquiryId 공간을 쓸 수 있어,
+        이를 빼면 서로 다른 문의를 같은 케이스로 오인할 수 있다(models.cs_case.CsCase
+        클래스 docstring 및 uq_cs_case_external_inquiry 인덱스 주석 참고)."""
         stmt = select(CsCase).where(
-            CsCase.platform_id == platform_id, CsCase.external_inquiry_id == external_inquiry_id
+            CsCase.platform_id == platform_id,
+            CsCase.external_source == external_source,
+            CsCase.external_inquiry_id == external_inquiry_id,
         )
         return self.session.execute(stmt).scalar_one_or_none()
 

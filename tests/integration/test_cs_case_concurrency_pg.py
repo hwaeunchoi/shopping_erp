@@ -182,3 +182,18 @@ class TestConcurrentDuplicateExternalInquiry:
         # 둘 다 created=1이면 유니크 제약이 실제로 경합을 못 막은 것이다.
         created_counts = sorted([payload["a"]["result"]["created"], payload["b"]["result"]["created"]])
         assert created_counts == [0, 1], payload
+
+
+class TestConcurrentSameNumericIdDifferentSource:
+    """유니크 제약에 external_source를 포함시킨 이번 migration의 핵심 회귀
+    테스트 - 반대로 "충돌해선 안 되는" 경우다."""
+
+    def test_two_workers_same_numeric_id_different_source_both_succeed(self, pg_sandbox):
+        payload = _run_scenario(pg_sandbox, "concurrent_same_numeric_id_different_source")
+
+        assert payload["a"]["exception"] is None, payload
+        assert payload["b"]["exception"] is None, payload
+        assert payload["row_count"] == 2, payload
+        assert payload["sources"] == ["COUPANG_CALL_CENTER", "COUPANG_PRODUCT_INQUIRY"], payload
+        assert payload["a"]["result"]["created"] == 1, payload
+        assert payload["b"]["result"]["created"] == 1, payload
