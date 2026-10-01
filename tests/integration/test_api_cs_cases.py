@@ -370,6 +370,155 @@ class TestDashboardAndSync:
         assert body["by_source"]["COUPANG_PRODUCT_INQUIRY"]["status"] == "SUCCESS"
 
 
+class TestLimitedManualSync:
+    """상용 ERP 확장 5단계 B묶음 보완 - source를 지정한 수동 제한 동기화 경로
+    (운영 자동 활성화 전 검증 목적). days/max_pages/max_retries가 허용 범위를
+    벗어나면 채널 연동 자체를 시도하기 전에 400으로 차단되는지, 그리고 정상
+    범위에서는 지정한 source 하나만 호출되는지를 검증한다."""
+
+    def test_unknown_source_rejected_before_connector_call(self, client, auth_headers, seed_data):
+        from unittest.mock import patch
+
+        from config.settings import settings
+
+        with (
+            patch.object(settings, "cs_inquiry_sync_enabled", True),
+            patch("api.routers.cs_cases.get_mall_connector") as mock_get_connector,
+        ):
+            resp = client.post(
+                "/api/cs-cases/sync",
+                json={"platform_id": seed_data["platform_id"], "days": 1, "source": "NOT_A_REAL_SOURCE"},
+                headers=auth_headers,
+            )
+        assert resp.status_code == 400
+        mock_get_connector.assert_not_called()
+
+    def test_days_out_of_range_rejected_before_connector_call(self, client, auth_headers, seed_data):
+        from unittest.mock import patch
+
+        from config.settings import settings
+
+        with (
+            patch.object(settings, "cs_inquiry_sync_enabled", True),
+            patch("api.routers.cs_cases.get_mall_connector") as mock_get_connector,
+        ):
+            resp = client.post(
+                "/api/cs-cases/sync",
+                json={
+                    "platform_id": seed_data["platform_id"],
+                    "days": 8,  # 공식 최대 7일을 초과.
+                    "source": "COUPANG_PRODUCT_INQUIRY",
+                },
+                headers=auth_headers,
+            )
+        assert resp.status_code == 400
+        mock_get_connector.assert_not_called()
+
+    def test_max_pages_above_settings_ceiling_rejected(self, client, auth_headers, seed_data):
+        from unittest.mock import patch
+
+        from config.settings import settings
+
+        with (
+            patch.object(settings, "cs_inquiry_sync_enabled", True),
+            patch.object(settings, "cs_inquiry_sync_max_pages_per_query", 3),
+            patch("api.routers.cs_cases.get_mall_connector") as mock_get_connector,
+        ):
+            resp = client.post(
+                "/api/cs-cases/sync",
+                json={
+                    "platform_id": seed_data["platform_id"],
+                    "days": 1,
+                    "source": "COUPANG_PRODUCT_INQUIRY",
+                    "max_pages": 4,  # 설정 상한(3)을 초과.
+                },
+                headers=auth_headers,
+            )
+        assert resp.status_code == 400
+        mock_get_connector.assert_not_called()
+
+    def test_max_retries_above_settings_ceiling_rejected(self, client, auth_headers, seed_data):
+        from unittest.mock import patch
+
+        from config.settings import settings
+
+        with (
+            patch.object(settings, "cs_inquiry_sync_enabled", True),
+            patch.object(settings, "cs_inquiry_sync_max_retries_per_page", 2),
+            patch("api.routers.cs_cases.get_mall_connector") as mock_get_connector,
+        ):
+            resp = client.post(
+                "/api/cs-cases/sync",
+                json={
+                    "platform_id": seed_data["platform_id"],
+                    "days": 1,
+                    "source": "COUPANG_PRODUCT_INQUIRY",
+                    "max_retries": 3,  # 설정 상한(2)을 초과.
+                },
+                headers=auth_headers,
+            )
+        assert resp.status_code == 400
+        mock_get_connector.assert_not_called()
+
+    def test_limited_sync_calls_only_the_specified_source_with_bounds(self, client, auth_headers, seed_data):
+        """상품별 문의 1소스·1일·max_pages=1·max_retries=0 조합(수동 제한 검증의
+        정확한 모양)이 실제로 그 값 그대로 커넥터에 전달되고, 콜센터 문의 쪽은
+        전혀 호출되지 않아야 한다."""
+        from unittest.mock import MagicMock, patch
+
+        from config.settings import settings
+
+        connector = MagicMock()
+        connector.supports_inquiry_sync = True
+        connector.supports_product_inquiry_sync = True
+        connector.fetch_inquiries.side_effect = AssertionError("source=COUPANG_PRODUCT_INQUIRY인데 콜센터 쪽이 호출됨")
+        connector.fetch_product_inquiries.return_value = []
+
+        with (
+            patch.object(settings, "cs_inquiry_sync_enabled", True),
+            patch("api.routers.cs_cases.get_mall_connector", return_value=connector),
+        ):
+            resp = client.post(
+                "/api/cs-cases/sync",
+                json={
+                    "platform_id": seed_data["platform_id"],
+                    "days": 1,
+                    "source": "COUPANG_PRODUCT_INQUIRY",
+                    "max_pages": 1,
+                    "max_retries": 0,
+                },
+                headers=auth_headers,
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "SUCCESS"
+        connector.fetch_inquiries.assert_not_called()
+        connector.fetch_product_inquiries.assert_called_once()
+        call_kwargs = connector.fetch_product_inquiries.call_args.kwargs
+        assert call_kwargs["max_pages"] == 1
+        assert call_kwargs["max_retries"] == 0
+
+    def test_limited_sync_requires_cs_manage_permission(self, client, api_session_factory, seed_data):
+        """기존 권한 체계(CS_MANAGE)를 그대로 재사용한다 - CS_VIEW만 있는 사용자는
+        source를 지정한 제한 동기화도 실행할 수 없어야 한다."""
+        creds = _make_limited_user(api_session_factory, ["CS_VIEW"], f"cs-view-only-{uuid.uuid4().hex[:6]}")
+        headers = _login_headers(client, creds)
+
+        resp = client.post(
+            "/api/cs-cases/sync",
+            json={
+                "platform_id": seed_data["platform_id"],
+                "days": 1,
+                "source": "COUPANG_PRODUCT_INQUIRY",
+                "max_pages": 1,
+                "max_retries": 0,
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 403
+
+
 class TestReference:
     def test_reference_lists_inquiry_types_and_priorities(self, client, auth_headers, seed_data):
         resp = client.get("/api/cs-cases/meta/reference", headers=auth_headers)

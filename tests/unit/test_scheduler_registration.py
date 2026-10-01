@@ -21,7 +21,9 @@ BaseScheduler._create_default_executor/job_defaults)은 건드리지 않았는�
 
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
+from config.settings import settings
 from scheduler.scheduler import build_scheduler
 
 # backup/backup_catchup을 제외한 기존 job 중, 이번 misfire 정책 변경의
@@ -148,3 +150,14 @@ class TestSchedulerJobRegistration:
         }
         assert expected_existing.issubset(ids)
         assert "backup_catchup" in ids
+
+    def test_cs_inquiry_sync_interval_reads_from_settings(self, monkeypatch):
+        """상용 ERP 확장 5단계 B묶음 보완 - scheduler 실행 주기가 하드코딩된 15분이
+        아니라 settings.cs_inquiry_sync_interval_minutes를 실제로 읽는지 확인한다
+        (요구사항: "scheduler가 설정된... 요청 예산을 실제로 전달"의 주기 부분)."""
+        monkeypatch.setattr(settings, "cs_inquiry_sync_interval_minutes", 42)
+        scheduler = build_scheduler()
+        job = scheduler.get_job("cs_inquiry_sync")
+        assert job is not None
+        assert isinstance(job.trigger, IntervalTrigger)
+        assert job.trigger.interval.total_seconds() == 42 * 60

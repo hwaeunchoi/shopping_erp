@@ -164,16 +164,21 @@ def scenario_concurrent_assignment_same_case() -> dict:
 
 
 class _StubInquiryConnector:
+    """fetch_inquiries/fetch_product_inquiries는 실제 CoupangConnector와 동일하게
+    max_pages/max_retries/request_budget을 키워드 전용으로 받는다(상용 ERP 확장
+    5단계 B묶음 보완 - CS 문의 호출량 안전 상한, services/cs_channel_sync_service.py
+    참고) - 이 스텁은 네트워크 호출이 없어 값을 무시해도 안전하다."""
+
     supports_inquiry_sync = True
     supports_product_inquiry_sync = True
 
     def __init__(self, item: dict[str, Any]) -> None:
         self.item = item
 
-    def fetch_inquiries(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+    def fetch_inquiries(self, start_date: date, end_date: date, **_kwargs: Any) -> list[dict[str, Any]]:
         return [self.item]
 
-    def fetch_product_inquiries(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+    def fetch_product_inquiries(self, start_date: date, end_date: date, **_kwargs: Any) -> list[dict[str, Any]]:
         return [self.item]
 
 

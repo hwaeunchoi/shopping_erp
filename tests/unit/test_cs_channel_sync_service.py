@@ -15,6 +15,7 @@ from integrations.malls.errors import (
     MarketplaceCapabilityUnsupportedError,
     MarketplaceCredentialMissingError,
     MarketplaceExternalAPIError,
+    RequestBudget,
 )
 from models.order import Order
 from repositories.cs_case_repository import CsCaseRepository
@@ -26,6 +27,12 @@ from services.cs_channel_sync_service import (
 
 
 class _StubConnector:
+    """fetch_inquiries/fetch_product_inquiries는 실제 CoupangConnector와 동일하게
+    max_pages/max_retries/request_budget을 키워드 전용으로 받는다(상용 ERP 확장
+    5단계 B묶음 보완 - CS 문의 호출량 안전 상한). 이 스텁은 실제 HTTP 요청이
+    없으므로 request_budget을 소비하지는 않지만, 호출부(CsChannelSyncService)가
+    실제로 그 값을 넘기는지는 call_kwargs/product_call_kwargs로 검증할 수 있다."""
+
     supports_inquiry_sync = True
     supports_product_inquiry_sync = True
 
@@ -42,15 +49,39 @@ class _StubConnector:
         self.product_error = product_error
         self.called_with: Optional[tuple[date, date]] = None
         self.product_called_with: Optional[tuple[date, date]] = None
+        self.call_kwargs: dict[str, Any] = {}
+        self.product_call_kwargs: dict[str, Any] = {}
 
-    def fetch_inquiries(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+    def fetch_inquiries(
+        self,
+        start_date: date,
+        end_date: date,
+        *,
+        max_pages: Optional[int] = None,
+        max_retries: Optional[int] = None,
+        request_budget: Optional[Any] = None,
+    ) -> list[dict[str, Any]]:
         self.called_with = (start_date, end_date)
+        self.call_kwargs = {"max_pages": max_pages, "max_retries": max_retries, "request_budget": request_budget}
         if self.error is not None:
             raise self.error
         return self.items
 
-    def fetch_product_inquiries(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+    def fetch_product_inquiries(
+        self,
+        start_date: date,
+        end_date: date,
+        *,
+        max_pages: Optional[int] = None,
+        max_retries: Optional[int] = None,
+        request_budget: Optional[Any] = None,
+    ) -> list[dict[str, Any]]:
         self.product_called_with = (start_date, end_date)
+        self.product_call_kwargs = {
+            "max_pages": max_pages,
+            "max_retries": max_retries,
+            "request_budget": request_budget,
+        }
         if self.product_error is not None:
             raise self.product_error
         return self.product_items
@@ -60,10 +91,10 @@ class _UnsupportedConnector:
     supports_inquiry_sync = False
     supports_product_inquiry_sync = False
 
-    def fetch_inquiries(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+    def fetch_inquiries(self, start_date: date, end_date: date, **_kwargs: Any) -> list[dict[str, Any]]:
         raise AssertionError("supports_inquiry_sync=False인 커넥터의 fetch_inquiries는 호출되면 안 된다.")
 
-    def fetch_product_inquiries(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+    def fetch_product_inquiries(self, start_date: date, end_date: date, **_kwargs: Any) -> list[dict[str, Any]]:
         raise AssertionError(
             "supports_product_inquiry_sync=False인 커넥터의 fetch_product_inquiries는 호출되면 안 된다."
         )
@@ -378,3 +409,117 @@ class TestSyncAllInquiries:
         result = service.sync_all_inquiries(connector, platform.id, date(2026, 1, 1), date(2026, 1, 7))
 
         assert result["status"] == "UNSUPPORTED"
+
+
+class TestRequestLimitPropagation:
+    """상용 ERP 확장 5단계 B묶음 보완 - 호출량 안전 상한(설정값)이 실제로 커넥터
+    호출까지 전달되는지 검증한다(요구사항: "scheduler가 설정된 기간·페이지·retry·
+    요청 예산을 실제로 전달")."""
+
+    def test_sync_inquiries_without_override_passes_settings_defaults(self, db_session, platform, monkeypatch):
+        from config.settings import settings
+
+        monkeypatch.setattr(settings, "cs_inquiry_sync_max_pages_per_query", 3)
+        monkeypatch.setattr(settings, "cs_inquiry_sync_max_retries_per_page", 2)
+        monkeypatch.setattr(settings, "cs_inquiry_sync_max_requests_per_run", 45)
+        connector = _StubConnector(items=[_inquiry()])
+        service = CsChannelSyncService(db_session)
+
+        service.sync_inquiries(connector, platform.id, date(2026, 1, 1), date(2026, 1, 7))
+
+        assert connector.call_kwargs["max_pages"] == 3
+        assert connector.call_kwargs["max_retries"] == 2
+        budget = connector.call_kwargs["request_budget"]
+        assert isinstance(budget, RequestBudget)
+        assert budget.max_requests == 45
+
+    def test_sync_inquiries_explicit_override_wins_over_settings(self, db_session, platform, monkeypatch):
+        """수동 제한 검증(예: 상품별 문의 1소스·1일·max_pages=1·retry=0)이 settings
+        기본값보다 더 엄격한 값을 명시적으로 넘길 수 있어야 한다."""
+        from config.settings import settings
+
+        monkeypatch.setattr(settings, "cs_inquiry_sync_max_pages_per_query", 3)
+        monkeypatch.setattr(settings, "cs_inquiry_sync_max_retries_per_page", 2)
+        connector = _StubConnector(product_items=[_inquiry(inquiry_id="5002")])
+        service = CsChannelSyncService(db_session)
+
+        service.sync_inquiries(
+            connector,
+            platform.id,
+            date(2026, 1, 1),
+            date(2026, 1, 1),
+            source=COUPANG_PRODUCT_INQUIRY_SOURCE,
+            max_pages=1,
+            max_retries=0,
+        )
+
+        assert connector.product_call_kwargs["max_pages"] == 1
+        assert connector.product_call_kwargs["max_retries"] == 0
+
+    def test_sync_all_inquiries_shares_one_budget_across_both_sources(self, db_session, platform):
+        """두 소스가 같은 RequestBudget 인스턴스를 공유해야 플랫폼 1회 실행의 전체
+        요청 수 상한이 소스별이 아니라 호출 전체 기준으로 지켜진다."""
+        connector = _StubConnector(items=[_inquiry(inquiry_id="1")], product_items=[_inquiry(inquiry_id="2")])
+        service = CsChannelSyncService(db_session)
+
+        service.sync_all_inquiries(connector, platform.id, date(2026, 1, 1), date(2026, 1, 7))
+
+        call_center_budget = connector.call_kwargs["request_budget"]
+        product_budget = connector.product_call_kwargs["request_budget"]
+        assert call_center_budget is product_budget
+
+    def test_page_limit_exceeded_fails_only_that_source_without_db_write(self, db_session, platform):
+        """다음 페이지가 더 있다고 알리는데 max_pages에 도달한 상황을 커넥터가
+        PAGE_LIMIT_EXCEEDED로 보고하면, 그 source는 FAILED로 끝나고 이미 "모아 둔"
+        페이지의 항목은 DB에 전혀 저장되지 않아야 한다(연결부인 CsChannelSyncService
+        입장에서는 커넥터가 raw_items를 전혀 돌려주지 못하므로 결과적으로 _upsert_one
+        자체가 호출되지 않는다)."""
+        connector = _StubConnector(
+            error=MarketplaceExternalAPIError("coupang", "PAGE_LIMIT_EXCEEDED", False),
+            product_items=[_inquiry(inquiry_id="3")],
+        )
+        service = CsChannelSyncService(db_session)
+
+        result = service.sync_all_inquiries(connector, platform.id, date(2026, 1, 1), date(2026, 1, 7))
+
+        assert result["by_source"][COUPANG_CALL_CENTER_SOURCE]["status"] == "FAILED"
+        assert result["by_source"][COUPANG_CALL_CENTER_SOURCE]["reason_code"] == "PAGE_LIMIT_EXCEEDED"
+        assert result["by_source"][COUPANG_PRODUCT_INQUIRY_SOURCE]["status"] == "SUCCESS"
+        repo = CsCaseRepository(db_session)
+        assert repo.get_by_external(platform.id, COUPANG_CALL_CENTER_SOURCE, "1001") is None
+        assert repo.get_by_external(platform.id, COUPANG_PRODUCT_INQUIRY_SOURCE, "3") is not None
+
+    def test_request_budget_exceeded_mid_run_fails_remaining_source_cleanly(self, db_session, platform):
+        """요청 예산이 첫 소스에서 이미 소진됐다고 가정한 상황(REQUEST_BUDGET_EXCEEDED)도
+        PAGE_LIMIT_EXCEEDED와 동일하게 안전한 FAILED로 처리되고, DB write가 없다."""
+        connector = _StubConnector(
+            items=[_inquiry(inquiry_id="4")],
+            product_error=MarketplaceExternalAPIError("coupang", "REQUEST_BUDGET_EXCEEDED", False),
+        )
+        service = CsChannelSyncService(db_session)
+
+        result = service.sync_all_inquiries(connector, platform.id, date(2026, 1, 1), date(2026, 1, 7))
+
+        assert result["by_source"][COUPANG_PRODUCT_INQUIRY_SOURCE]["status"] == "FAILED"
+        assert result["by_source"][COUPANG_PRODUCT_INQUIRY_SOURCE]["reason_code"] == "REQUEST_BUDGET_EXCEEDED"
+        assert result["status"] == "PARTIAL_SUCCESS"
+        repo = CsCaseRepository(db_session)
+        assert repo.get_by_external(platform.id, COUPANG_CALL_CENTER_SOURCE, "4") is not None
+
+
+class TestRequestBudget:
+    """integrations.malls.errors.RequestBudget 자체의 단위 동작."""
+
+    def test_consume_within_limit_succeeds(self):
+        budget = RequestBudget(max_requests=2)
+        budget.consume("coupang")
+        budget.consume("coupang")
+        assert budget.used == 2
+
+    def test_consume_beyond_limit_raises_without_incrementing(self):
+        budget = RequestBudget(max_requests=1)
+        budget.consume("coupang")
+        with pytest.raises(MarketplaceExternalAPIError) as exc_info:
+            budget.consume("coupang")
+        assert exc_info.value.reason_code == "REQUEST_BUDGET_EXCEEDED"
+        assert budget.used == 1  # 초과 시도는 카운트에 반영되지 않는다(실제 요청을 보내지 않았으므로).
