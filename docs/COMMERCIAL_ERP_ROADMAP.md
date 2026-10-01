@@ -444,6 +444,124 @@
   검증은 수행하지 않았다(채널 조회 자체는 기능 플래그로 막혀 있고, 답변
   전송은 구현 자체가 없다).
 
+### 5-B단계 보완 - CS 문의 동기화 호출량 안전 상한 (구현 완료, feature 브랜치 `feature/cs-inquiry-sync-request-budget`)
+
+- **배경**: 운영 자동 활성화(`cs_inquiry_sync_enabled=True`) 전 차단 요인 해소
+  요청에 따라, 기존 무제한 pagination·매번 7일 전체 재조회 방식을 그대로
+  활성화하지 않고 코드 레벨로 호출량에 상한을 뒀다. 쿠팡 공식 문서를
+  재확인한 결과(developers.coupang.com/en/api/cs/customer-inquiry-query-by-product,
+  developers.coupang.com/en/api/cs/query-of-coupang-contact-center-inquiries,
+  developers.coupang.com/en/faq/what-should-i-do-when-a-429-error-is-returned,
+  전부 2026-10-01 확인) 조회기간(≤7일)·pageSize(상품별 최대 50/콜센터 최대
+  30)는 문서에 명시돼 있으나, **요청 수/시간 단위의 공식 rate limit은 공개돼
+  있지 않다** - "throttling setting"이 있고 근접 시 `X-CAG-Warnings` 헤더로만
+  알려준다고만 안내한다. 그래서 아래 상한값은 공식 한도가 아니라 이 ERP가
+  보수적으로 정한 **내부 안전 예산**이다(`OFFICIAL_LIMIT_UNCONFIRMED`).
+- **설정값과 의미**(`config/settings.py`, 전부 기본값이 보수적이고
+  `cs_inquiry_sync_enabled`는 여전히 기본 `False`):
+  - `cs_inquiry_sync_window_days`(기본 1) - 조회 기간. 매번 오늘 기준 이
+    일수만큼의 기간을 다시 조회한다(이전처럼 항상 7일이 아니다).
+  - `cs_inquiry_sync_max_pages_per_query`(기본 3) - "쿼리 1개"(콜센터 문의는
+    상태 1종 x 7일 이하 창 1개, 상품별 문의는 answeredType=ALL x 7일 이하
+    창 1개) 안에서 허용하는 최대 페이지 수.
+  - `cs_inquiry_sync_max_retries_per_page`(기본 2) - 페이지 1회 요청당 HTTP
+    429 재시도 횟수(기존 전역 재시도 상수(5)보다 낮다 - 재시도도 아래 요청
+    예산을 소비하기 때문).
+  - `cs_inquiry_sync_max_requests_per_run`(기본 45) - 플랫폼 1개당 scheduler
+    1회 실행(또는 수동 동기화 1회 호출)에서 실제로 네트워크로 나가는 요청
+    수(최초 시도+재시도 전부 포함, 두 source 합산)의 절대 상한.
+  - `cs_inquiry_sync_interval_minutes`(기본 15) - scheduler 실행 주기.
+  - **계산식**(기본값 기준): 콜센터 상태 4종 + 상품별 문의 1종 = 쿼리 5개.
+    - 1회 실행 최소 요청 수 = 5(쿼리마다 1페이지로 끝나는 경우).
+    - 1회 실행 최대 요청 수(상한 적용 전) = 5 x `max_pages_per_query` x
+      (1 + `max_retries_per_page`) = 5 x 3 x 3 = **45** -
+      `max_requests_per_run` 기본값(45)과 정확히 일치하도록 잡아, 정상
+      한도 내에서는 예산이 절대 소진되지 않고 설정 실수·향후 소스 추가 시에만
+      방어적으로 작동한다.
+    - 플랫폼당 하루 요청 수(15분 주기, 1440/15=96회) = 최소 `5 x 96 = 480`,
+      최대 `45 x 96 = 4320`.
+    - **활성 플랫폼 수(N) 증가 시**: scheduler가 플랫폼별로 독립된
+      `RequestBudget`을 새로 만들어 돌므로(쿼리 수·페이지 상한은 플랫폼마다
+      동일하게 적용) 하루 전체 요청 수 = `N x (최소|최대) x 96`으로 선형
+      증가한다. 지금은 `CoupangConnector`만 이 두 capability를 지원하므로
+      N=1(coupang)이다.
+- **상한 초과 시 실패 폐쇄(조용한 성공/부분성공 위장 금지)**: 커넥터가
+  `max_pages`에 도달했는데 응답이 다음 페이지가 더 있다고 알리면, 그 다음
+  페이지는 요청하지 않고 `MarketplaceExternalAPIError(..., "PAGE_LIMIT_EXCEEDED")`
+  로 그 쿼리를 즉시 실패시킨다(`integrations/malls/coupang_connector.py`의
+  `_fetch_raw_call_center_inquiries`/`_fetch_raw_online_inquiries`). 예산
+  (`RequestBudget`)이 소진되면 요청을 **보내기 전에** `REQUEST_BUDGET_EXCEEDED`로
+  막는다 - 요청을 보낸 뒤 응답을 버리는 방식이 아니다
+  (`integrations/malls/errors.py`의 `RequestBudget.consume()`,
+  `CoupangConnector._request_with_retry()`). 두 예외 모두
+  `MarketplaceExternalAPIError`라 `CsChannelSyncService.sync_inquiries()`의
+  기존 예외 처리 분기(`FAILED` + `reason_code`)로 그대로 들어온다 - fetch 메서드가
+  예외로 끝났으므로 호출부가 `raw_items`를 전혀 받지 못해 이미 모아 둔 페이지의
+  항목이 DB에 저장되는 경로 자체가 없다(전체 fetch가 완료돼 목록을 반환한
+  뒤에만 `_upsert_one()` 루프가 도는 기존 구조 그대로 - 이번 보완 전부터도
+  fetch 완료 전에 DB write가 시작되는 구조가 아니었음을 재확인했다).
+  소스/플랫폼 격리는 기존 그대로 유지된다 - `sync_all_inquiries()`가 두
+  source를 독립적으로 호출해 결과 dict로만 돌려받으므로, 한 source가
+  `PAGE_LIMIT_EXCEEDED`/`REQUEST_BUDGET_EXCEEDED`로 실패해도 다른 source가
+  이미 성공적으로 만든 케이스는 커밋 대상에서 제외되지 않는다(scheduler는
+  플랫폼 단위로, API는 요청 단위로 한 번만 `db.commit()`한다).
+- **운영 관찰 경로**: `cs_inquiry_sync_job._record_integration_status()`가
+  `sync_all_inquiries()`의 `by_source`에 담긴 안전한 `reason_code`를
+  `integration_status.last_error_message`에 포함시킨다(예: "일부 문의만
+  수집 성공 (reason=PAGE_LIMIT_EXCEEDED)") - 운영자가 문의 본문/주문번호/
+  Secret 노출 없이, 운영 대시보드(기존 `IntegrationStatus` 조회 경로)만
+  보고도 "페이지 상한에 걸렸다"는 사실을 바로 알 수 있다. 다음 주기에
+  스케줄러가 상한을 자동으로 완화하는 로직은 없다 - 운영자가
+  `config/settings.py`(또는 `.env`) 값을 직접 올리기로 결정할 때만 바뀐다.
+- **PAGE_LIMIT_EXCEEDED 발생 시 운영 절차**: (1) `integration_status`에서
+  어느 플랫폼·어느 source(`by_source`가 API 응답에도 그대로 노출됨)가
+  걸렸는지 확인한다. (2) 그 기간에 실제로 쌓인 문의량이 설정된
+  `max_pages_per_query x pageSize`(상품별 50, 콜센터 30)를 넘었는지
+  추정한다(문의 본문을 보지 않고도 쿠팡 판매자센터의 문의 건수 통계로 가늠
+  가능). (3) 일시적 폭증이면 다음 주기(15분 뒤, 그 사이 새 문의는 계속
+  7일/1일 창에 포함되므로)에 자연 재수집되는지 지켜본다 - 재시도/기간/
+  pageSize를 운영자가 즉석에서 임의로 바꾸지 않는다. (4) 구조적으로 상시
+  초과한다면 아래 "상한을 임의로 늘리지 말아야 하는 이유"를 먼저 검토한 뒤
+  별도 변경 승인을 받아 설정값을 조정한다.
+- **상한을 임의로 늘리지 말아야 하는 이유**: `max_requests_per_run`/
+  `max_pages_per_query`/`max_retries_per_page`는 공식 rate limit이 비공개라
+  "이 값까지는 안전하다"는 근거가 없는 내부 추정치다. 값을 올리면 하루 전체
+  요청 수가 선형으로 늘어나는데(위 계산식), 쿠팡의 비공개 throttling
+  threshold(90% 근접 시 429)에 다른 작업(발주서/정산/반품/교환 등 기존
+  수집 job)까지 더해 부딫힐 위험이 있다 - 429가 나면 이 job뿐 아니라 같은
+  판매자 계정의 다른 수집 job도 함께 영향받을 수 있다. 값을 바꾸려면 먼저
+  실제 429 발생 빈도(로그/`integration_status`의 `RATE_LIMITED` reason_code
+  빈도)를 관찰한 뒤, 작은 단위로만 올리고 다시 관찰한다.
+- **기능 활성화 전 수동 제한 검증 순서**(실행은 이번 라운드에 포함되지 않음 -
+  별도 승인 필요): (1) `POST /api/cs-cases/sync`에 `source=
+  "COUPANG_PRODUCT_INQUIRY"`, `days=1`, `max_pages=1`,
+  `max_retries=0`(또는 승인된 값)을 지정해 1회 실행한다(허용 범위를 벗어난
+  값은 커넥터 호출 전에 400으로 차단됨 - `api/routers/cs_cases.py`의
+  `_sync_single_source_limited()`). (2) 생성된 케이스 수/중복 여부/권한별
+  열람 범위/UI 표시를 확인한다. (3) 성공하면 같은 방식으로
+  `source="COUPANG_CALL_CENTER"`도 1회 확인한다. (4) 둘 다 문제없으면
+  아래 자동 활성화 절차로 진행한다.
+- **비활성화 및 롤백 절차**: `.env`의 `CS_INQUIRY_SYNC_ENABLED`를 다시
+  `false`로 되돌리기만 하면 즉시 모든 자동/수동 CS 문의 동기화가
+  `DISABLED`로 돌아간다(세션도 열지 않고 커넥터도 만들지 않음 - 기존
+  방어 로직 그대로). **이미 수집된 `cs_cases`/`cs_case_history` 데이터는
+  삭제하지 않는다** - 비활성화는 신규 수집만 멈추는 스위치다. 호출량 설정
+  (`cs_inquiry_sync_max_*`)은 기능 플래그와 독립이라 플래그를 끈 상태에서도
+  그대로 유지해도 무해하다.
+- **알려진 한계(의도된 설계)**: 이번 보완은 **cursor/마지막 성공 시각이
+  없는 보수적 1단계**다 - 매번 설정된 기간(`window_days`) 전체를 처음부터
+  다시 조회하고, dedup은 전적으로 `(platform_id, external_source,
+  external_inquiry_id)` 유니크 제약과 upsert 로직이 막아 준다(재조회
+  자체가 안전하지만, 그만큼 같은 문의를 반복해서 다시 받아오는 비효율은
+  남아 있다).
+- **후속 과제(이번 범위 밖)**: 플랫폼별 "마지막 성공 수집 시각" 또는
+  채널이 제공하면 cursor/페이지 토큰을 저장해, 매 실행마다 전체 기간을
+  다시 조회하지 않고 그 이후 변경분만 증분 수집하도록 바꾸는 것 - 호출량을
+  문의량과 무관하게 거의 상수로 줄일 수 있다(현재는 문의량이 늘면 페이지
+  수도 늘어 예산에 더 가까이 다가간다). `IntegrationStatus.last_success_at`을
+  그대로 재사용할 수 있는지, 아니면 CS 전용 cursor 테이블이 필요한지는
+  그 과제에서 별도로 설계한다.
+
 ### 5-C단계(잔여) - CS-주문 자동 연결 고도화/택배사 실시간 연동
 
 - **범위**: 5-B단계가 다루지 않은 나머지 - 채널 문의를 수집 시점에 주문라인
