@@ -1649,17 +1649,30 @@ def _normalize_receipt_item(item: dict[str, Any], status_mapping: dict[str, str]
 
 
 def _parse_coupang_datetime(value: Optional[str]) -> datetime:
-    """쿠팡 orderedAt(예: "2026-07-01T09:00:00", KST·오프셋 없음)을 KST datetime으로 파싱한다.
+    """쿠팡 orderedAt/inquiryAt(예: "2026-07-01T09:00:00", KST·오프셋 없음)을 파싱해
+    이 코드베이스의 공통 관례(naive UTC - models.base.utcnow, services의 _now() 등과
+    동일)에 맞춘 **naive UTC** datetime으로 반환한다. 오프셋이 붙어 있으면 그대로
+    존중하고, 없으면 KST로 간주한 뒤 UTC로 환산한다. 값이 없으면 현재 시각(UTC)으로
+    폴백한다.
 
-    오프셋이 붙어 있으면 그대로 존중하고, 없으면 KST로 간주한다. 값이 없으면
-    현재 시각(KST)으로 폴백한다.
-    """
+    버그 수정(2026-10): 이전에는 tz-aware(KST 등) datetime을 그대로 반환해, naive
+    DateTime 컬럼(models.cs_case.CsCase.last_customer_message_at 등)에 저장된 값이
+    DB에서 naive로 다시 읽혀 들어올 때 신규 tz-aware 값과 비교(`_upsert_one()`의
+    `inquiry_at > existing.last_customer_message_at`)하면서
+    "can't compare offset-naive and offset-aware datetimes" TypeError가 발생했다
+    (실계정 콜센터 문의 수집 1회차 재현 - 같은 inquiryId가 여러
+    partnerCounselingStatus 쿼리에 중복 포함돼 한 번의 동기화 실행 안에서 방금 생성한
+    case를 다시 읽어 비교하는 경로를 탔다). 상품별 문의는 answeredType=ALL 단일
+    조회라 한 실행 안에서 같은 inquiryId가 중복될 수 없어 이 비교 분기를 타지 않았을
+    뿐이며, 재동기화(다음 스케줄 실행) 시에는 두 source 모두 동일하게 영향받는
+    문제였다 - 이 함수가 항상 naive UTC를 반환하도록 정규화 경계에서 고쳐 두 source
+    모두와 fetch_orders()의 order_date까지 한 번에 바로잡는다."""
     if not value:
-        return datetime.now(_KST)
+        return datetime.now(timezone.utc).replace(tzinfo=None)
     parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=_KST)
-    return parsed
+        parsed = parsed.replace(tzinfo=_KST)
+    return parsed.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def _parse_coupang_offset_datetime(value: Optional[str]) -> datetime:
