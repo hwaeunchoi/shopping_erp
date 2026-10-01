@@ -229,8 +229,16 @@ def build_scheduler() -> BlockingScheduler:
     )
     # 채널 CS(고객문의) 조회 동기화 - 상용 ERP 확장(5단계 B묶음, 기본 OFF:
     # cs_inquiry_sync_enabled). 조회 전용이다 - 어떤 코드 경로도 채널에 답변을
-    # 쓰지 않는다(services/cs_channel_sync_service.py 모듈 docstring 참고).
-    scheduler.add_job(run_cs_inquiry_sync, IntervalTrigger(minutes=15), id="cs_inquiry_sync", max_instances=1)
+    # 쓰지 않는다(services/cs_channel_sync_service.py 모듈 docstring 참고). 실행
+    # 주기는 settings.cs_inquiry_sync_interval_minutes(기본 15분)로 설정 가능하다 -
+    # config/settings.py의 cs_inquiry_sync_max_requests_per_run 계산식 주석과 함께
+    # 호출량 상한을 구성한다.
+    scheduler.add_job(
+        run_cs_inquiry_sync,
+        IntervalTrigger(minutes=settings.cs_inquiry_sync_interval_minutes),
+        id="cs_inquiry_sync",
+        max_instances=1,
+    )
     return scheduler
 
 

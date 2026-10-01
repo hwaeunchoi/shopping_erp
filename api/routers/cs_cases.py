@@ -36,6 +36,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from api.deps import get_current_user, get_db, require_permission
+from config.settings import settings
 from integrations.malls import get_mall_connector
 from integrations.malls.errors import (
     MarketplaceCapabilityUnsupportedError,
@@ -49,7 +50,11 @@ from models.user import User
 from repositories.platform_repository import PlatformRepository
 from repositories.user_repository import PermissionRepository
 from services.cs_case_service import BulkCaseOutcome, CsCaseConflictError, CsCaseService, CsCaseValidationError
-from services.cs_channel_sync_service import CsChannelSyncService
+from services.cs_channel_sync_service import (
+    COUPANG_CALL_CENTER_SOURCE,
+    COUPANG_PRODUCT_INQUIRY_SOURCE,
+    CsChannelSyncService,
+)
 from services.pii_mask import mask_name, mask_phone
 
 router = APIRouter(prefix="/api/cs-cases", tags=["cs-cases"])
@@ -308,6 +313,17 @@ def bulk_change_status(
 class SyncRequest(BaseModel):
     platform_id: int
     days: int = 7
+    # 아래 3개 필드를 모두 생략하면(기존 동작) 공식 계약이 확인된 두 source를 모두
+    # sync_all_inquiries()로 동기화한다(무변경). source를 지정하면 그 source 하나만
+    # sync_inquiries()로 제한 동기화한다 - 운영 활성화 전 수동 제한 검증
+    # (예: 상품별 문의 1종·1일·max_pages=1) 지원 목적이다(상용 ERP 확장 5단계 B묶음
+    # 보완). max_pages/max_retries를 생략하면 settings의 보수적 기본값이 쓰인다.
+    # 이 엔드포인트는 (DISABLED가 아닌 한) 항상 실제로 DB에 upsert한다 - 쓰기 없는
+    # 읽기 전용 검증은 이 서비스 바깥의 별도 1회성 스크립트(실계정 승인 절차)가
+    # 담당하며 이 API의 책임이 아니다.
+    source: Optional[str] = None
+    max_pages: Optional[int] = None
+    max_retries: Optional[int] = None
 
 
 class SyncResultOut(BaseModel):
@@ -329,23 +345,93 @@ class SyncResultOut(BaseModel):
     response_model=SyncResultOut,
     dependencies=[Depends(require_permission("CS_MANAGE"))],
     summary="채널 CS(고객문의) 수동 동기화 - 공식 계약이 확인된 채널만 실제로 조회한다",
-    description="현재는 쿠팡 콜센터 문의·상품별 문의가 함께 동기화된다(둘 다 공식 계약"
-    " 확인됨, by_source에 소스별 결과가 나뉘어 담긴다) - 다른 채널/미지원 소스는"
-    " UNSUPPORTED로 반환된다. settings.cs_inquiry_sync_enabled가 False(기본값)면"
-    " DISABLED를 반환하고 외부 채널을 호출하지 않는다. 실제 채널 답변 전송은 이"
-    " 엔드포인트를 포함해 어디에도 없다(조회 전용).",
-    responses={404: {"description": "플랫폼을 찾을 수 없습니다."}},
+    description="source를 생략하면(기존 동작) 쿠팡 콜센터 문의·상품별 문의가 함께"
+    " 동기화된다(둘 다 공식 계약 확인됨, by_source에 소스별 결과가 나뉘어 담긴다) -"
+    " 다른 채널/미지원 소스는 UNSUPPORTED로 반환된다. source를 COUPANG_CALL_CENTER"
+    "/COUPANG_PRODUCT_INQUIRY 중 하나로 지정하면 그 source 하나만, days(1~7)·"
+    "max_pages·max_retries로 제한된 수동 검증 동기화를 수행한다(운영 자동 활성화"
+    " 전 제한 검증 목적 - 상용 ERP 확장 5단계 B묶음 보완). 허용 범위를 벗어난"
+    " days/max_pages/max_retries는 실제 채널 호출 전에 400으로 차단된다."
+    " settings.cs_inquiry_sync_enabled가 False(기본값)면 DISABLED를 반환하고 외부"
+    " 채널을 호출하지 않는다. 실제 채널 답변 전송은 이 엔드포인트를 포함해 어디에도"
+    " 없다(조회 전용 - 단, 조회된 문의는 다른 모든 경로와 동일하게 실제로 DB에"
+    " upsert된다. 쓰기 없는 읽기 전용 검증이 필요하면 이 API가 아니라 별도의"
+    " 1회성 실계정 검증 절차를 쓴다).",
+    responses={
+        400: {"description": "source를 지정했는데 days/max_pages/max_retries가 허용 범위를 벗어남."},
+        404: {"description": "플랫폼을 찾을 수 없습니다."},
+    },
 )
 def sync_channel_inquiries(payload: SyncRequest, db=Depends(get_db)) -> SyncResultOut:
     platform = PlatformRepository(db).get_by_id(payload.platform_id)
     if platform is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="플랫폼을 찾을 수 없습니다.")
 
+    if payload.source is not None:
+        return _sync_single_source_limited(db, platform, payload)
+
     end_date = date.today()
     start_date = end_date - timedelta(days=payload.days)
     try:
         connector = get_mall_connector(platform.connector_class, session=db, platform_id=platform.id)
         result = CsChannelSyncService(db).sync_all_inquiries(connector, platform.id, start_date, end_date)
+    except MarketplaceCapabilityUnsupportedError:
+        db.rollback()
+        return SyncResultOut(platform_code=platform.code, status="UNSUPPORTED")
+    except MarketplaceCredentialMissingError:
+        db.rollback()
+        return SyncResultOut(platform_code=platform.code, status="FAILED", reason_code="CREDENTIAL_MISSING")
+    except MarketplaceExternalAPIError as e:
+        db.rollback()
+        return SyncResultOut(platform_code=platform.code, status="FAILED", reason_code=e.reason_code)
+    db.commit()
+    return SyncResultOut(platform_code=platform.code, **result)
+
+
+def _sync_single_source_limited(db, platform, payload: "SyncRequest") -> SyncResultOut:
+    """source가 지정된 제한 동기화 경로 - 운영 활성화 전 수동 제한 검증
+    (예: 상품별 문의 1종·1일·max_pages=1·max_retries=0)을 코드로 보장한다. 허용
+    범위를 벗어난 값은 커넥터/채널을 전혀 건드리기 전에 400으로 차단한다(요구사항:
+    "허용 범위를 벗어난 날짜·페이지·retry 값은 요청 전에 차단"). 권한은 이
+    엔드포인트의 기존 CS_MANAGE 의존성을 그대로 재사용한다 - 별도 권한 분기가
+    없다(요구사항: "기존 권한 체계를 재사용하고 무권한 사용자는 실행할 수 없음")."""
+    if payload.source not in (COUPANG_CALL_CENTER_SOURCE, COUPANG_PRODUCT_INQUIRY_SOURCE):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"알 수 없는 source입니다: {payload.source} (COUPANG_CALL_CENTER/COUPANG_PRODUCT_INQUIRY만 허용)",
+        )
+    if not (1 <= payload.days <= 7):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="source를 지정한 제한 동기화는 days가 1~7 사이여야 합니다."
+        )
+    max_pages = payload.max_pages if payload.max_pages is not None else settings.cs_inquiry_sync_max_pages_per_query
+    if not (1 <= max_pages <= settings.cs_inquiry_sync_max_pages_per_query):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"max_pages는 1~{settings.cs_inquiry_sync_max_pages_per_query} 사이여야 합니다.",
+        )
+    max_retries = (
+        payload.max_retries if payload.max_retries is not None else settings.cs_inquiry_sync_max_retries_per_page
+    )
+    if not (0 <= max_retries <= settings.cs_inquiry_sync_max_retries_per_page):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"max_retries는 0~{settings.cs_inquiry_sync_max_retries_per_page} 사이여야 합니다.",
+        )
+
+    end_date = date.today()
+    start_date = end_date - timedelta(days=payload.days - 1)
+    try:
+        connector = get_mall_connector(platform.connector_class, session=db, platform_id=platform.id)
+        result = CsChannelSyncService(db).sync_inquiries(
+            connector,
+            platform.id,
+            start_date,
+            end_date,
+            source=payload.source,
+            max_pages=max_pages,
+            max_retries=max_retries,
+        )
     except MarketplaceCapabilityUnsupportedError:
         db.rollback()
         return SyncResultOut(platform_code=platform.code, status="UNSUPPORTED")

@@ -58,6 +58,7 @@ from integrations.malls.errors import (
     MarketplaceCredentialMissingError,
     MarketplaceExternalAPIError,
     MarketplaceValidationError,
+    RequestBudget,
     external_call,
     raise_for_status,
 )
@@ -557,24 +558,66 @@ class CoupangConnector(BaseMallConnector):
         normalized = self._normalize_cancel_requests(raw_items)
         return normalized[0] if normalized else None
 
-    def fetch_inquiries(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+    def fetch_inquiries(
+        self,
+        start_date: date,
+        end_date: date,
+        *,
+        max_pages: Optional[int] = None,
+        max_retries: Optional[int] = None,
+        request_budget: Optional[RequestBudget] = None,
+    ) -> list[dict[str, Any]]:
         """콜센터 문의(CS) 목록 조회 - 상품별 문의(onlineInquiries)는 fetch_product_inquiries()가
-        별도로 담당한다(모듈 상단 ONLINE_INQUIRY_PATH_TMPL 주석 참고)."""
+        별도로 담당한다(모듈 상단 ONLINE_INQUIRY_PATH_TMPL 주석 참고).
+
+        max_pages/max_retries/request_budget은 상용 ERP 확장 5단계 B묶음 보완(CS 문의
+        호출량 안전 상한)을 위한 선택 파라미터다 - 기본값(None)은 기존 동작(무제한
+        페이지, 모듈 기본 재시도 횟수, 예산 없음)을 그대로 유지한다. 호출부
+        (services.cs_channel_sync_service.CsChannelSyncService)가 설정값을 명시적으로
+        넘겨야 실제로 제한이 걸린다 - 이 메서드 자체는 설정을 읽지 않는다."""
         credentials = self._get_credentials()
         if credentials is None:
             raise MarketplaceCredentialMissingError("coupang")
         access_key, secret_key, vendor_id = credentials
-        raw_items = self._fetch_raw_call_center_inquiries(start_date, end_date, access_key, secret_key, vendor_id)
+        raw_items = self._fetch_raw_call_center_inquiries(
+            start_date,
+            end_date,
+            access_key,
+            secret_key,
+            vendor_id,
+            max_pages=max_pages,
+            max_retries=max_retries,
+            request_budget=request_budget,
+        )
         return self._normalize_call_center_inquiries(raw_items)
 
-    def fetch_product_inquiries(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+    def fetch_product_inquiries(
+        self,
+        start_date: date,
+        end_date: date,
+        *,
+        max_pages: Optional[int] = None,
+        max_retries: Optional[int] = None,
+        request_budget: Optional[RequestBudget] = None,
+    ) -> list[dict[str, Any]]:
         """상품별 문의(onlineInquiries) 목록 조회(모듈 상단 ONLINE_INQUIRY_PATH_TMPL
-        주석의 공식 문서 재확인 근거 참고)."""
+        주석의 공식 문서 재확인 근거 참고). max_pages/max_retries/request_budget은
+        fetch_inquiries()와 동일한 선택적 호출량 제한 파라미터(기본값 None=기존
+        동작 그대로)."""
         credentials = self._get_credentials()
         if credentials is None:
             raise MarketplaceCredentialMissingError("coupang")
         access_key, secret_key, vendor_id = credentials
-        raw_items = self._fetch_raw_online_inquiries(start_date, end_date, access_key, secret_key, vendor_id)
+        raw_items = self._fetch_raw_online_inquiries(
+            start_date,
+            end_date,
+            access_key,
+            secret_key,
+            vendor_id,
+            max_pages=max_pages,
+            max_retries=max_retries,
+            request_budget=request_budget,
+        )
         return self._normalize_online_inquiries(raw_items)
 
     def fetch_exchanges(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
@@ -935,23 +978,40 @@ class CoupangConnector(BaseMallConnector):
         )
 
     def _request_with_retry(
-        self, method: str, url: str, headers: dict[str, str], json_body: Optional[dict[str, Any]] = None
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        json_body: Optional[dict[str, Any]] = None,
+        max_retries: Optional[int] = None,
+        request_budget: Optional[RequestBudget] = None,
     ) -> httpx.Response:
         """HTTP 429(Rate Limit)에 대해 지수 백오프(1s -> 2s -> 4s -> 8s -> 16s)로
-        최대 RATE_LIMIT_MAX_RETRIES회 재시도한다. 재시도 소진 시 RATE_LIMITED 오류를
-        던진다. 네트워크/연결 오류는 external_call이 안전한 오류로 변환한다.
+        최대 max_retries회(생략 시 모듈 기본값 RATE_LIMIT_MAX_RETRIES) 재시도한다.
+        재시도 소진 시 RATE_LIMITED 오류를 던진다. 네트워크/연결 오류는 external_call이
+        안전한 오류로 변환한다.
+
+        request_budget이 주어지면 최초 시도·재시도 모두 포함해 실제로 네트워크로
+        나가는 요청마다 consume()을 호출한다(상용 ERP 확장 5단계 B묶음 보완 - CS 문의
+        호출량 안전 상한, services.cs_channel_sync_service.CsChannelSyncService 참고).
+        예산 초과 시 요청을 보내지 않고 REQUEST_BUDGET_EXCEEDED로 즉시 막는다. 이
+        파라미터를 넘기지 않는 기존 호출부(주문/정산/반품/교환 등)는 동작이 전혀
+        바뀌지 않는다(기본값 None = 무제한, 기존 동작 그대로).
 
         로그에는 요청 URL(경로에 vendorId 포함)을 남기지 않는다 - 안전한 메타데이터만.
         json_body가 있으면 그대로 요청 본문에 실린다(HMAC 서명 대상에는 포함되지
         않는다 - _authorization()의 서명 메시지는 method+path+query뿐이다)."""
+        retry_limit = RATE_LIMIT_MAX_RETRIES if max_retries is None else max_retries
         attempt = 0
         while True:
+            if request_budget is not None:
+                request_budget.consume(self._marketplace_code())
             with external_call("coupang"):
                 response = self._http().request(method, url, headers=headers, json=json_body)
             if response.status_code != 429:
                 return response
             attempt += 1
-            if attempt > RATE_LIMIT_MAX_RETRIES:
+            if attempt > retry_limit:
                 raise MarketplaceExternalAPIError("coupang", "RATE_LIMITED", True, http_status=429)
             retry_after = response.headers.get("Retry-After")
             if retry_after is not None:
@@ -1153,8 +1213,23 @@ class CoupangConnector(BaseMallConnector):
         ]
 
     def _fetch_raw_call_center_inquiries(
-        self, start_date: date, end_date: date, access_key: str, secret_key: str, vendor_id: str
+        self,
+        start_date: date,
+        end_date: date,
+        access_key: str,
+        secret_key: str,
+        vendor_id: str,
+        *,
+        max_pages: Optional[int] = None,
+        max_retries: Optional[int] = None,
+        request_budget: Optional[RequestBudget] = None,
     ) -> list[dict[str, Any]]:
+        """max_pages가 주어지면 (상태, 7일 창) 쿼리 1개당 최대 그 페이지 수까지만
+        실제로 요청하고, 그 이후에도 다음 페이지가 있다고 응답이 알려오면(조용한
+        성공/부분성공 위장 없이) PAGE_LIMIT_EXCEEDED로 즉시 실패 처리한다 - 이미
+        모아 둔 raw_items는 함수가 끝까지 정상 반환하지 못하므로 호출부(fetch_inquiries
+        -> services.cs_channel_sync_service.CsChannelSyncService.sync_inquiries)에
+        전달되지 않는다(부분 페이지 데이터가 DB에 저장되지 않음을 보장)."""
         path = CALL_CENTER_INQUIRY_PATH_TMPL.format(vendor_id=vendor_id)
         raw_items: list[dict[str, Any]] = []
 
@@ -1175,7 +1250,11 @@ class CoupangConnector(BaseMallConnector):
                     query = urlencode(params)
                     authorization = self._authorization(access_key, secret_key, "GET", path, query)
                     response = self._request_with_retry(
-                        "GET", f"{path}?{query}", headers={"Authorization": authorization}
+                        "GET",
+                        f"{path}?{query}",
+                        headers={"Authorization": authorization},
+                        max_retries=max_retries,
+                        request_budget=request_budget,
                     )
                     raise_for_status("coupang", response.status_code)
                     with external_call("coupang"):
@@ -1187,6 +1266,8 @@ class CoupangConnector(BaseMallConnector):
                         total_pages = pagination.get("totalPages") or page_num
                     if current_page >= total_pages:
                         break
+                    if max_pages is not None and page_num >= max_pages:
+                        raise MarketplaceExternalAPIError("coupang", "PAGE_LIMIT_EXCEEDED", False)
                     page_num += 1
                 window_start = window_end + timedelta(days=1)
 
@@ -1215,11 +1296,24 @@ class CoupangConnector(BaseMallConnector):
         return normalized
 
     def _fetch_raw_online_inquiries(
-        self, start_date: date, end_date: date, access_key: str, secret_key: str, vendor_id: str
+        self,
+        start_date: date,
+        end_date: date,
+        access_key: str,
+        secret_key: str,
+        vendor_id: str,
+        *,
+        max_pages: Optional[int] = None,
+        max_retries: Optional[int] = None,
+        request_budget: Optional[RequestBudget] = None,
     ) -> list[dict[str, Any]]:
         """answeredType=ALL 단일 값으로 조회한다(모듈 상단 ONLINE_INQUIRY_PATH_TMPL
         주석 - 공식 문서에 ALL이 유효값으로 명시돼 있어 콜센터 문의처럼 상태별
-        순회가 필요 없다)."""
+        순회가 필요 없다).
+
+        max_pages/max_retries/request_budget 동작은 _fetch_raw_call_center_inquiries와
+        동일하다(7일 창 1개당 최대 페이지 수 제한, 초과 시 PAGE_LIMIT_EXCEEDED로
+        실패해 부분 페이지를 반환하지 않음)."""
         path = ONLINE_INQUIRY_PATH_TMPL.format(vendor_id=vendor_id)
         raw_items: list[dict[str, Any]] = []
 
@@ -1238,7 +1332,13 @@ class CoupangConnector(BaseMallConnector):
                 ]
                 query = urlencode(params)
                 authorization = self._authorization(access_key, secret_key, "GET", path, query)
-                response = self._request_with_retry("GET", f"{path}?{query}", headers={"Authorization": authorization})
+                response = self._request_with_retry(
+                    "GET",
+                    f"{path}?{query}",
+                    headers={"Authorization": authorization},
+                    max_retries=max_retries,
+                    request_budget=request_budget,
+                )
                 raise_for_status("coupang", response.status_code)
                 with external_call("coupang"):
                     payload = response.json()
@@ -1249,6 +1349,8 @@ class CoupangConnector(BaseMallConnector):
                     total_pages = pagination.get("totalPages") or page_num
                 if current_page >= total_pages:
                     break
+                if max_pages is not None and page_num >= max_pages:
+                    raise MarketplaceExternalAPIError("coupang", "PAGE_LIMIT_EXCEEDED", False)
                 page_num += 1
             window_start = window_end + timedelta(days=1)
 

@@ -51,7 +51,7 @@ COMMERCIAL_ERP_ROADMAP.md 5-B단계 절 참고). CS 케이스는 답변 초안
 
 import logging
 from datetime import date, datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -61,6 +61,7 @@ from integrations.malls.errors import (
     MarketplaceCapabilityUnsupportedError,
     MarketplaceCredentialMissingError,
     MarketplaceExternalAPIError,
+    RequestBudget,
 )
 from models.cs_case import CsCase, CsCaseHistory
 from repositories.cs_case_repository import CsCaseHistoryRepository, CsCaseRepository
@@ -99,11 +100,24 @@ class CsChannelSyncService:
         start_date: date,
         end_date: date,
         source: str = COUPANG_CALL_CENTER_SOURCE,
+        *,
+        max_pages: Optional[int] = None,
+        max_retries: Optional[int] = None,
+        request_budget: Optional[RequestBudget] = None,
     ) -> dict[str, Any]:
         """source에 해당하는 capability가 False면 커넥터를 호출하지 않고
         UNSUPPORTED를 반환한다(capability 인지 - "지원하지만 결과 0건"과 구분).
         source 기본값은 하위호환을 위해 기존 콜센터 문의로 유지한다 - 두 소스를
-        모두 동기화하려면 sync_all_inquiries()를 쓴다."""
+        모두 동기화하려면 sync_all_inquiries()를 쓴다.
+
+        max_pages/max_retries/request_budget을 생략하면(None) 각각
+        settings.cs_inquiry_sync_max_pages_per_query/cs_inquiry_sync_max_retries_per_page/
+        새 RequestBudget(settings.cs_inquiry_sync_max_requests_per_run)으로 보수적
+        기본값이 채워진다 - 수동 제한 검증(예: 상품별 문의 1소스·max_pages=1·
+        max_retries=0)처럼 이 메서드를 단독 호출하는 경우에도 항상 호출량 상한이
+        걸린다(제한 없이 호출할 방법이 없다). request_budget을 호출부가 직접 넘기면
+        (sync_all_inquiries처럼 여러 소스가 하나의 예산을 공유해야 할 때) 그 인스턴스를
+        그대로 누적 사용한다."""
         if not settings.cs_inquiry_sync_enabled:
             return {"status": "DISABLED", "created": 0, "updated": 0, "failed": 0}
 
@@ -111,13 +125,33 @@ class CsChannelSyncService:
         if not getattr(connector, capability_attr, False):
             return {"status": "UNSUPPORTED", "created": 0, "updated": 0, "failed": 0}
 
+        effective_max_pages = settings.cs_inquiry_sync_max_pages_per_query if max_pages is None else max_pages
+        effective_max_retries = settings.cs_inquiry_sync_max_retries_per_page if max_retries is None else max_retries
+        effective_budget = (
+            RequestBudget(max_requests=settings.cs_inquiry_sync_max_requests_per_run)
+            if request_budget is None
+            else request_budget
+        )
+
         try:
-            raw_items = getattr(connector, fetch_method_name)(start_date, end_date)
+            raw_items = getattr(connector, fetch_method_name)(
+                start_date,
+                end_date,
+                max_pages=effective_max_pages,
+                max_retries=effective_max_retries,
+                request_budget=effective_budget,
+            )
         except MarketplaceCapabilityUnsupportedError:
             return {"status": "UNSUPPORTED", "created": 0, "updated": 0, "failed": 0}
         except MarketplaceCredentialMissingError:
             return {"status": "FAILED", "created": 0, "updated": 0, "failed": 0, "reason_code": "CREDENTIAL_MISSING"}
         except MarketplaceExternalAPIError as e:
+            # PAGE_LIMIT_EXCEEDED/REQUEST_BUDGET_EXCEEDED도 이 분기로 들어온다(둘 다
+            # MarketplaceExternalAPIError) - fetch_*가 예외로 끝났으므로 raw_items를
+            # 받지 못해 아래 upsert 루프 자체가 실행되지 않는다(부분 페이지 DB 저장
+            # 없음 보장). 다른 source/다른 플랫폼은 이 예외와 무관하게 평소처럼
+            # 계속 진행된다(scheduler/jobs/cs_inquiry_sync_job.py, 이 클래스의
+            # sync_all_inquiries()가 source별로 이 메서드를 독립 호출하기 때문).
             return {"status": "FAILED", "created": 0, "updated": 0, "failed": 0, "reason_code": e.reason_code}
 
         created = 0
@@ -150,17 +184,27 @@ class CsChannelSyncService:
         차례로 동기화하고 결과를 합산한다. 소스 하나가 UNSUPPORTED여도 다른
         소스는 계속 진행한다(둘 다 UNSUPPORTED면 전체도 UNSUPPORTED). 반환값의
         `by_source`에는 소스별 원본 결과를 그대로 남겨(디버깅/화면 참고용) 어느
-        소스가 실패했는지 구분할 수 있게 한다."""
+        소스가 실패했는지 구분할 수 있게 한다.
+
+        두 소스가 settings.cs_inquiry_sync_max_requests_per_run 하나를 공유하는
+        단일 RequestBudget을 쓴다 - "플랫폼 1개당 scheduler 1회 실행에서 허용되는
+        전체 외부 요청 수"가 소스별이 아니라 호출 전체(이 메서드 1회 호출) 기준이기
+        때문이다(config/settings.py의 계산식 주석 참고). 한 소스가 예산을 다 써서
+        REQUEST_BUDGET_EXCEEDED로 실패해도 이미 처리된 다른 소스의 결과는 그대로
+        유지된다(아래 for 루프가 예외를 올리지 않고 결과 dict로만 돌려받기 때문)."""
         if not settings.cs_inquiry_sync_enabled:
             return {"status": "DISABLED", "created": 0, "updated": 0, "failed": 0, "by_source": {}}
 
+        shared_budget = RequestBudget(max_requests=settings.cs_inquiry_sync_max_requests_per_run)
         by_source: dict[str, dict[str, Any]] = {}
         total_created = 0
         total_updated = 0
         total_failed = 0
         reason_codes: list[str] = []
         for source in _INQUIRY_SOURCES:
-            result = self.sync_inquiries(connector, platform_id, start_date, end_date, source=source)
+            result = self.sync_inquiries(
+                connector, platform_id, start_date, end_date, source=source, request_budget=shared_budget
+            )
             by_source[source] = result
             total_created += result.get("created", 0)
             total_updated += result.get("updated", 0)

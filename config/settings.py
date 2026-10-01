@@ -120,6 +120,39 @@ class Settings(BaseSettings):
     # 참고(공식 계약상 안전하게 확정할 수 없는 필드가 있어 구현 자체가 없다).
     cs_inquiry_sync_enabled: bool = False
 
+    # cs_inquiry_sync 호출량 안전 상한 - 공식 쿠팡 rate limit은 요청 수/시간 단위로
+    # 공개돼 있지 않다(developers.coupang.com/en/faq/what-should-i-do-when-a-429-error-is-returned,
+    # 2026-10 확인: "throttling setting"이 있고 근접 시 X-CAG-Warnings 헤더로만
+    # 알려준다 - 숫자 한도 자체는 비공개). 그래서 아래 값들은 공식 한도가 아니라
+    # 이 ERP가 보수적으로 정한 내부 안전 예산이다(OFFICIAL_LIMIT_UNCONFIRMED).
+    # integrations.malls.coupang_connector.CoupangConnector.fetch_inquiries/
+    # fetch_product_inquiries의 max_pages/max_retries/request_budget 파라미터로
+    # 실제 적용된다(services/cs_channel_sync_service.py 참고).
+    #
+    # 조회 기간(일) - 기존 7일 전체를 매번 다시 조회하던 방식 대신 보수적으로 1일로
+    # 줄인다(cursor/마지막 성공 시각이 없는 1단계 설계의 한계를 기간 축소로 완화 -
+    # docs/COMMERCIAL_ERP_ROADMAP.md 5-B단계 절의 후속 과제 참고).
+    cs_inquiry_sync_window_days: int = 1
+    # source(쿠팡 콜센터 문의는 상태 4종, 상품별 문의는 answeredType=ALL 1종)별로
+    # "하나의 쿼리"(상태 또는 answeredType 1개 x 7일 이하 창 1개) 안에서 허용하는
+    # 최대 페이지 수. 이 페이지를 다 받고도 응답이 다음 페이지가 더 있다고 알리면
+    # 성공/부분성공으로 위장하지 않고 PAGE_LIMIT_EXCEEDED로 그 source를 실패 처리한다
+    # (coupang_connector._fetch_raw_call_center_inquiries/_fetch_raw_online_inquiries 참고).
+    cs_inquiry_sync_max_pages_per_query: int = 3
+    # 페이지 1회 요청당 HTTP 429 재시도 횟수 - 기존 전역 RATE_LIMIT_MAX_RETRIES(5)보다
+    # 보수적이다(재시도도 아래 요청 예산을 소비하므로 과도한 재시도가 예산을 빨리
+    # 소진시키지 않도록 더 낮게 잡는다).
+    cs_inquiry_sync_max_retries_per_page: int = 2
+    # 플랫폼 1개당, scheduler 1회 실행(또는 수동 동기화 1회 호출)에서 실제로 네트워크로
+    # 나가는 HTTP 요청 수(최초 시도+재시도 전부 포함, 두 source 합산)의 절대 상한.
+    # 계산: (콜센터 상태 4종 + 상품별 1종) x max_pages_per_query x (1 + max_retries_per_page)
+    #     = 5 x 3 x 3 = 45 (기본값 기준 절대 최댓값과 정확히 일치하도록 설정 - 정상
+    #       한도 내에서는 절대 소진되지 않고, 설정 실수나 향후 소스 추가 시에만
+    #       방어적으로 작동하는 2차 안전장치다).
+    cs_inquiry_sync_max_requests_per_run: int = 45
+    # scheduler 실행 주기(분) - scheduler/scheduler.py의 IntervalTrigger가 이 값을 읽는다.
+    cs_inquiry_sync_interval_minutes: int = 15
+
     # 상용 ERP 확장(6단계) - 운영 대시보드 심각도(INFO/WARNING/ERROR/CRITICAL) 분류
     # 임계값. 오류 문자열 검색이 아니라 이 숫자 임계값과 구조화된 필드(status/
     # error_code)만으로 심각도를 정한다(services/operations_dashboard_service.py

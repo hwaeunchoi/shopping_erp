@@ -46,7 +46,6 @@ from services.cs_channel_sync_service import CsChannelSyncService
 
 logger = logging.getLogger(__name__)
 
-COLLECT_WINDOW_DAYS = 7
 INTEGRATION_TYPE = "CS_INQUIRY"
 
 
@@ -61,6 +60,14 @@ def _safe_error_summary(exc: Exception) -> str:
     return f"INTERNAL_ERROR:{type(exc).__name__}:trace={uuid.uuid4().hex[:8]}"
 
 
+def _collection_window(today: date) -> tuple[date, date]:
+    """settings.cs_inquiry_sync_window_days(기본 1일)로 [start_date, end_date]를
+    계산하는 순수 함수 - session_scope() 없이 단위테스트할 수 있도록 run()에서
+    분리했다. 기존처럼 매번 7일 전체를 다시 조회하지 않고 보수적으로 줄인 값이다
+    (config/settings.py의 계산식 주석 참고). window_days=1이면 start=end=today."""
+    return today - timedelta(days=settings.cs_inquiry_sync_window_days - 1), today
+
+
 def run() -> dict[str, dict]:
     if not settings.cs_inquiry_sync_enabled:
         logger.debug("CS 문의 동기화 기능이 비활성화(OFF) 상태라 cs_inquiry_sync_job을 건너뜁니다.")
@@ -68,8 +75,7 @@ def run() -> dict[str, dict]:
 
     results: dict[str, dict] = {}
     with session_scope() as db:
-        end_date = date.today()
-        start_date = end_date - timedelta(days=COLLECT_WINDOW_DAYS)
+        start_date, end_date = _collection_window(date.today())
         sync_service = CsChannelSyncService(db)
         integration_status_repo = IntegrationStatusRepository(db)
 
@@ -78,7 +84,7 @@ def run() -> dict[str, dict]:
                 connector = get_mall_connector(platform.connector_class, session=db, platform_id=platform.id)
                 result = sync_service.sync_all_inquiries(connector, platform.id, start_date, end_date)
                 results[platform.code] = result
-                _record_integration_status(integration_status_repo, platform.code, result.get("status"))
+                _record_integration_status(integration_status_repo, platform.code, result)
                 db.commit()
             except MarketplaceCapabilityUnsupportedError:
                 db.rollback()
@@ -97,12 +103,27 @@ def run() -> dict[str, dict]:
 
 
 def _record_integration_status(
-    integration_status_repo: IntegrationStatusRepository, platform_code: str, sync_status: object
+    integration_status_repo: IntegrationStatusRepository, platform_code: str, result: dict
 ) -> None:
+    """result는 CsChannelSyncService.sync_all_inquiries()의 반환값 전체다(status 하나만이
+    아니라) - by_source에 담긴 안전한 reason_code(예: PAGE_LIMIT_EXCEEDED/
+    REQUEST_BUDGET_EXCEEDED/CREDENTIAL_MISSING)를 메시지에 포함해, 운영자가
+    integration_status 조회만으로 "무엇 때문에" 실패/부분성공했는지 확인할 수 있게
+    한다(요구사항: 실패 사실과 안전한 요약을 기존 운영 관찰 경로에서 확인 가능하게
+    할 것). reason_code는 이 코드베이스가 직접 정의한 짧은 안전 문자열뿐이라(모듈
+    상단 _safe_error_summary와 동일 원칙) 문의 본문/주문번호/Secret이 섞여 들어올
+    수 없다."""
+    sync_status = result.get("status")
+    by_source = result.get("by_source") or {}
+    reason_codes: set[str] = {
+        str(r["reason_code"]) for r in by_source.values() if isinstance(r, dict) and r.get("reason_code")
+    }
+    reason_suffix = f" (reason={','.join(sorted(reason_codes))})" if reason_codes else ""
+
     if sync_status == "SUCCESS":
         integration_status_repo.upsert_success(INTEGRATION_TYPE, platform_code)
     elif sync_status == "PARTIAL_SUCCESS":
-        integration_status_repo.upsert_partial(INTEGRATION_TYPE, platform_code, "일부 문의만 수집 성공")
+        integration_status_repo.upsert_partial(INTEGRATION_TYPE, platform_code, f"일부 문의만 수집 성공{reason_suffix}")
     elif sync_status == "FAILED":
-        integration_status_repo.upsert_error(INTEGRATION_TYPE, platform_code, "CS 문의 수집 전체 실패")
+        integration_status_repo.upsert_error(INTEGRATION_TYPE, platform_code, f"CS 문의 수집 전체 실패{reason_suffix}")
     # UNSUPPORTED(capability 없음)는 기록하지 않는다(미지원과 실패를 구분).

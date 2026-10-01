@@ -351,10 +351,25 @@ class BaseMallConnector(ABC):
         내 취소 사실이 없으면 None(빈 결과 - 오류 아님)."""
         raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "cancellation_lookup_by_order")
 
-    def fetch_inquiries(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+    def fetch_inquiries(
+        self,
+        start_date: date,
+        end_date: date,
+        *,
+        max_pages: Optional[int] = None,
+        max_retries: Optional[int] = None,
+        request_budget: Optional[Any] = None,
+    ) -> list[dict[str, Any]]:
         """기간 내 채널 CS(고객문의) 목록을 정규화된 형식으로 조회한다(기본: 미지원
         오류 - 빈 목록으로 위장하지 않는다). supports_inquiry_sync=True인 커넥터만
         오버라이드한다.
+
+        max_pages/max_retries/request_budget은 상용 ERP 확장 5단계 B묶음 보완(CS 문의
+        호출량 안전 상한) 파라미터 - 기본값(None)은 "제한 없음"이다. 오버라이드하는
+        커넥터가 실제 페이지네이션을 한다면 이 제한을 반영해야 한다(integrations.
+        malls.coupang_connector.CoupangConnector.fetch_inquiries 참고). request_budget의
+        타입은 integrations.malls.errors.RequestBudget이며, 순환 import를 피하려 이
+        인터페이스에서는 Any로만 선언한다.
 
         반환 형식(정규화):
             {"platform_inquiry_id": str,       # 채널의 문의 고유 ID(재수집 dedup 키)
@@ -367,10 +382,20 @@ class BaseMallConnector(ABC):
         """
         raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "inquiry_sync")
 
-    def fetch_product_inquiries(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+    def fetch_product_inquiries(
+        self,
+        start_date: date,
+        end_date: date,
+        *,
+        max_pages: Optional[int] = None,
+        max_retries: Optional[int] = None,
+        request_budget: Optional[Any] = None,
+    ) -> list[dict[str, Any]]:
         """기간 내 채널 상품별 문의(예: 쿠팡 onlineInquiries) 목록을 정규화된 형식으로
         조회한다(기본: 미지원 오류 - 빈 목록으로 위장하지 않는다).
         supports_product_inquiry_sync=True인 커넥터만 오버라이드한다.
+
+        max_pages/max_retries/request_budget은 fetch_inquiries()와 동일(위 docstring 참고).
 
         반환 형식(정규화)은 fetch_inquiries()와 동일한 키를 쓴다 - CsChannelSyncService가
         두 소스를 같은 upsert 경로로 처리하기 위함. 채널마다 응답에 실제로 존재하지

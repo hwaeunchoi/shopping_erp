@@ -13,6 +13,7 @@ reason_code와 (있으면) 숫자 HTTP 상태 코드만 담는다.
 """
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Iterator, Optional
 
 import httpx
@@ -20,6 +21,29 @@ import httpx
 
 class MarketplaceError(Exception):
     """마켓플레이스 연동 공통 예외 베이스."""
+
+
+@dataclass
+class RequestBudget:
+    """한 호출 단위(예: scheduler 1회 실행의 플랫폼 1개)에서 실제로 네트워크로 나가는
+    HTTP 요청 수(최초 시도 + 429 재시도 전부 포함)에 상한을 두는 공유 카운터.
+
+    - 커넥터의 `_request_with_retry()`가 실제 요청을 보내기 **직전**마다 `consume()`을
+      호출한다 - 재시도도 예산을 소비한다(요구사항 원문).
+    - 소스(예: 쿠팡 콜센터 문의 4상태 + 상품별 문의 1종)를 여러 번 순회하는 호출부가
+      같은 인스턴스를 공유해서 넘기면, 플랫폼 1개의 scheduler 1회 실행 전체에서 쓴
+      요청 수가 누적된다(services.cs_channel_sync_service.CsChannelSyncService 참고).
+    - 상한 도달 시 네트워크 요청을 보내지 않고 바로 안전한 오류로 막는다(요청을 보낸
+      뒤 응답을 버리는 방식이 아니다 - 예산 자체를 지키기 위함).
+    """
+
+    max_requests: int
+    used: int = 0
+
+    def consume(self, marketplace_code: str) -> None:
+        if self.used >= self.max_requests:
+            raise MarketplaceExternalAPIError(marketplace_code, "REQUEST_BUDGET_EXCEEDED", False)
+        self.used += 1
 
 
 class MarketplaceCredentialMissingError(MarketplaceError):
