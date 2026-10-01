@@ -561,6 +561,22 @@
   수도 늘어 예산에 더 가까이 다가간다). `IntegrationStatus.last_success_at`을
   그대로 재사용할 수 있는지, 아니면 CS 전용 cursor 테이블이 필요한지는
   그 과제에서 별도로 설계한다.
+- **버그 수정(2026-10, `fix/coupang-call-center-inquiry-persistence`)**: 콜센터
+  문의 실계정 제한 검증(1회차)에서 `TypeError: can't compare offset-naive and
+  offset-aware datetimes`로 전체 롤백되는 문제를 발견·재현·수정했다. 원인은
+  `integrations/malls/coupang_connector._parse_coupang_datetime()`가
+  tz-aware(KST) datetime을 반환했는데, `CsCase.last_customer_message_at`은
+  naive `DateTime` 컬럼이라 같은 트랜잭션 안에서 방금 생성한 case를 다시 읽으면
+  naive로 바뀌어 새로 파싱한 tz-aware 값과 비교(`CsChannelSyncService.
+  _upsert_one()`)할 때 터진 것이다. 콜센터 문의는 상태 4종을 한 raw_items로
+  합쳐 같은 inquiryId가 한 실행 안에서 중복될 수 있어 바로 재현됐고, 상품별
+  문의는 단일 조회라 첫 실행에서는 드러나지 않았을 뿐 **재동기화(다음 스케줄
+  실행)에서는 두 source 모두 동일하게 영향받는 문제**였다. 이 함수가 항상
+  naive UTC를 반환하도록(이 코드베이스의 공통 관례, `models.base.utcnow`/각
+  서비스의 `_now()`와 동일) 정규화 경계에서 고쳐, `fetch_orders()`의
+  `order_date`까지 한 번에 함께 바로잡았다. MockTransport 기반 회귀 테스트
+  (`tests/unit/test_coupang_cs_inquiry_tz_regression.py`)로 수정 전 실패·수정
+  후 통과를 모두 확인했다 - 실제 쿠팡 API는 재호출하지 않았다.
 
 ### 5-C단계(잔여) - CS-주문 자동 연결 고도화/택배사 실시간 연동
 
