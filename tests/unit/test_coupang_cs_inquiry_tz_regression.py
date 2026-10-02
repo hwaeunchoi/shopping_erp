@@ -319,6 +319,7 @@ class TestResyncAcrossSeparateRunsRegression:
         assert second["updated"] == 1
         assert second["failed"] == 0
         case = CsCaseRepository(db_session).get_by_external(platform.id, COUPANG_CALL_CENTER_SOURCE, "2001")
+        assert case is not None
         assert case.last_customer_message_at == datetime(2026, 9, 30, 6, 0, 0)  # 15:00 KST -> 06:00 UTC
 
 
