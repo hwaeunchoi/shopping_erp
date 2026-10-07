@@ -578,6 +578,125 @@
   (`tests/unit/test_coupang_cs_inquiry_tz_regression.py`)로 수정 전 실패·수정
   후 통과를 모두 확인했다 - 실제 쿠팡 API는 재호출하지 않았다.
 
+### 5-B단계 보완 - CS 문의 자동수집: 15분 정기 실행 + 재시작 catch-up + stale RUNNING 정리 (구현 완료, feature 브랜치 `feature/cs-inquiry-sync-catchup`)
+
+> 이 보완은 코드·테스트·문서까지다. 운영 배포와 `CS_INQUIRY_SYNC_ENABLED` 활성화는 별도 승인 후 진행한다
+> (기본값 `False` 그대로 - 플래그가 꺼져 있으면 DB 세션·credential 복호화·외부 HTTP 요청이 전혀 없다).
+> 새 테이블·Alembic migration은 없다(head `9162c416e673` 그대로).
+
+**배경 - 이 ERP는 PC가 켜져 있는 동안에만 돈다.** 운영 PC는 평일 업무시간 위주로 켜지고(실측: 7월부터 거의 매일
+아침 Docker Desktop 시작, 저녁 09:00Z=18:00 KST 전후 PC 종료로 컨테이너 종료), 주말·공휴일은 꺼져 있다. 그 동안
+scheduler 자체가 없으므로 "15분마다"만으로는 꺼져 있던 기간의 문의를 영영 가져오지 못한다. 그래서 source별로
+"어디까지 가져왔는가"를 기억(checkpoint)하고, 다시 켜지면 그 지점부터 따라잡는다.
+
+#### 1) 실행 구조
+
+| 실행 | 등록 | 동작 |
+|---|---|---|
+| 15분 정기 | `cs_inquiry_sync` (`IntervalTrigger`, `cs_inquiry_sync_interval_minutes=15`, 기존 그대로) | 매번 checkpoint부터 오늘(Asia/Seoul)까지 조회. 같은 날을 반복 조회해도 source별 dedup으로 같은 case에 수렴 |
+| 시작 직후 catch-up | `cs_inquiry_catchup` (`DateTrigger`, `misfire_grace_time=None`, `coalesce=True`, `max_instances=1`) | scheduler가 뜰 때 1회. 모든 source checkpoint가 최근 15분 이내(같은 날)이면 외부 호출 없이 `skipped_up_to_date`. 실패해도 자체 재시도 없음 - 다음 15분 정기 실행이 같은 checkpoint부터 이어받는다 |
+| 수동 sync | `POST /api/cs-cases/sync` (기존) | 같은 잠금을 공유(아래). checkpoint는 건드리지 않는다(수동은 명시한 기간만 조회) |
+
+세 경로 모두 같은 서비스(`services/cs_inquiry_catchup_service.py`)·요청 예산·페이지 제한·dedup(`CsChannelSyncService`)을
+쓴다. job 모듈(`scheduler/jobs/cs_inquiry_sync_job.py`)은 플랫폼 순회와 `integration_status(CS_INQUIRY)` 기록만 한다.
+scheduler job은 17개 -> 18개(`cs_inquiry_catchup` 추가).
+
+#### 2) source별 checkpoint (새 테이블 없음)
+
+- 키: `platform_id` + `external_source` (`COUPANG_CALL_CENTER` / `COUPANG_PRODUCT_INQUIRY`). source끼리 독립이라 한쪽이
+  계속 실패해도 다른 쪽 진행은 영향받지 않는다.
+- 저장소: 기존 `integration_status` 테이블 재사용 - `integration_type="CS_CHECKPOINT"`,
+  `integration_code="<platform_id>:<source>"`(30자 이내, 코드가 길이를 검증), `last_success_at`=**covered_until**
+  (이 시각까지의 문의를 해당 source에서 완전히 가져와 저장했다는 뜻, naive UTC), `status`=NORMAL/ERROR,
+  `last_error_message`=**안전한 오류 코드 1개**(예: `PAGE_LIMIT_EXCEEDED`, `INTERNAL_ERROR:TypeError`), `updated_at`.
+  문의 ID·주문번호·본문·credential은 저장하지 않는다. 연동 상태 화면/운영 대시보드(`list_all_status`)에서는
+  `CS_CHECKPOINT` 행을 제외한다.
+- 전진 조건(전부 충족): fetch·정규화·DB 저장 성공 + `failed=0` + 요청 예산/페이지 제한 초과 없음 + commit 성공.
+  데이터 upsert와 checkpoint 갱신은 **같은 트랜잭션**이다. 실패·rollback·부분실패면 전진하지 않고(오류 코드만 기록),
+  값은 단조 증가만 허용한다(뒤로 가지 않음). `PARTIAL_SUCCESS`는 이미 저장된 항목(멱등)을 보존하되 전진하지 않는다.
+- 단점/이유: `integration_status`는 원래 "상태 스냅샷"이라 checkpoint 전용 스키마보다 덜 명시적이지만, 필요한 값
+  (진행 시각·상태·안전한 오류 코드·updated_at)이 모두 들어가고 migration(운영 DB 변경) 위험이 없다. 구간 자체는
+  covered_until에서 항상 다시 계산되므로 "마지막 성공 구간"을 따로 저장하지 않는다.
+
+#### 3) 조회 구간 계산 (모두 Asia/Seoul 날짜, 요청은 날짜 단위)
+
+- checkpoint 없음(최초): `cs_inquiry_sync_window_days`(기본 1)일, 오늘 포함 -> 성공 후 checkpoint 생성.
+- checkpoint 있음: 시작일 = covered_until의 KST 날짜, 종료일 = 오늘. 시작일을 다시 포함해 경계 누락을 막는다.
+- 쿠팡 문의 조회 API 최대 기간 7일(콜센터/상품별 공통) -> **최대 7일 구간으로 분할**, 가장 오래된 구간부터 처리.
+  구간 성공마다 checkpoint를 그 구간 끝까지만 옮긴다(지난 날짜 구간은 다음 날 00:00 KST, 오늘이 포함된 구간은 실행 시작
+  시각). 전체 공백을 건너뛰어 오늘로 점프하지 않는다. 구간 하나가 실패하면 그 뒤 구간은 시도하지 않는다.
+- 예: 금요일 18시 종료 -> 월요일 아침 시작 = 금~월 한 구간. 20일 공백 = 7+7+7일 구간 3개를 오래된 순으로(한 번에
+  다 처리하지 않을 수 있음 - 아래 예산) -> 모두 따라잡은 뒤에는 오늘만 반복 조회.
+- 한국은 DST가 없어 고정 +09:00 오프셋을 쓴다(tzdata 의존성 없음).
+
+#### 4) 요청 예산 (플랫폼 1개 x 실행 1회 = 예산 1개)
+
+기존 안전 설정을 그대로 쓴다: `max_pages_per_query=3`, `max_retries_per_page=2`, `max_requests_per_run=45`,
+`interval_minutes=15`. 두 source와 모든 구간이 **하나의 `RequestBudget`을 공유**하고, 최초 요청과 retry가 모두 소비되며,
+소진되면 네트워크 전송 전에 차단된다(`REQUEST_BUDGET_EXCEEDED`).
+
+| 최악 조건(구간 1개) | 계산 | 요청 수 |
+|---|---|---|
+| 콜센터 | 상태 4종 x 3페이지 x (1+재시도 2) | **36** |
+| 상품별 | 1종 x 3페이지 x (1+재시도 2) | **9** |
+| 구간 1개, 두 source 합 | 36 + 9 | **45 = 예산** |
+
+- 구간을 **시작하기 전에** 남은 예산이 그 source의 구간당 최악 요청 수 이상일 때만 시작한다. 부족하면 남은 구간은 다음
+  15분 실행으로 넘긴다(구간을 시작해 중간에 예산이 끊기는 낭비를 없앤다). source는 라운드 로빈으로 처리해 한쪽이
+  독점하지 못한다.
+- 최악 비용이면 한 실행에 구간 1개씩, 일반 비용(페이지 1·429 없음: 구간당 콜센터 4 + 상품별 1)에서도 콜센터는 한
+  실행에 최대 2구간(사용 10 -> 남은 35 < 36)까지 시작된다. 20일 공백(구간 3개)은 콜센터 기준 2회 실행(약 15~30분)이면
+  따라잡는다. **예산을 넘겨 요청하는 경로는 없다.**
+- `PAGE_LIMIT_EXCEEDED`/`REQUEST_BUDGET_EXCEEDED`로 실패한 구간은 DB에 아무것도 쓰지 않고 checkpoint도 옮기지 않는다.
+  같은 구간이 계속 `PAGE_LIMIT_EXCEEDED`이면(하루 문의량이 3페이지를 넘는 경우) 진행이 막힌다 - 의도된 fail-closed이며
+  `max_pages_per_query` 조정 또는 수동 조치가 필요하다(`integration_status`/checkpoint 오류 코드로 확인).
+
+#### 5) 동시 실행 방지 - advisory lock 범위
+
+- 잠금 단위: **(platform_id, source)**. 같은 플랫폼의 같은 source만 서로 막고, 다른 source/다른 플랫폼은 막지 않는다.
+- 구현(`services/cs_sync_lock.py`): PostgreSQL 세션 advisory lock(`pg_try_advisory_lock(classid=0x43530001, objid=platform_id*16+source)`,
+  논블로킹)을 전용 AUTOCOMMIT 커넥션에 건다(백업과 같은 패턴). 호출자 세션의 commit/rollback과 무관하고, 정상/예외 종료 시
+  unlock, unlock 실패 시 커넥션을 폐기해 잠금이 풀에 남지 않게 한다. 커넥션이 죽으면 DB가 자동 해제한다.
+  SQLite(단위 테스트)에서는 프로세스 내 잠금으로 대체한다. 잠금은 항상 호출 세션이 바인딩된 엔진으로 건다.
+- 보호 대상: 시작 직후 catch-up, 15분 정기 실행, 수동 sync(`/api/cs-cases/sync`, 전체 source는 두 잠금을 모두 잡아야 진행,
+  단일 source는 그 source 잠금). 겹치면 하나만 외부 호출·DB 쓰기를 하고 패자는 `ALREADY_RUNNING`(대기·자동 retry 없음).
+  `ALREADY_RUNNING`은 연동 상태를 오류로 기록하지 않는다.
+
+#### 6) stale RUNNING 정리 (재시작 잔존 이력)
+
+운영에서 3주 전 `PRODUCT_SYNC` RUNNING 행이 발견됐다(작업 도중 프로세스가 사라지면 RUNNING으로 영원히 남는다).
+scheduler **시작 시 1회**(`scheduler/scheduler.py main()`, 실패해도 기동은 계속) `services/stale_task_recovery_service.py`가
+다음을 **모두** 만족하는 행만 정리한다.
+
+1. `status=RUNNING` 이고 `started_at`이 `task_stale_running_threshold_minutes`(기본 360분)보다 오래됨.
+2. `target`이 등록된 scheduler job이고 `trigger_type`이 `SCHEDULE`/`CATCHUP`(API 수동 실행 이력은 건드리지 않음).
+3. 같은 작업의 실제 활성 실행이 없음 - CS 동기화·백업은 advisory lock을 실제로 누가 들고 있는지 확인해 들고 있으면 유지.
+   (잠금이 없는 작업은 "scheduler가 방금 시작했고 인스턴스는 1개(docker-compose)"라는 전제로 임계시간 초과 행을 잔존물로 본다.)
+
+기록: 기존 상태 계약(RUNNING/SUCCESS/FAILED)에 맞춰 `status=FAILED`, `error_message="PROCESS_INTERRUPTED"`
+(`task_execution_history`에는 `error_code` 컬럼이 없어 안전한 고정 코드를 `error_message`에 둔다), `finished_at`=정리 시각.
+원본 오류·Secret·PII는 기록하지 않는다. 임의 `INTERRUPTED` 상태값은 만들지 않았다. 모니터링은
+`GET /api/system-monitor/running-tasks`가 최근 RUNNING과 stale RUNNING(임계시간 초과)을 분리해 센다.
+**이번 코드 작업은 운영 DB의 기존 고아 행을 수정하지 않았다** - 배포 후 scheduler가 처음 시작될 때 정리된다.
+
+#### 7) 운영 시나리오와 한계
+
+- 활성화 순서(별도 승인): 이미지 빌드/배포 -> 플래그 활성화 -> 첫 실행은 checkpoint가 없어 `window_days`(1일)만 조회하고
+  checkpoint 생성 -> 이후 15분마다 이어서 조회. 활성화 전 기존 수동 검증 데이터(상품별 2건/콜센터 3건)는 dedup으로 수렴한다.
+- 되돌리기: 플래그를 `False`로 되돌리면 모든 자동 경로가 외부 호출 없이 종료한다. checkpoint 행은 남아도 무해하다
+  (다시 켜면 그 지점부터 따라잡는다). 코드 롤백도 migration이 없어 이미지 교체만으로 된다.
+- **24시간 켜져 있는 서버를 여전히 권장한다.** catch-up은 "꺼진 기간의 문의를 나중에 가져오는" 장치일 뿐이다. 꺼져 있는 동안
+  고객 문의에 대한 알림·SLA 대응은 불가능하고, 쿠팡 API가 오래된 문의 조회를 제한하거나 문의량이 구간당 페이지 상한을
+  넘으면 따라잡기가 막힐 수 있다. 장기 공백(수 주)은 구간 수만큼 실행 횟수가 늘어난다.
+- 한계: checkpoint 저장 위치가 `integration_status`라 연동 상태 화면과 분리하려고 조회에서 제외했다(전용 테이블이 필요해지면
+  후속 migration으로 분리 가능). 실제 쿠팡 응답 지연/시계 오차는 covered_until을 "실행 시작 시각"으로 잡아 보수적으로 처리한다.
+
+#### 8) 검증
+
+단위(날짜 경계·7일 분할·8/14/20일 공백·KST 자정 경계·checkpoint 전진/불변·source 독립·예산 공유/최악 조건/재개·잠금·stale 정리),
+통합(수동 sync 잠금 공유·모니터 엔드포인트·checkpoint 비노출), 실제 PostgreSQL 격리 컨테이너(advisory lock 경합·크래시 해제·
+동시 catch-up·stale 판단·수동 vs 자동)로 검증했다. 실제 쿠팡 API 호출·운영 DB 쓰기는 없다.
+
 ### 5-C단계(잔여) - CS-주문 자동 연결 고도화/택배사 실시간 연동
 
 - **범위**: 5-B단계가 다루지 않은 나머지 - 채널 문의를 수집 시점에 주문라인
