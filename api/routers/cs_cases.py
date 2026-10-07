@@ -29,6 +29,7 @@ pii_mask.py), 상세 조회에서도 CS_PII_DETAIL 권한이 있는 사용자에
 case_id="bulk" 정수 변환 실패로 422가 난다).
 """
 
+from contextlib import ExitStack
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -55,6 +56,8 @@ from services.cs_channel_sync_service import (
     COUPANG_PRODUCT_INQUIRY_SOURCE,
     CsChannelSyncService,
 )
+from services.cs_inquiry_catchup_service import SOURCES as CS_SYNC_SOURCES
+from services.cs_sync_lock import cs_sync_source_lock
 from services.pii_mask import mask_name, mask_phone
 
 router = APIRouter(prefix="/api/cs-cases", tags=["cs-cases"])
@@ -372,19 +375,27 @@ def sync_channel_inquiries(payload: SyncRequest, db=Depends(get_db)) -> SyncResu
 
     end_date = date.today()
     start_date = end_date - timedelta(days=payload.days)
-    try:
-        connector = get_mall_connector(platform.connector_class, session=db, platform_id=platform.id)
-        result = CsChannelSyncService(db).sync_all_inquiries(connector, platform.id, start_date, end_date)
-    except MarketplaceCapabilityUnsupportedError:
-        db.rollback()
-        return SyncResultOut(platform_code=platform.code, status="UNSUPPORTED")
-    except MarketplaceCredentialMissingError:
-        db.rollback()
-        return SyncResultOut(platform_code=platform.code, status="FAILED", reason_code="CREDENTIAL_MISSING")
-    except MarketplaceExternalAPIError as e:
-        db.rollback()
-        return SyncResultOut(platform_code=platform.code, status="FAILED", reason_code=e.reason_code)
-    db.commit()
+    # 자동 실행(15분 정기/시작 catch-up)과 같은 (platform, source) advisory lock - 두 source를 모두
+    # 잡지 못하면(다른 실행이 한쪽이라도 진행 중이면) 이 호출은 외부 호출·DB 쓰기 없이 ALREADY_RUNNING.
+    with ExitStack() as stack:
+        acquired = [
+            stack.enter_context(cs_sync_source_lock(platform.id, src, db.get_bind())) for src in CS_SYNC_SOURCES
+        ]
+        if not all(acquired):
+            return SyncResultOut(platform_code=platform.code, status="ALREADY_RUNNING", reason_code="ALREADY_RUNNING")
+        try:
+            connector = get_mall_connector(platform.connector_class, session=db, platform_id=platform.id)
+            result = CsChannelSyncService(db).sync_all_inquiries(connector, platform.id, start_date, end_date)
+        except MarketplaceCapabilityUnsupportedError:
+            db.rollback()
+            return SyncResultOut(platform_code=platform.code, status="UNSUPPORTED")
+        except MarketplaceCredentialMissingError:
+            db.rollback()
+            return SyncResultOut(platform_code=platform.code, status="FAILED", reason_code="CREDENTIAL_MISSING")
+        except MarketplaceExternalAPIError as e:
+            db.rollback()
+            return SyncResultOut(platform_code=platform.code, status="FAILED", reason_code=e.reason_code)
+        db.commit()
     return SyncResultOut(platform_code=platform.code, **result)
 
 
@@ -421,27 +432,30 @@ def _sync_single_source_limited(db, platform, payload: "SyncRequest") -> SyncRes
 
     end_date = date.today()
     start_date = end_date - timedelta(days=payload.days - 1)
-    try:
-        connector = get_mall_connector(platform.connector_class, session=db, platform_id=platform.id)
-        result = CsChannelSyncService(db).sync_inquiries(
-            connector,
-            platform.id,
-            start_date,
-            end_date,
-            source=payload.source,
-            max_pages=max_pages,
-            max_retries=max_retries,
-        )
-    except MarketplaceCapabilityUnsupportedError:
-        db.rollback()
-        return SyncResultOut(platform_code=platform.code, status="UNSUPPORTED")
-    except MarketplaceCredentialMissingError:
-        db.rollback()
-        return SyncResultOut(platform_code=platform.code, status="FAILED", reason_code="CREDENTIAL_MISSING")
-    except MarketplaceExternalAPIError as e:
-        db.rollback()
-        return SyncResultOut(platform_code=platform.code, status="FAILED", reason_code=e.reason_code)
-    db.commit()
+    with cs_sync_source_lock(platform.id, payload.source, db.get_bind()) as acquired:
+        if not acquired:
+            return SyncResultOut(platform_code=platform.code, status="ALREADY_RUNNING", reason_code="ALREADY_RUNNING")
+        try:
+            connector = get_mall_connector(platform.connector_class, session=db, platform_id=platform.id)
+            result = CsChannelSyncService(db).sync_inquiries(
+                connector,
+                platform.id,
+                start_date,
+                end_date,
+                source=payload.source,
+                max_pages=max_pages,
+                max_retries=max_retries,
+            )
+        except MarketplaceCapabilityUnsupportedError:
+            db.rollback()
+            return SyncResultOut(platform_code=platform.code, status="UNSUPPORTED")
+        except MarketplaceCredentialMissingError:
+            db.rollback()
+            return SyncResultOut(platform_code=platform.code, status="FAILED", reason_code="CREDENTIAL_MISSING")
+        except MarketplaceExternalAPIError as e:
+            db.rollback()
+            return SyncResultOut(platform_code=platform.code, status="FAILED", reason_code=e.reason_code)
+        db.commit()
     return SyncResultOut(platform_code=platform.code, **result)
 
 

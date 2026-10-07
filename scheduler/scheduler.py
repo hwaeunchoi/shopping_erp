@@ -153,6 +153,12 @@ def run_cs_inquiry_sync() -> None:
     _run_job("cs_inquiry_sync", cs_inquiry_sync_job.run, task_type="FULL_SYNC")
 
 
+def run_cs_inquiry_catchup() -> None:
+    """scheduler 시작 직후 1회 - PC 비가동 기간의 CS 문의를 따라잡는다(이미 최신이면 건너뜀).
+    정기 실행(run_cs_inquiry_sync)과 같은 서비스·요청 예산·dedup·advisory lock을 쓴다."""
+    _run_job("cs_inquiry_catchup", cs_inquiry_sync_job.run_catchup, task_type="FULL_SYNC", trigger_type="CATCHUP")
+
+
 def build_scheduler() -> BlockingScheduler:
     scheduler = BlockingScheduler(timezone="UTC")
     # 상품 동기화는 주문 수집보다 먼저 실행되도록 더 짧은 주기(10분보다 여유를 둔 20분)로
@@ -238,6 +244,18 @@ def build_scheduler() -> BlockingScheduler:
         IntervalTrigger(minutes=settings.cs_inquiry_sync_interval_minutes),
         id="cs_inquiry_sync",
         max_instances=1,
+    )
+    # 시작 직후 1회 catch-up(PC 비가동 기간 보충). DateTrigger()는 start() 직후 한 번만 발화하고,
+    # misfire_grace_time=None으로 add_job()~start() 사이의 지연 때문에 건너뛰어지지 않게 하며
+    # (backup_catchup과 같은 이유), 실패해도 재시도하지 않는다 - 다음 15분 정기 실행이 같은
+    # checkpoint부터 이어받는다. 기능 플래그가 False면 외부 호출 없이 바로 끝난다.
+    scheduler.add_job(
+        run_cs_inquiry_catchup,
+        DateTrigger(),
+        id="cs_inquiry_catchup",
+        max_instances=1,
+        misfire_grace_time=None,
+        coalesce=True,
     )
     return scheduler
 

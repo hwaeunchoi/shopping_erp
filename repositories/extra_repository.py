@@ -33,6 +33,12 @@ class ReportScheduleRepository(BaseRepository[ReportSchedule]):
         return list(self.session.execute(stmt).scalars().all())
 
 
+# CS 문의 자동수집의 source별 checkpoint는 integration_status 테이블을 재사용하지만 "연동 상태"
+# 화면/대시보드 대상이 아니다 - list_all_status()가 이 type을 제외한다
+# (services/cs_inquiry_catchup_service.py 참고).
+CS_CHECKPOINT_INTEGRATION_TYPE = "CS_CHECKPOINT"
+
+
 class TaskExecutionHistoryRepository(BaseRepository[TaskExecutionHistory]):
     def __init__(self, session: Session) -> None:
         super().__init__(session, TaskExecutionHistory)
@@ -192,8 +198,10 @@ class IntegrationStatusRepository(BaseRepository[IntegrationStatus]):
         super().__init__(session, IntegrationStatus)
 
     def list_all_status(self) -> list[IntegrationStatus]:
-        stmt = select(IntegrationStatus).order_by(
-            IntegrationStatus.integration_type, IntegrationStatus.integration_code
+        stmt = (
+            select(IntegrationStatus)
+            .where(IntegrationStatus.integration_type != CS_CHECKPOINT_INTEGRATION_TYPE)
+            .order_by(IntegrationStatus.integration_type, IntegrationStatus.integration_code)
         )
         return list(self.session.execute(stmt).scalars().all())
 
