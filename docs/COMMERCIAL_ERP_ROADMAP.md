@@ -606,7 +606,9 @@ scheduler job은 17개 -> 18개(`cs_inquiry_catchup` 추가).
 - 키: `platform_id` + `external_source` (`COUPANG_CALL_CENTER` / `COUPANG_PRODUCT_INQUIRY`). source끼리 독립이라 한쪽이
   계속 실패해도 다른 쪽 진행은 영향받지 않는다.
 - 저장소: 기존 `integration_status` 테이블 재사용 - `integration_type="CS_CHECKPOINT"`,
-  `integration_code="<platform_id>:<source>"`(30자 이내, 코드가 길이를 검증), `last_success_at`=**covered_until**
+  `integration_code="<platform_id>:<CC|PI>"`(source별 고정 2자 코드 - CC=콜센터, PI=상품별. `platforms.id`는
+  PostgreSQL integer(최대 10자리)라 긴 source 이름을 키에 넣으면 7자리 platform_id부터 `varchar(30)`을 넘으므로 짧은
+  코드를 쓴다. 최대 13자, 새 source는 코드를 하나 추가), `last_success_at`=**covered_until**
   (이 시각까지의 문의를 해당 source에서 완전히 가져와 저장했다는 뜻, naive UTC), `status`=NORMAL/ERROR,
   `last_error_message`=**안전한 오류 코드 1개**(예: `PAGE_LIMIT_EXCEEDED`, `INTERNAL_ERROR:TypeError`), `updated_at`.
   문의 ID·주문번호·본문·credential은 저장하지 않는다. 연동 상태 화면/운영 대시보드(`list_all_status`)에서는
@@ -655,6 +657,9 @@ scheduler job은 17개 -> 18개(`cs_inquiry_catchup` 추가).
   | 최악 비용(36/9), 양쪽 backlog 3 | 1 | 1 | 3회 |
   | 첫 라운드 후 잔여 40 / 35 / 9 / 8 / 0 | 시작 조건: 콜센터는 잔여 >= 36, 상품별은 잔여 >= 9일 때만 다음 구간 시작 | | |
 
+  실행당 예산을 45보다 작게 낮추고(예: 40) 최악 비용이 계속되는 병적인 구성에서는 두 source가 같은 실행에서 함께
+  진행하지 못하고 checkpoint가 더 뒤처진 쪽이 먼저 가는 방식으로 번갈아 전진한다(상품별은 최대 2회 연속 미뤄짐 -
+  시뮬레이션). 기본 설정(45)에서는 해당 없음.
   콜센터는 "최대 2구간"이 아니다 - 상품별 backlog가 작으면(최소 비용) 3구간까지 간다. 어떤 경우에도
   예산(45)을 넘겨 요청하지 않으며, 두 source 모두 backlog가 있으면 매 실행마다 각자 최소 1구간씩 전진한다
   (첫 구간은 항상 시작 조건 45>=36, 콜센터 최악 36 후 잔여 9>=9). 한 source가 실패해도 다른 source는 계속
@@ -668,8 +673,8 @@ scheduler job은 17개 -> 18개(`cs_inquiry_catchup` 추가).
 #### 5) 동시 실행 방지 - advisory lock 범위
 
 - 잠금 단위: **(platform_id, source)**. 같은 플랫폼의 같은 source만 서로 막고, 다른 source/다른 플랫폼은 막지 않는다.
-- 구현(`services/cs_sync_lock.py`): PostgreSQL 세션 advisory lock(`pg_try_advisory_lock(classid=0x43530001, objid=platform_id*16+source)`,
-  논블로킹)을 전용 AUTOCOMMIT 커넥션에 건다(백업과 같은 패턴). 호출자 세션의 commit/rollback과 무관하고, 정상/예외 종료 시
+- 구현(`services/cs_sync_lock.py`): PostgreSQL 세션 advisory lock(`pg_try_advisory_lock(classid=0x43530000+source 번호, objid=platform_id)`,
+  int4 전체 범위, 백업 잠금 0x424B5550과 다른 네임스페이스, 논블로킹)을 전용 AUTOCOMMIT 커넥션에 건다(백업과 같은 패턴). 호출자 세션의 commit/rollback과 무관하고, 정상/예외 종료 시
   unlock, unlock 실패 시 커넥션을 폐기해 잠금이 풀에 남지 않게 한다. 커넥션이 죽으면 DB가 자동 해제한다.
   SQLite에서는 프로세스 내 잠금으로 대체한다 - **프로세스 간 보호는 PostgreSQL에서만 보장**되므로 SQLite로 여러
   프로세스를 운영하는 구성에서는 동시 실행 방지가 성립하지 않는다(운영은 PostgreSQL). 잠금은 항상 호출 세션이
