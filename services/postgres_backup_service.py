@@ -63,10 +63,10 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 from sqlalchemy import text
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import Connection, Engine, make_url
 
 from config.settings import settings
 from core.database import engine, session_scope
@@ -507,6 +507,32 @@ def run_backup_job(trigger_type: str = "SCHEDULE") -> dict:
                 )
             except Exception:  # noqa: BLE001 - 연결이 이미 끊겼어도 무시한다(아래 close가 세션 lock을 어차피 해제).
                 logger.warning("advisory unlock 호출에 실패했습니다 - 커넥션 종료로 세션 lock은 함께 해제됩니다.")
+        conn.close()
+
+
+def is_backup_lock_held(bind: Optional[Union[Engine, Connection]] = None) -> bool:
+    """지금 다른 백업이 advisory lock을 들고 있는지 확인한다(잡았다면 즉시 놓는다). stale
+    작업 정리(services/stale_task_recovery_service.py)가 "실제로 실행 중인 백업"을 중단 처리하지
+    않도록 판단하는 용도다. PostgreSQL이 아니면 이 잠금 자체가 없으므로 False."""
+    eng = (bind if bind is not None else engine).engine
+    if eng.dialect.name != "postgresql":
+        return False
+    conn = eng.connect()
+    try:
+        conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+        got = bool(
+            conn.execute(
+                text("SELECT pg_try_advisory_lock(:classid, :objid)"),
+                {"classid": _ADVISORY_LOCK_CLASSID, "objid": _ADVISORY_LOCK_OBJID},
+            ).scalar()
+        )
+        if got:
+            conn.execute(
+                text("SELECT pg_advisory_unlock(:classid, :objid)"),
+                {"classid": _ADVISORY_LOCK_CLASSID, "objid": _ADVISORY_LOCK_OBJID},
+            )
+        return not got
+    finally:
         conn.close()
 
 

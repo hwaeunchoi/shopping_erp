@@ -48,6 +48,7 @@ from scheduler.jobs import (  # noqa: E402
     report_generate_job,
     settlement_sync_job,
 )
+from services.stale_task_recovery_service import recover_stale_running_tasks  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +160,18 @@ def run_cs_inquiry_catchup() -> None:
     _run_job("cs_inquiry_catchup", cs_inquiry_sync_job.run_catchup, task_type="FULL_SYNC", trigger_type="CATCHUP")
 
 
+def recover_stale_running_tasks_on_start() -> None:
+    """시작 시 1회: 재시작으로 RUNNING에 남은 이력 행을 FAILED/PROCESS_INTERRUPTED로 정리한다
+    (services/stale_task_recovery_service.py의 조건을 모두 충족한 행만). 실패해도 scheduler
+    시작을 막지 않는다."""
+    try:
+        targets = [job.id for job in build_scheduler().get_jobs()]
+        with session_scope() as db:
+            recover_stale_running_tasks(db, targets)
+    except Exception as exc:  # noqa: BLE001 - 정리 실패가 scheduler 기동을 막으면 안 된다
+        logger.warning("stale RUNNING 작업 정리에 실패했습니다(무시하고 계속): %s", type(exc).__name__)
+
+
 def build_scheduler() -> BlockingScheduler:
     scheduler = BlockingScheduler(timezone="UTC")
     # 상품 동기화는 주문 수집보다 먼저 실행되도록 더 짧은 주기(10분보다 여유를 둔 20분)로
@@ -265,6 +278,7 @@ def main() -> None:
     # 시도하지 않고 즉시 종료한다(fail-closed). 값 자체는 예외 메시지에 담기지 않는다.
     validate_startup_secrets(settings.jwt_secret_key, settings.credential_encryption_key)
     setup_logging()
+    recover_stale_running_tasks_on_start()
     scheduler = build_scheduler()
     logger.info("스케줄러를 시작합니다. (Ctrl+C로 종료)")
     try:

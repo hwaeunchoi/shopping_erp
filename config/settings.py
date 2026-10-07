@@ -153,6 +153,14 @@ class Settings(BaseSettings):
     # scheduler 실행 주기(분) - scheduler/scheduler.py의 IntervalTrigger가 이 값을 읽는다.
     cs_inquiry_sync_interval_minutes: int = 15
 
+    # scheduler 시작 시 task_execution_history에 RUNNING으로 남은 재시작 잔존 행을
+    # "중단됨(FAILED + PROCESS_INTERRUPTED)"으로 정리할 때의 임계시간(분) - 이 시간보다
+    # 오래된 RUNNING 행만 대상이다(services/stale_task_recovery_service.py 참고). 가장
+    # 오래 걸리는 정상 작업(정산/백업 등)보다 충분히 길게 잡아, 정상적으로 오래 걸리는
+    # 활성 작업을 종료 처리하지 않도록 한다. 시스템 모니터링의 "최근 RUNNING/stale
+    # RUNNING" 구분 기준도 이 값을 쓴다.
+    task_stale_running_threshold_minutes: int = 360
+
     # 상용 ERP 확장(6단계) - 운영 대시보드 심각도(INFO/WARNING/ERROR/CRITICAL) 분류
     # 임계값. 오류 문자열 검색이 아니라 이 숫자 임계값과 구조화된 필드(status/
     # error_code)만으로 심각도를 정한다(services/operations_dashboard_service.py

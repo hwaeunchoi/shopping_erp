@@ -8,9 +8,9 @@ addendum(최근조회/즐겨찾기/시스템 모니터링), 주문 메모 기능
 """
 
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
@@ -75,6 +75,29 @@ class TaskExecutionHistoryRepository(BaseRepository[TaskExecutionHistory]):
         history.total_count = total_count
         self.session.flush()
         return history
+
+    def list_stale_running(
+        self, cutoff: datetime, targets: Sequence[str], trigger_types: Sequence[str]
+    ) -> list[TaskExecutionHistory]:
+        """RUNNING인데 cutoff(naive UTC)보다 오래 전에 시작된 행 - 대상 target/trigger_type만."""
+        stmt = (
+            select(TaskExecutionHistory)
+            .where(
+                TaskExecutionHistory.status == "RUNNING",
+                TaskExecutionHistory.started_at < cutoff,
+                TaskExecutionHistory.target.in_(list(targets)),
+                TaskExecutionHistory.trigger_type.in_(list(trigger_types)),
+            )
+            .order_by(TaskExecutionHistory.started_at)
+        )
+        return list(self.session.execute(stmt).scalars().all())
+
+    def count_running_split(self, cutoff: datetime) -> dict[str, int]:
+        """모니터링용: 최근 RUNNING(진짜 실행 중일 수 있음)과 stale RUNNING(cutoff보다 오래됨)을 분리해 센다."""
+        base = select(func.count()).select_from(TaskExecutionHistory).where(TaskExecutionHistory.status == "RUNNING")
+        stale = self.session.execute(base.where(TaskExecutionHistory.started_at < cutoff)).scalar_one()
+        recent = self.session.execute(base.where(TaskExecutionHistory.started_at >= cutoff)).scalar_one()
+        return {"recent": int(recent), "stale": int(stale)}
 
     def list_recent(
         self,

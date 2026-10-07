@@ -4,7 +4,7 @@ api/routers/system_monitor.py
 UI v1.1 4장 시스템 모니터링(탭 3종: 연동상태/작업이력/시스템상태).
 """
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends
@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 from api.deps import get_db, require_permission
+from config.settings import settings
 from repositories.extra_repository import IntegrationStatusRepository, TaskExecutionHistoryRepository
 from services.system_monitor_service import SystemMonitorService
 
@@ -57,6 +58,12 @@ class LatestBackupOut(BaseModel):
     file_size_bytes: Optional[int]
 
 
+class RunningTasksOut(BaseModel):
+    recent_running: int
+    stale_running: int
+    stale_threshold_minutes: int
+
+
 class SystemStatusOut(BaseModel):
     db_size_bytes: int
     log_dir_size_bytes: int
@@ -91,6 +98,22 @@ def list_task_history(
     end_dt = datetime.combine(end_date, datetime.min.time()) + timedelta(days=1) if end_date else None
     return TaskExecutionHistoryRepository(db).list_recent(
         task_type=task_type, status=status_filter, start_date=start_dt, end_date=end_dt
+    )
+
+
+@router.get(
+    "/running-tasks",
+    response_model=RunningTasksOut,
+    summary="실행 중 작업 수(최근/stale 분리)",
+    description="status=RUNNING 작업 이력을 settings.task_stale_running_threshold_minutes 기준으로"
+    " 최근(실제 실행 중일 수 있음)과 stale(재시작 등으로 남은 잔존 행)로 나눠 센다.",
+)
+def get_running_tasks(db: Session = Depends(get_db)) -> RunningTasksOut:
+    minutes = settings.task_stale_running_threshold_minutes
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=minutes)
+    counts = TaskExecutionHistoryRepository(db).count_running_split(cutoff)
+    return RunningTasksOut(
+        recent_running=counts["recent"], stale_running=counts["stale"], stale_threshold_minutes=minutes
     )
 
 
