@@ -76,25 +76,17 @@ class TestKeyConsistencyAndNamespaces:
         assert set(_SOURCE_INDEX) == set(SOURCES) == set(CHECKPOINT_SOURCE_CODES)
         assert len(set(_SOURCE_INDEX.values())) == len(_SOURCE_INDEX)  # 번호 단사
 
-    def test_lock_classids_never_equal_the_other_advisory_lock_namespaces_in_use(self):
-        """repositories/integration_sync_repository.acquire_target_lock은 classid=crc32(target_type)&0x7FFFFFFF를
-        쓴다(해시라 구조적 분리는 불가능) - 현재 코드베이스가 쓰는 target_type 전부와 백업 잠금 classid가 이 기능의
-        classid와 다름을 감사 시점 값으로 고정한다. 새 target_type이 생기면 이 목록에 추가해 확인한다."""
-        import zlib
+    def test_lock_classids_are_inside_the_reserved_cs_range_and_disjoint_from_other_domains(self):
+        """다른 영역(백업·외부 명령)과의 구조적 분리는 core/advisory_locks.py registry가 보장한다
+        (tests/unit/test_advisory_lock_registry.py). 여기서는 이 모듈의 키가 그 예약 범위 안에 있음만 확인한다."""
+        from core.advisory_locks import RESERVED_CLASSID_RANGES
 
-        known_target_types = [
-            "CS_CASE",
-            "FULFILLMENT_ORDER_ITEM",
-            "FULFILLMENT_INVENTORY",
-            "ORDER",
-            "PRODUCT_OPTION_PUBLISH_DRAFT",
-            "PRODUCT_PLATFORM_MAP",
-            "PRODUCT_PUBLISH_DRAFT",
-            "SHIPMENT",
-        ]
-        others = {zlib.crc32(t.encode("utf-8")) & 0x7FFFFFFF for t in known_target_types} | {0x424B5550}
-        mine = {lock_key(1, s)[0] for s in SOURCES}
-        assert mine.isdisjoint(others)
+        lo, hi = RESERVED_CLASSID_RANGES["CS_SYNC"]
+        others = [r for name, r in RESERVED_CLASSID_RANGES.items() if name != "CS_SYNC"]
+        for source in SOURCES:
+            classid = lock_key(1, source)[0]
+            assert lo <= classid <= hi
+            assert not any(a <= classid <= b for a, b in others)
 
     def test_key_is_injective_in_both_components(self):
         """(classid, objid) -> (source, platform_id)를 복원할 수 있으면 서로 다른 입력이 같은 키를 가질 수 없다."""
