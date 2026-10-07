@@ -1153,6 +1153,90 @@ class TestFailureRecordingIsResilientAndSafe:
         assert CsCaseRepository(db_session).get_by_external(platform.id, PR, "2") is not None
         assert _covered(db_session, platform.id, CC) is None  # 실패 기록 실패가 checkpoint를 만들지 않는다
 
+    @staticmethod
+    def _rollback_raises_once(db_session, monkeypatch) -> dict:
+        """실제 rollback을 수행한 뒤 한 번 예외를 던진다(ROLLBACK 문 자체가 실패하는 상황 - 트랜잭션 상태는 정리된다)."""
+        real = db_session.rollback
+        calls = {"n": 0}
+
+        def _rollback():
+            real()
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("synthetic: ROLLBACK failed 010-1234-5678")
+
+        monkeypatch.setattr(db_session, "rollback", _rollback)
+        return calls
+
+    def test_rollback_failure_after_a_fetch_failure_keeps_the_reason_and_other_sources_running(
+        self, db_session, engine, platform, monkeypatch
+    ):
+        db_session.commit()
+        calls = self._rollback_raises_once(db_session, monkeypatch)
+        connector = _Connector(
+            pr_items=[_item("2")],
+            cc_error=MarketplaceExternalAPIError("coupang", "SERVER_ERROR", True, http_status=500),
+        )
+
+        result = _service(db_session, engine).sync_platform(connector, platform.id)  # 예외 없이 반환
+
+        assert calls["n"] >= 1
+        assert result["by_source"][CC]["status"] == "FAILED"
+        assert result["by_source"][CC]["reason_code"] == "SERVER_ERROR"
+        assert result["by_source"][PR]["status"] == "SUCCESS"
+        assert CsCaseRepository(db_session).get_by_external(platform.id, PR, "2") is not None
+        assert _covered(db_session, platform.id, CC) is None
+
+    def test_rollback_failure_after_a_commit_failure_reports_commit_failed_and_continues(
+        self, db_session, engine, platform, monkeypatch
+    ):
+        db_session.commit()
+        service = _service(db_session, engine)
+        self._rollback_raises_once(db_session, monkeypatch)
+        original_advance = service.checkpoints.advance
+
+        def _advance(platform_id: int, source: str, covered_until: datetime) -> None:
+            if source == CC:
+                raise RuntimeError("synthetic: commit path")
+            original_advance(platform_id, source, covered_until)
+
+        monkeypatch.setattr(service.checkpoints, "advance", _advance)
+
+        result = service.sync_platform(_Connector(cc_items=[_item("1")], pr_items=[_item("2")]), platform.id)
+
+        assert result["by_source"][CC]["status"] == "FAILED"
+        assert result["by_source"][CC]["reason_code"] == "COMMIT_FAILED:RuntimeError"
+        assert result["by_source"][PR]["status"] == "SUCCESS"
+
+    def test_rollback_failure_after_an_unexpected_exception_reports_internal_error_and_continues(
+        self, db_session, engine, platform, monkeypatch
+    ):
+        db_session.commit()
+        self._rollback_raises_once(db_session, monkeypatch)
+
+        class _Boom(_Connector):
+            def fetch_inquiries(self, *a, **k):
+                raise ZeroDivisionError("synthetic 010-1234-5678")
+
+        result = _service(db_session, engine).sync_platform(_Boom(pr_items=[_item("2")]), platform.id)
+
+        assert result["by_source"][CC]["reason_code"] == "INTERNAL_ERROR:ZeroDivisionError"
+        assert result["by_source"][PR]["status"] == "SUCCESS"
+
+    def test_rollback_failure_logs_only_the_exception_class(self, db_session, engine, platform, monkeypatch, caplog):
+        import logging
+
+        db_session.commit()
+        self._rollback_raises_once(db_session, monkeypatch)
+        connector = _Connector(cc_error=MarketplaceExternalAPIError("coupang", "SERVER_ERROR", True, http_status=500))
+
+        with caplog.at_level(logging.WARNING):
+            _service(db_session, engine).sync_platform(connector, platform.id)
+
+        text_ = " ".join(r.getMessage() for r in caplog.records)
+        assert "type=RuntimeError" in text_
+        assert "010-1234-5678" not in text_ and "ROLLBACK failed" not in text_
+
     def test_commit_failure_message_is_never_stored_only_the_exception_class(
         self, db_session, engine, platform, monkeypatch
     ):

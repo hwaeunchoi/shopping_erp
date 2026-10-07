@@ -13,6 +13,8 @@ catch-up 서비스·stale 작업 정리·수동 sync 경로의 경합을 검증�
 3) stale_probe_sees_real_lock - 실제 잠금을 들고 있는 동안 stale 작업 정리는 RUNNING 행을 건드리지
    않고, 해제 후에는 FAILED/PROCESS_INTERRUPTED로 정리한다.
 4) manual_vs_running_sync - 자동 실행이 진행 중일 때 수동 sync(두 source 잠금 전부 요구)는 거절된다.
+5) cross_domain_locks - 백업·CS 동기화·외부 명령 세 영역의 advisory lock이 서로 막지 않고 같은 영역에서는
+   같은 자원만 직렬화되며, 커밋/롤백/예외/BaseException/연결 종료 후 해제된다.
 
 tests/integration/test_cs_sync_lock_pg.py가 격리된 1회성 postgres 컨테이너를 띄우고 이 스크립트를
 같은(--internal) 네트워크의 러너 컨테이너에서 실행한다. 스키마는 Base.metadata.create_all()로
@@ -682,6 +684,396 @@ def scenario_int4_boundary_ids() -> dict:
     return {"scenario": "int4_boundary_ids", **out}
 
 
+def scenario_cross_domain_locks() -> dict:
+    """백업·CS 동기화·외부 명령 세 영역의 advisory lock이 실제 PostgreSQL에서 서로 막지 않고, 같은 영역 안에서는
+    같은 자원만 직렬화되며, 커밋/롤백/예외/BaseException/연결 종료 후 해제됨을 확인한다."""
+    from sqlalchemy.exc import DBAPIError
+
+    from core.advisory_locks import BACKUP_CLASSID, BACKUP_OBJID, EXTERNAL_COMMAND_CLASSID, external_command_lock_key
+    from repositories.integration_sync_repository import ExternalCommandRepository
+
+    target_type = "PRODUCT_PLATFORM_MAP"
+    out: dict[str, Any] = {}
+    opened: list[Session] = []
+
+    def new_session() -> Session:
+        s = SessionLocal()
+        opened.append(s)
+        return s
+
+    def acquire(session: Session, t: str, ids: Any) -> bool:
+        """blocking pg_advisory_xact_lock을 300ms lock_timeout으로 시도 - 막히면 False."""
+        session.execute(text("SET LOCAL lock_timeout = '300ms'"))
+        try:
+            ExternalCommandRepository(session).acquire_target_lock(t, ids)
+            return True
+        except DBAPIError:
+            session.rollback()
+            return False
+
+    holder = new_session()
+    assert acquire(holder, target_type, 1001)
+    key = external_command_lock_key(target_type, 1001)
+    rows = holder.execute(
+        text(
+            "SELECT classid::bigint, objid::bigint FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()"
+        )
+    ).all()
+    out["registry_key"] = list(key)
+    out["advisory_rows_in_pg_locks"] = [[int(r[0]), int(r[1])] for r in rows]
+    out["classid_is_fixed_external_value"] = bool(rows) and all(int(r[0]) == EXTERNAL_COMMAND_CLASSID for r in rows)
+
+    # 같은 영역: 같은 자원(형제 매핑의 min id 포함)은 직렬화, 다른 id/다른 target_type은 막지 않는다.
+    out["same_resource_blocked"] = not acquire(new_session(), target_type, 1001)
+    out["sibling_set_min_id_blocked"] = [
+        not acquire(new_session(), target_type, ids) for ids in ([1001, 2000], [2000, 1001])
+    ]
+    out["other_id_not_blocked"] = acquire(new_session(), target_type, 1002)
+    out["other_target_type_same_id_not_blocked"] = acquire(new_session(), "SHIPMENT", 1001)
+    out["huge_ids_ok"] = acquire(new_session(), target_type, [2**40, 2**41])
+
+    # 다른 영역: objid가 같아도(CS platform_id = 외부 명령 objid) 막지 않는다. 백업 잠금과도 공존한다.
+    ext_objid = key[1]
+    with cs_sync_source_lock(ext_objid, CC, engine) as cc, cs_sync_source_lock(ext_objid, PR, engine) as pr:
+        out["cs_locks_with_equal_objid_acquired_while_external_held"] = [cc, pr]
+    raw = engine.connect()
+    out["backup_lock_acquired_while_external_held"] = bool(
+        raw.execute(text("SELECT pg_try_advisory_lock(:c, :o)"), {"c": BACKUP_CLASSID, "o": BACKUP_OBJID}).scalar()
+    )
+    raw.execute(text("SELECT pg_advisory_unlock(:c, :o)"), {"c": BACKUP_CLASSID, "o": BACKUP_OBJID})
+    raw.close()
+    # 반대 방향: CS 잠금을 들고 있어도 같은 objid의 외부 명령 잠금은 막히지 않는다.
+    ext2 = external_command_lock_key(target_type, 3003)
+    with cs_sync_source_lock(ext2[1], CC, engine) as cc_held:
+        out["external_not_blocked_while_cs_held_with_equal_objid"] = [
+            cc_held,
+            acquire(new_session(), target_type, 3003),
+        ]
+    raw = engine.connect()
+    raw.execute(text("SELECT pg_try_advisory_lock(:c, :o)"), {"c": BACKUP_CLASSID, "o": BACKUP_OBJID})
+    out["external_not_blocked_while_backup_held"] = acquire(new_session(), target_type, 4004)
+    raw.execute(text("SELECT pg_advisory_unlock(:c, :o)"), {"c": BACKUP_CLASSID, "o": BACKUP_OBJID})
+    raw.close()
+
+    # 해제: 커밋 / 롤백 / 예외 / BaseException / 연결 종료(크래시)
+    release: dict[str, bool] = {}
+    holder.commit()
+    release["after_commit"] = acquire(new_session(), target_type, 1001)
+
+    s_rb = new_session()
+    assert acquire(s_rb, target_type, 5001)
+    s_rb.rollback()
+    release["after_rollback"] = acquire(new_session(), target_type, 5001)
+
+    s_exc = SessionLocal()
+    try:
+        assert acquire(s_exc, target_type, 5002)
+        raise RuntimeError("synthetic")
+    except RuntimeError:
+        pass
+    finally:
+        s_exc.close()
+    release["after_exception_and_session_close"] = acquire(new_session(), target_type, 5002)
+
+    s_base = SessionLocal()
+    try:
+        assert acquire(s_base, target_type, 5003)
+        raise KeyboardInterrupt()
+    except BaseException as exc:  # noqa: BLE001 - BaseException 경로 확인용
+        release["base_exception_type"] = type(exc).__name__ == "KeyboardInterrupt"
+    finally:
+        s_base.close()
+    release["after_base_exception_and_session_close"] = acquire(new_session(), target_type, 5003)
+
+    s_kill = new_session()
+    assert acquire(s_kill, target_type, 5004)
+    s_kill.connection().invalidate()  # 풀로 돌려보내지 않고 물리 연결을 끊는다(프로세스 크래시와 동일)
+    release["after_connection_killed"] = acquire(new_session(), target_type, 5004)
+    out["release"] = release
+
+    for s in opened:
+        s.close()
+    return {"scenario": "cross_domain_locks", **out}
+
+
+SENTINEL = "SENTINEL-9f3a (010-1234-5678 / ORDER-777 / 문의본문)"  # 로그·DB·결과 어디에도 나타나면 안 되는 합성 값
+
+
+def _status_rows(pid: int) -> dict[str, Any]:
+    """CS_CHECKPOINT 행의 (status, last_error_message, last_success_at)을 새 커넥션으로 읽는다."""
+    check = SessionLocal()
+    try:
+        out: dict[str, Any] = {}
+        for short in ("CC", "PI"):
+            row = check.execute(
+                select(
+                    IntegrationStatus.status, IntegrationStatus.last_error_message, IntegrationStatus.last_success_at
+                ).where(
+                    IntegrationStatus.integration_type == "CS_CHECKPOINT",
+                    IntegrationStatus.integration_code == f"{pid}:{short}",
+                )
+            ).first()
+            out[short] = (
+                None
+                if row is None
+                else {"status": row[0], "error": row[1], "covered": row[2].isoformat() if row[2] is not None else None}
+            )
+        return out
+    finally:
+        check.close()
+
+
+class _LogCollector:
+    def __init__(self) -> None:
+        import logging
+
+        self.messages: list[str] = []
+        outer = self
+
+        class _H(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                # 포맷된 메시지와 (있다면) 예외 텍스트를 모두 수집한다.
+                text_ = record.getMessage()
+                if record.exc_info:
+                    text_ += " | " + repr(record.exc_info[1])
+                outer.messages.append(text_)
+
+        self.handler = _H(level=logging.DEBUG)
+        self.logger = logging.getLogger("services.cs_inquiry_catchup_service")
+
+    def __enter__(self) -> "_LogCollector":
+        self.logger.addHandler(self.handler)
+        return self
+
+    def __exit__(self, *_a: Any) -> None:
+        self.logger.removeHandler(self.handler)
+
+
+def _fail_next_top_level_commits(session: Session, n: int) -> dict[str, int]:
+    """다음 n번의 최상위 commit(SAVEPOINT 해제 제외)을 합성 오류(SENTINEL 포함)로 실패시킨다."""
+    state = {"left": n, "fired": 0}
+
+    @event.listens_for(session, "before_commit")
+    def _boom(_s: Session) -> None:
+        if state["left"] > 0 and not _s.in_nested_transaction():
+            state["left"] -= 1
+            state["fired"] += 1
+            raise RuntimeError(SENTINEL)
+
+    return state
+
+
+def _make_rollbacks_raise(session: Session, n: int) -> dict[str, int]:
+    """다음 n번의 session.rollback()이 (실제 rollback을 수행한 뒤) 예외를 던지게 한다 - 연결이 죽어 ROLLBACK 문이
+    실패하는 상황의 흉내다(SQLAlchemy는 실패해도 트랜잭션 상태는 정리한다)."""
+    real = session.rollback
+    state = {"left": n, "fired": 0}
+
+    def _rollback() -> None:
+        real()
+        if state["left"] > 0:
+            state["left"] -= 1
+            state["fired"] += 1
+            raise RuntimeError(SENTINEL)
+
+    session.rollback = _rollback  # type: ignore[method-assign]
+    return state
+
+
+def scenario_failure_record_resilience() -> dict:
+    """_fail()/실패 기록 경로의 실제 PostgreSQL 검증 - 5개 경우의 최종 case/history/checkpoint/integration_status."""
+    from integrations.malls.errors import MarketplaceExternalAPIError
+
+    server_error = MarketplaceExternalAPIError("coupang", "SERVER_ERROR", True, http_status=500)
+    cases: dict[str, Any] = {}
+    leaked = False
+
+    def finish(name: str, pid: int, data: dict[str, Any], logs: _LogCollector) -> None:
+        nonlocal leaked
+        data["snapshot"] = _snapshot(pid)
+        data["status_rows"] = _status_rows(pid)
+        data["log_messages"] = list(logs.messages)
+        blob = json.dumps(data, default=str)
+        data["sentinel_leaked"] = "SENTINEL-9f3a" in blob or "010-1234-5678" in blob or "ORDER-777" in blob
+        leaked = leaked or data["sentinel_leaked"]
+        cases[name] = data
+
+    # 1) 두 source 모두 원래 fetch 실패 + 실패 기록 commit도 실패 -> 예외 없이 원래 사유를 그대로 반환
+    pid = _make_platform()
+    session = SessionLocal()
+    with _LogCollector() as logs:
+        hook = _fail_next_top_level_commits(session, 2)
+        res = _service(session).sync_platform(_ScriptedConnector(cc=[server_error], pr=[server_error]), pid)
+        data = {"summary": _summary(res), "record_commit_failures": hook["fired"]}
+        session.close()
+        finish("1_fetch_fail_and_record_commit_fail", pid, data, logs)
+
+    # 2) 첫 source(CC) 실패 기록 실패 + 두 번째 source(PI) 성공, 이어서 같은 세션으로 재실행(성공)
+    pid = _make_platform()
+    session = SessionLocal()
+    with _LogCollector() as logs:
+        hook = _fail_next_top_level_commits(session, 1)
+        svc = _service(session)
+        res = svc.sync_platform(_ScriptedConnector(cc=[server_error]), pid)
+        data = {"summary": _summary(res), "record_commit_failures": hook["fired"]}
+        data["after_first"] = {"snapshot": _snapshot(pid), "status_rows": _status_rows(pid)}
+        data["rerun_same_session"] = _summary(svc.sync_platform(_ScriptedConnector(), pid))
+        session.close()
+        finish("2_first_source_record_fails_second_succeeds_then_rerun", pid, data, logs)
+
+    # 3) 실제 연결 종료(pg_terminate_backend) - 실패 기록 commit과 rollback이 모두 실패할 수 있다 -> 예외 없이 끝나고
+    #    같은 세션이 다음 실행에서 새 연결로 정상 동작한다.
+    pid = _make_platform()
+    session = SessionLocal()
+    killer = engine.connect()
+
+    class _KillingConnector(_ScriptedConnector):
+        def fetch_inquiries(self, start_date, end_date, *, max_pages=None, max_retries=None, request_budget=None):
+            backend = session.execute(text("SELECT pg_backend_pid()")).scalar()
+            killer.execute(text("SELECT pg_terminate_backend(:p)"), {"p": backend})
+            killer.commit()
+            return super().fetch_inquiries(
+                start_date, end_date, max_pages=max_pages, max_retries=max_retries, request_budget=request_budget
+            )
+
+    with _LogCollector() as logs:
+        raised: Optional[str] = None
+        data = {}
+        try:
+            res = _service(session).sync_platform(_KillingConnector(cc=[[_item("killed")]]), pid)
+            data["summary"] = _summary(res)
+        except Exception as exc:  # noqa: BLE001 - 결과 JSON으로 보고한다
+            raised = type(exc).__name__
+        data["raised"] = raised
+        killer.close()
+        try:
+            data["rerun_same_session"] = _summary(_service(session).sync_platform(_ScriptedConnector(), pid))
+        except Exception as exc:  # noqa: BLE001
+            data["rerun_raised"] = type(exc).__name__
+        session.close()
+        finish("3_connection_killed_record_and_rollback_fail", pid, data, logs)
+
+    # 3b) 호출부 rollback 자체가 실패(원래 fetch 실패 경로) -> 예외 없이 원래 사유(SERVER_ERROR)를 보고하고 PI는 성공
+    pid = _make_platform()
+    session = SessionLocal()
+    with _LogCollector() as logs:
+        rb = _make_rollbacks_raise(session, 1)
+        data = {}
+        try:
+            res = _service(session).sync_platform(_ScriptedConnector(cc=[server_error]), pid)
+            data["summary"] = _summary(res)
+        except Exception as exc:  # noqa: BLE001 - 결과 JSON으로 보고한다
+            data["raised"] = type(exc).__name__
+        data["rollback_failures"] = rb["fired"]
+        session.close()
+        finish("3b_call_site_rollback_fails_after_fetch_failure", pid, data, logs)
+
+    # 3c) 성공 경로 commit 실패 + 그 뒤 rollback도 실패 -> 예외 없이 COMMIT_FAILED 보고, PI는 성공
+    pid = _make_platform()
+    session = SessionLocal()
+    with _LogCollector() as logs:
+        hook = _fail_next_top_level_commits(session, 1)
+        rb = _make_rollbacks_raise(session, 1)
+        data = {}
+        try:
+            res = _service(session).sync_platform(_ScriptedConnector(), pid)
+            data["summary"] = _summary(res)
+        except Exception as exc:  # noqa: BLE001
+            data["raised"] = type(exc).__name__
+        data["record_commit_failures"] = hook["fired"]
+        data["rollback_failures"] = rb["fired"]
+        session.close()
+        finish("3c_commit_fails_then_rollback_fails", pid, data, logs)
+
+    # 3d) 예상 밖 예외(INTERNAL_ERROR) 경로에서 rollback이 실패 -> 예외 없이 INTERNAL_ERROR 보고, PI는 성공
+    pid = _make_platform()
+    session = SessionLocal()
+    with _LogCollector() as logs:
+        rb = _make_rollbacks_raise(session, 1)
+        data = {}
+        try:
+            res = _service(session).sync_platform(_ScriptedConnector(cc=[ZeroDivisionError(SENTINEL)]), pid)
+            data["summary"] = _summary(res)
+        except Exception as exc:  # noqa: BLE001
+            data["raised"] = type(exc).__name__
+        data["rollback_failures"] = rb["fired"]
+        session.close()
+        finish("3d_unexpected_exception_then_rollback_fails", pid, data, logs)
+
+    # 4) 실패가 기록된(ERROR) 뒤 같은 source 재실행 성공 -> NORMAL 복구 + 오류 메시지 제거(같은 commit)
+    pid = _make_platform()
+    session = SessionLocal()
+    with _LogCollector() as logs:
+        svc = _service(session)
+        first = _summary(svc.sync_platform(_ScriptedConnector(cc=[server_error]), pid))
+        data = {"first": first, "after_first": {"snapshot": _snapshot(pid), "status_rows": _status_rows(pid)}}
+        data["rerun"] = _summary(svc.sync_platform(_ScriptedConnector(), pid))
+        session.close()
+        finish("4_error_recorded_then_success_recovers_to_normal", pid, data, logs)
+
+    # 5) ERROR 상태에서 성공 복구 중 commit 실패 -> 복구 데이터·NORMAL 전환 모두 반영 안 됨(ERROR 유지), 다음 실행에서 복구
+    pid = _make_platform()
+    session = SessionLocal()
+    with _LogCollector() as logs:
+        svc = _service(session)
+        first = _summary(svc.sync_platform(_ScriptedConnector(cc=[server_error]), pid))
+        hook = _fail_next_top_level_commits(session, 1)
+        second = _summary(svc.sync_platform(_ScriptedConnector(), pid))
+        data = {
+            "first": first,
+            "recovery_attempt": second,
+            "record_commit_failures": hook["fired"],
+            "after_recovery_attempt": {"snapshot": _snapshot(pid), "status_rows": _status_rows(pid)},
+        }
+        data["rerun"] = _summary(svc.sync_platform(_ScriptedConnector(), pid))
+        session.close()
+        finish("5_recovery_commit_fails_then_recovers", pid, data, logs)
+
+    return {"scenario": "failure_record_resilience", "cases": cases, "sentinel_leaked": leaked}
+
+
+def scenario_partial_success_contract_a() -> dict:
+    """계약 A 최종 확인: 성공 항목 1 + 영구 실패 항목 1 -> 성공 항목만 저장, checkpoint 미전진, 재실행 중복 없음,
+    로컬 필드 보존, ERROR 유지, 실패 항목이 정상화된 다음 실행에서 checkpoint 전진·NORMAL 복구."""
+    pid = _make_platform()
+    session = SessionLocal()
+    svc = _service(session)
+    out: dict[str, Any] = {}
+
+    poison = _item("x" * 150)  # 저장 불가(컬럼 길이 초과) - 매번 같은 항목이 영구 실패한다
+    out["run1"] = _summary(svc.sync_platform(_ScriptedConnector(cc=[[_item("good"), poison]], pr=[[]]), pid))
+    out["after_run1"] = {"snapshot": _snapshot(pid), "status_rows": _status_rows(pid)}
+
+    # 운영자가 로컬 필드를 수동으로 바꿨다고 가정한다.
+    mine = SessionLocal()
+    case = mine.execute(select(CsCase).where(CsCase.platform_id == pid, CsCase.external_source == CC)).scalar_one()
+    case.tags = "LOCAL-TAG"
+    case.reply_draft = "LOCAL-DRAFT"
+    case.priority = "HIGH"
+    case.status = "IN_PROGRESS"
+    mine.commit()
+    mine.close()
+
+    out["run2"] = _summary(svc.sync_platform(_ScriptedConnector(cc=[[_item("good"), poison]], pr=[[]]), pid))
+    out["after_run2"] = {"snapshot": _snapshot(pid), "status_rows": _status_rows(pid)}
+
+    out["run3"] = _summary(
+        svc.sync_platform(_ScriptedConnector(cc=[[_item("good"), _item("poison-fixed")]], pr=[[]]), pid)
+    )
+    out["after_run3"] = {"snapshot": _snapshot(pid), "status_rows": _status_rows(pid)}
+
+    check = SessionLocal()
+    rows = check.execute(
+        select(CsCase.external_inquiry_id, CsCase.tags, CsCase.reply_draft, CsCase.priority, CsCase.status).where(
+            CsCase.platform_id == pid, CsCase.external_source == CC
+        )
+    ).all()
+    out["cases"] = sorted([list(r) for r in rows])
+    check.close()
+    session.close()
+    return {"scenario": "partial_success_contract_a", **out}
+
+
 SCENARIOS = {
     "lock_contention": scenario_lock_contention,
     "concurrent_sync_platform": scenario_concurrent_sync_platform,
@@ -691,6 +1083,9 @@ SCENARIOS = {
     "atomicity_matrix": scenario_atomicity_matrix,
     "stale_concurrent_recovery": scenario_stale_concurrent_recovery,
     "int4_boundary_ids": scenario_int4_boundary_ids,
+    "cross_domain_locks": scenario_cross_domain_locks,
+    "failure_record_resilience": scenario_failure_record_resilience,
+    "partial_success_contract_a": scenario_partial_success_contract_a,
 }
 
 

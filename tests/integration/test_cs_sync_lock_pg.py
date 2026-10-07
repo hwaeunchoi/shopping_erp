@@ -325,3 +325,136 @@ class TestInt4BoundaryPlatformIds:
         assert p["adjacent_platforms_independent"] == [True, True], p
         assert p["checkpoint_rows_stored"] == p["expected_rows"] == 10, p
         assert p["max_code_length"] <= 13 <= 30, p  # varchar(30) 안, 가장 긴 키 "2147483647:CC"
+
+
+class TestCrossDomainAdvisoryLocks:
+    def test_domains_do_not_block_each_other_and_release_on_every_exit_path(self, pg_sandbox):
+        from core.advisory_locks import EXTERNAL_COMMAND_CLASSID
+
+        p = _run_scenario(pg_sandbox, "cross_domain_locks")
+
+        # 실제 PostgreSQL 잠금 테이블에 registry가 만든 키가 그대로 올라간다.
+        assert p["advisory_rows_in_pg_locks"] == [p["registry_key"]], p
+        assert p["registry_key"][0] == EXTERNAL_COMMAND_CLASSID and p["classid_is_fixed_external_value"] is True, p
+        # 같은 영역: 같은 자원(형제 집합의 최소 id 포함)만 직렬화한다.
+        assert p["same_resource_blocked"] is True, p
+        assert p["sibling_set_min_id_blocked"] == [True, True], p
+        assert p["other_id_not_blocked"] is True, p
+        assert p["other_target_type_same_id_not_blocked"] is True, p
+        assert p["huge_ids_ok"] is True, p
+        # 다른 영역: objid가 같아도 서로 막지 않는다.
+        assert p["cs_locks_with_equal_objid_acquired_while_external_held"] == [True, True], p
+        assert p["backup_lock_acquired_while_external_held"] is True, p
+        assert p["external_not_blocked_while_cs_held_with_equal_objid"] == [True, True], p
+        assert p["external_not_blocked_while_backup_held"] is True, p
+        # 해제: 커밋 / 롤백 / 예외 / BaseException / 연결 종료.
+        r = p["release"]
+        assert r["after_commit"] is True, p
+        assert r["after_rollback"] is True, p
+        assert r["after_exception_and_session_close"] is True, p
+        assert r["base_exception_type"] is True and r["after_base_exception_and_session_close"] is True, p
+        assert r["after_connection_killed"] is True, p
+
+
+class TestFailureRecordResilienceOnPostgres:
+    """_fail()/실패 기록 경로 - 표기: (case, history, checkpoint)  CC=콜센터, PI=상품별."""
+
+    @pytest.fixture()
+    def res(self, pg_sandbox):
+        return _run_scenario(pg_sandbox, "failure_record_resilience", timeout=240)
+
+    def test_no_secret_or_pii_reaches_logs_db_or_results(self, res):
+        assert res["sentinel_leaked"] is False, res
+        for name, case in res["cases"].items():
+            assert case["sentinel_leaked"] is False, name
+
+    def test_1_fetch_failure_plus_record_commit_failure_returns_the_original_reason(self, res):
+        c = res["cases"]["1_fetch_fail_and_record_commit_fail"]
+        assert c["record_commit_failures"] == 2, c
+        assert c["summary"] == {
+            "CC": {"status": "FAILED", "reason": "SERVER_ERROR"},
+            "PI": {"status": "FAILED", "reason": "SERVER_ERROR"},
+        }, c
+        assert _counts(c["snapshot"], "CC") == (0, 0, None) and _counts(c["snapshot"], "PI") == (0, 0, None), c
+        assert c["status_rows"] == {"CC": None, "PI": None}, c  # 기록 실패가 checkpoint 행도 만들지 않는다
+        assert all("type=RuntimeError" in m for m in c["log_messages"]) and len(c["log_messages"]) == 2, c
+
+    def test_2_first_source_record_failure_does_not_stop_the_second_source_and_the_rerun_succeeds(self, res):
+        c = res["cases"]["2_first_source_record_fails_second_succeeds_then_rerun"]
+        assert c["summary"]["CC"] == {"status": "FAILED", "reason": "SERVER_ERROR"}, c
+        assert c["summary"]["PI"]["status"] == "SUCCESS", c
+        assert _counts(c["after_first"]["snapshot"], "CC") == (0, 0, None), c
+        assert _counts(c["after_first"]["snapshot"], "PI") == (1, 1, FIXED_NOW_ISO), c
+        assert c["after_first"]["status_rows"]["CC"] is None, c
+        assert c["rerun_same_session"]["CC"]["status"] == "SUCCESS", c  # 같은 세션이 다음 실행에서 정상
+        assert _counts(c["snapshot"], "CC") == (1, 1, FIXED_NOW_ISO), c
+        assert _counts(c["snapshot"], "PI") == (1, 1, FIXED_NOW_ISO), c  # 재실행해도 중복 없음
+
+    def test_3_real_connection_kill_never_raises_and_the_session_stays_usable(self, res):
+        c = res["cases"]["3_connection_killed_record_and_rollback_fail"]
+        assert c["raised"] is None and "rerun_raised" not in c, c
+        assert c["summary"]["PI"]["status"] == "SUCCESS", c
+        assert c["rerun_same_session"]["CC"]["status"] == "SUCCESS", c
+        assert _counts(c["snapshot"], "CC") == (1, 1, FIXED_NOW_ISO), c
+
+    @pytest.mark.parametrize(
+        "name,reason",
+        [
+            ("3b_call_site_rollback_fails_after_fetch_failure", "SERVER_ERROR"),
+            ("3c_commit_fails_then_rollback_fails", "COMMIT_FAILED:RuntimeError"),
+            ("3d_unexpected_exception_then_rollback_fails", "INTERNAL_ERROR:ZeroDivisionError"),
+        ],
+    )
+    def test_3x_rollback_itself_failing_keeps_the_reason_and_the_other_source(self, res, name, reason):
+        c = res["cases"][name]
+        assert c["rollback_failures"] == 1 and "raised" not in c, c
+        assert c["summary"]["CC"] == {"status": "FAILED", "reason": reason}, c
+        assert c["summary"]["PI"]["status"] == "SUCCESS", c
+        assert _counts(c["snapshot"], "CC") == (0, 0, None), c
+        assert _counts(c["snapshot"], "PI") == (1, 1, FIXED_NOW_ISO), c
+        assert c["status_rows"]["CC"] == {"status": "ERROR", "error": reason, "covered": None}, c
+        assert any("rollback 실패: type=RuntimeError" in m for m in c["log_messages"]), c
+
+    def test_4_error_then_success_returns_to_normal_and_clears_the_message_in_the_same_commit(self, res):
+        c = res["cases"]["4_error_recorded_then_success_recovers_to_normal"]
+        assert c["after_first"]["status_rows"]["CC"] == {"status": "ERROR", "error": "SERVER_ERROR", "covered": None}, c
+        assert c["status_rows"]["CC"] == {"status": "NORMAL", "error": None, "covered": FIXED_NOW_ISO}, c
+        assert _counts(c["snapshot"], "CC") == (1, 1, FIXED_NOW_ISO), c
+
+    def test_5_commit_failure_during_recovery_keeps_error_and_the_next_run_recovers(self, res):
+        c = res["cases"]["5_recovery_commit_fails_then_recovers"]
+        assert c["record_commit_failures"] == 1, c
+        assert c["recovery_attempt"]["CC"] == {"status": "FAILED", "reason": "COMMIT_FAILED:RuntimeError"}, c
+        after = c["after_recovery_attempt"]
+        assert _counts(after["snapshot"], "CC") == (0, 0, None), c  # 데이터·checkpoint 전진 모두 롤백
+        assert after["status_rows"]["CC"]["status"] == "ERROR", c  # NORMAL로 먼저 바뀌지 않는다
+        assert c["status_rows"]["CC"] == {"status": "NORMAL", "error": None, "covered": FIXED_NOW_ISO}, c
+        assert _counts(c["snapshot"], "CC") == (1, 1, FIXED_NOW_ISO), c
+
+
+class TestPartialSuccessContractAOnPostgres:
+    def test_success_item_is_kept_checkpoint_stalls_rerun_has_no_duplicates_and_recovers_when_fixed(self, pg_sandbox):
+        p = _run_scenario(pg_sandbox, "partial_success_contract_a", timeout=240)
+
+        # 첫 실행: 성공 항목 1개만 저장, checkpoint 미전진, ERROR 상태(안전한 코드만).
+        assert p["run1"]["CC"] == {"status": "PARTIAL_SUCCESS", "reason": "PARTIAL_SUCCESS"}, p
+        assert p["run1"]["PI"]["status"] == "SUCCESS", p  # 다른 source는 영향 없음
+        assert _counts(p["after_run1"]["snapshot"], "CC") == (1, 1, None), p
+        assert p["after_run1"]["status_rows"]["CC"] == {
+            "status": "ERROR",
+            "error": "PARTIAL_SUCCESS",
+            "covered": None,
+        }, p
+        # 두 번째 실행(로컬 필드를 수동 변경한 뒤): 중복 없음, 여전히 미전진, ERROR 유지.
+        assert p["run2"]["CC"]["status"] == "PARTIAL_SUCCESS", p
+        assert _counts(p["after_run2"]["snapshot"], "CC") == (1, 1, None), p
+        assert p["after_run2"]["status_rows"]["CC"]["status"] == "ERROR", p
+        # 실패 항목이 정상화된 실행: checkpoint 전진, NORMAL 복구, 오류 메시지 제거, case/history 중복 없음.
+        assert p["run3"]["CC"]["status"] == "SUCCESS", p
+        assert _counts(p["after_run3"]["snapshot"], "CC") == (2, 2, FIXED_NOW_ISO), p
+        assert p["after_run3"]["status_rows"]["CC"] == {"status": "NORMAL", "error": None, "covered": FIXED_NOW_ISO}, p
+        # 로컬 필드는 두 번의 재실행에도 보존되고, 새 항목은 기본값이다.
+        assert p["cases"] == [
+            ["good", "LOCAL-TAG", "LOCAL-DRAFT", "HIGH", "IN_PROGRESS"],
+            ["poison-fixed", None, None, "NORMAL", "OPEN"],
+        ], p
