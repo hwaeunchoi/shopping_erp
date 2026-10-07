@@ -614,8 +614,18 @@ scheduler job은 17개 -> 18개(`cs_inquiry_catchup` 추가).
   문의 ID·주문번호·본문·credential은 저장하지 않는다. 연동 상태 화면/운영 대시보드(`list_all_status`)에서는
   `CS_CHECKPOINT` 행을 제외한다.
 - 전진 조건(전부 충족): fetch·정규화·DB 저장 성공 + `failed=0` + 요청 예산/페이지 제한 초과 없음 + commit 성공.
-  데이터 upsert와 checkpoint 갱신은 **같은 트랜잭션**이다. 실패·rollback·부분실패면 전진하지 않고(오류 코드만 기록),
-  값은 단조 증가만 허용한다(뒤로 가지 않음). `PARTIAL_SUCCESS`는 이미 저장된 항목(멱등)을 보존하되 전진하지 않는다.
+  **checkpoint가 전진할 때는 항상 같은 트랜잭션의 데이터와 함께** commit된다(commit이 실패하면 데이터와 checkpoint가
+  둘 다 롤백). 실패·rollback이면 전진하지 않고(오류 코드만 기록), 값은 단조 증가만 허용한다(뒤로 가지 않음).
+  실패 기록은 데이터 트랜잭션과 분리된 짧은 트랜잭션이며, 그 기록 자체가 실패해도 원래 실패 사유를 가리거나 다른
+  source를 중단하지 않는다.
+- **`PARTIAL_SUCCESS` 계약(계약 A)**: 한 구간의 항목 일부가 DB 오류로 실패하면(`failed > 0`) 항목별 SAVEPOINT로
+  성공한 case/history는 **먼저 저장(commit)될 수 있고**, checkpoint는 전진하지 않는다. 따라서 (1) 부분 성공 데이터가
+  checkpoint보다 앞서 존재할 수 있고, (2) 다음 실행은 같은 구간 전체를 다시 조회하며, (3) unique 제약
+  (`platform + source + external_inquiry_id`)과 upsert로 중복 생성 없이 수렴하고, (4) 재처리되는 항목의 로컬
+  필드(담당자·태그·메모·답변초안·상태)는 덮어쓰지 않는다(외부 원문 상태·최신 문의 시각·본문만 갱신), (5) 영구적으로
+  실패하는 항목(예: 저장할 수 없는 값)이 있으면 그 source의 checkpoint가 계속 막히고 매 실행이 같은 구간을 다시
+  조회한다 - `integration_status`(CS_INQUIRY)의 "일부 문의만 수집 성공"과 checkpoint 오류 코드로 드러나며 조치가
+  필요하다. 구간 전체를 롤백하는 대안(계약 B)은 성공한 항목까지 버리고도 같은 막힘이 생기므로 채택하지 않았다.
 - 단점/이유: `integration_status`는 원래 "상태 스냅샷"이라 checkpoint 전용 스키마보다 덜 명시적이지만, 필요한 값
   (진행 시각·상태·안전한 오류 코드·updated_at)이 모두 들어가고 migration(운영 DB 변경) 위험이 없다. 구간 자체는
   covered_until에서 항상 다시 계산되므로 "마지막 성공 구간"을 따로 저장하지 않는다.
@@ -681,7 +691,14 @@ scheduler job은 17개 -> 18개(`cs_inquiry_catchup` 추가).
   바인딩된 엔진으로 건다(엔진 인자는 필수 - 전역 엔진으로 폴백하지 않는다).
 - 보호 대상: 시작 직후 catch-up, 15분 정기 실행, 수동 sync(`/api/cs-cases/sync`, 전체 source는 두 잠금을 모두 잡아야 진행,
   단일 source는 그 source 잠금). 겹치면 하나만 외부 호출·DB 쓰기를 하고 패자는 `ALREADY_RUNNING`(대기·자동 retry 없음).
-  `ALREADY_RUNNING`은 연동 상태를 오류로 기록하지 않는다.
+  `ALREADY_RUNNING`은 연동 상태를 오류로 기록하지 않는다. 수동 sync API는 HTTP 200에 `status=ALREADY_RUNNING`,
+  `reason_code=ALREADY_RUNNING`으로 응답한다(프론트 `CsSyncResult.status` 타입에 반영 - 화면은 상태 문자열을 그대로
+  표시하므로 번들은 바뀌지 않는다).
+- 잠금 네임스페이스: 이 기능의 키는 `(0x43530000+source 번호, platform_id)`로 (source, platform_id)에서 구조적으로
+  단사(서로 다른 입력은 서로 다른 키)이고 int4 안이다. 같은 PostgreSQL 인스턴스의 다른 advisory lock - 백업
+  (`0x424B5550`)과 외부 명령 대상 잠금(`classid=crc32(target_type)&0x7FFFFFFF`, 해시라 구조적 분리는 불가) - 와는
+  현재 코드베이스의 모든 값(백업 + target_type 8종)이 서로 다름을 확인했고 테스트가 그 목록을 고정한다. 새
+  target_type을 추가하면 그 테스트 목록에도 추가한다.
 
 #### 6) stale RUNNING 정리 (재시작 잔존 이력)
 
