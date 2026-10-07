@@ -220,7 +220,7 @@ class TestModulesUseTheRegistryValues:
     def test_backup_service_constants_are_the_registry_backup_key(self):
         from services import postgres_backup_service as svc
 
-        assert (svc._ADVISORY_LOCK_CLASSID, svc._ADVISORY_LOCK_OBJID) == backup_lock_key()
+        assert backup_lock_key() == (svc._ADVISORY_LOCK_CLASSID, svc._ADVISORY_LOCK_OBJID)
 
     def test_cs_sync_lock_keys_come_from_the_registry_cs_domain(self):
         from services.cs_sync_lock import _SOURCE_INDEX, lock_key
