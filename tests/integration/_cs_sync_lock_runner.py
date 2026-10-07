@@ -138,12 +138,11 @@ def scenario_lock_contention() -> dict:
 
     # 비정상 종료 흉내: 같은 키를 raw 커넥션이 잡은 채 unlock 없이 커넥션만 닫으면(프로세스 크래시와 동일)
     # 세션 잠금은 DB가 자동으로 해제한다.
-    from services.cs_sync_lock import _ADVISORY_CLASSID, lock_object_id
+    from services.cs_sync_lock import lock_key
 
     raw = engine.connect()
-    got = raw.execute(
-        text("SELECT pg_try_advisory_lock(:c, :o)"), {"c": _ADVISORY_CLASSID, "o": lock_object_id(pid, PR)}
-    ).scalar()
+    classid, objid = lock_key(pid, PR)
+    got = raw.execute(text("SELECT pg_try_advisory_lock(:c, :o)"), {"c": classid, "o": objid}).scalar()
     result["raw_held"] = bool(got)
     with cs_sync_source_lock(pid, PR, engine) as while_raw_held:
         result["acquired_while_raw_connection_holds_it"] = while_raw_held
@@ -369,12 +368,286 @@ def scenario_atomic_segment_commit_failure() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# 시나리오 5) atomicity_matrix - 실제 PostgreSQL에서 실패 유형별 case/history/checkpoint의 "커밋된" 행 수
+# ---------------------------------------------------------------------------
+
+FIXED_NOW = datetime(2026, 10, 7, 1, 0, 0)  # KST 2026-10-07 10:00 (naive UTC) - 시계 고정
+
+
+def _kst_midnight_utc(year: int, month: int, day: int) -> datetime:
+    kst = timezone(timedelta(hours=9))
+    return datetime(year, month, day, tzinfo=kst).astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _item(inquiry_id: str) -> dict[str, Any]:
+    return {
+        "platform_inquiry_id": inquiry_id,
+        "content": "합성 문의",
+        "inquiry_at": FIXED_NOW,
+        "raw_status": "progress:requestAnswer",
+        "needs_answer": True,
+        "platform_order_no": None,
+        "customer_phone": None,
+    }
+
+
+class _ScriptedConnector:
+    """호출 순번별로 결과(항목 리스트 또는 예외)를 정하고, 호출마다 예산을 cost만큼 소비한다."""
+
+    supports_inquiry_sync = True
+    supports_product_inquiry_sync = True
+
+    def __init__(
+        self, cc: Optional[list[Any]] = None, pr: Optional[list[Any]] = None, cost_cc: int = 4, cost_pr: int = 1
+    ):
+        self.plan = {CC: cc if cc is not None else [[_item("A")]], PR: pr if pr is not None else [[_item("P")]]}
+        self.cost = {CC: cost_cc, PR: cost_pr}
+        self.calls = {CC: 0, PR: 0}
+
+    def _run(self, source: str, request_budget: Any) -> list[dict[str, Any]]:
+        plan = self.plan[source]
+        outcome = plan[min(self.calls[source], len(plan) - 1)]
+        self.calls[source] += 1
+        for _ in range(self.cost[source]):
+            request_budget.consume("coupang")
+        if isinstance(outcome, Exception):
+            raise outcome
+        return list(outcome)
+
+    def fetch_inquiries(self, start_date, end_date, *, max_pages=None, max_retries=None, request_budget=None):
+        return self._run(CC, request_budget)
+
+    def fetch_product_inquiries(self, start_date, end_date, *, max_pages=None, max_retries=None, request_budget=None):
+        return self._run(PR, request_budget)
+
+
+def _snapshot(pid: int) -> dict[str, dict[str, Any]]:
+    """새 커넥션에서 보이는(= 커밋된) source별 case/history/checkpoint."""
+    check = SessionLocal()
+    try:
+        out: dict[str, dict[str, Any]] = {}
+        for source, short in ((CC, "CC"), (PR, "PI")):
+            cases = check.execute(
+                select(func.count())
+                .select_from(CsCase)
+                .where(CsCase.platform_id == pid, CsCase.external_source == source)
+            ).scalar_one()
+            history = check.execute(
+                select(func.count())
+                .select_from(CsCaseHistory)
+                .join(CsCase, CsCase.id == CsCaseHistory.case_id)
+                .where(CsCase.platform_id == pid, CsCase.external_source == source)
+            ).scalar_one()
+            checkpoint = check.execute(
+                select(IntegrationStatus.last_success_at).where(
+                    IntegrationStatus.integration_type == "CS_CHECKPOINT",
+                    IntegrationStatus.integration_code == f"{pid}:{short}",
+                )
+            ).scalar_one_or_none()
+            out[short] = {
+                "cases": int(cases),
+                "history": int(history),
+                "checkpoint": checkpoint.isoformat() if checkpoint is not None else None,
+            }
+        return out
+    finally:
+        check.close()
+
+
+def _summary(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        short: {"status": result["by_source"][src]["status"], "reason": result["by_source"][src].get("reason_code")}
+        for src, short in ((CC, "CC"), (PR, "PI"))
+    }
+
+
+def _service(session: Any) -> CsInquiryCatchupService:
+    return CsInquiryCatchupService(session, now_fn=lambda: FIXED_NOW)
+
+
+def scenario_atomicity_matrix() -> dict:
+    from sqlalchemy.orm import sessionmaker
+
+    from integrations.malls.errors import MarketplaceExternalAPIError
+    from services.cs_inquiry_catchup_service import CsSyncCheckpointRepository
+
+    matrix: dict[str, Any] = {}
+
+    # A) case 저장(flush) 후 checkpoint 갱신 단계에서 실패 -> 둘 다 반영 안 됨, 같은 구간 재실행하면 수렴
+    pid = _make_platform()
+    session = SessionLocal()
+    service = _service(session)
+
+    def _boom(*_a: Any, **_k: Any) -> None:
+        raise RuntimeError("synthetic checkpoint failure")
+
+    service.checkpoints.advance = _boom  # type: ignore[method-assign]
+    first = service.sync_platform(_ScriptedConnector(), pid)
+    row: dict[str, Any] = {"first": _summary(first), "after_first": _snapshot(pid)}
+    del service.checkpoints.advance  # 인스턴스 덮어쓰기 제거 -> 원래 메서드
+    row["rerun"] = _summary(service.sync_platform(_ScriptedConnector(), pid))
+    row["after_rerun"] = _snapshot(pid)
+    session.close()
+    matrix["A_fail_before_checkpoint"] = row
+
+    # B) checkpoint flush 후 최상위 commit 실패(첫 source) -> 첫 source만 반영 안 됨, 두 번째 source는 성공
+    pid = _make_platform()
+    session = SessionLocal()
+    state = {"fail_once": True}
+
+    @event.listens_for(session, "before_commit")
+    def _fail_first_top_level_commit(_s: Session) -> None:
+        if state["fail_once"] and not _s.in_nested_transaction():
+            state["fail_once"] = False
+            raise RuntimeError("synthetic commit failure")
+
+    service = _service(session)
+    row = {"first": _summary(service.sync_platform(_ScriptedConnector(), pid)), "after_first": _snapshot(pid)}
+    row["rerun"] = _summary(service.sync_platform(_ScriptedConnector(), pid))
+    row["after_rerun"] = _snapshot(pid)
+    session.close()
+    matrix["B_flush_then_commit_failure"] = row
+
+    # C) chunk 1 성공 후 chunk 2 실패 -> chunk 1만 보존, checkpoint는 chunk 1 끝
+    pid = _make_platform()
+    session = SessionLocal()
+    CsSyncCheckpointRepository(session).advance(pid, CC, _kst_midnight_utc(2026, 9, 24))
+    session.commit()
+    service = _service(session)
+    server_error = MarketplaceExternalAPIError("coupang", "SERVER_ERROR", True, http_status=500)
+    connector = _ScriptedConnector(cc=[[_item("A")], server_error], pr=[[]])
+    row = {"first": _summary(service.sync_platform(connector, pid)), "after_first": _snapshot(pid)}
+    connector2 = _ScriptedConnector(cc=[[_item("B")]], pr=[[]])
+    row["rerun"] = _summary(service.sync_platform(connector2, pid))
+    row["after_rerun"] = _snapshot(pid)
+    session.close()
+    matrix["C_chunk2_fails_after_chunk1"] = row
+
+    # D) failed > 0: 항목 하나가 실제 DB 오류(컬럼 길이 초과) -> SAVEPOINT 롤백, 나머지 보존, checkpoint 불변
+    pid = _make_platform()
+    session = SessionLocal()
+    service = _service(session)
+    connector = _ScriptedConnector(cc=[[_item("good"), _item("x" * 150)]])
+    row = {"first": _summary(service.sync_platform(connector, pid)), "after_first": _snapshot(pid)}
+    row["rerun"] = _summary(service.sync_platform(_ScriptedConnector(cc=[[_item("good")]]), pid))
+    row["after_rerun"] = _snapshot(pid)
+    session.close()
+    matrix["D_item_failure_failed_gt_0"] = row
+
+    # E) PAGE_LIMIT_EXCEEDED -> 그 source는 쓰기·checkpoint 없음
+    pid = _make_platform()
+    session = SessionLocal()
+    service = _service(session)
+    page_limit = MarketplaceExternalAPIError("coupang", "PAGE_LIMIT_EXCEEDED", False)
+    row = {
+        "first": _summary(service.sync_platform(_ScriptedConnector(cc=[page_limit]), pid)),
+        "after_first": _snapshot(pid),
+    }
+    row["rerun"] = _summary(service.sync_platform(_ScriptedConnector(), pid))
+    row["after_rerun"] = _snapshot(pid)
+    session.close()
+    matrix["E_page_limit_exceeded"] = row
+
+    # F) REQUEST_BUDGET_EXCEEDED(콜센터가 예산보다 많이 쓰려 함) -> 쓰기·checkpoint 없음, 상품별은 미뤄짐
+    pid = _make_platform()
+    session = SessionLocal()
+    service = _service(session)
+    row = {"first": _summary(service.sync_platform(_ScriptedConnector(cost_cc=50), pid)), "after_first": _snapshot(pid)}
+    row["rerun"] = _summary(service.sync_platform(_ScriptedConnector(), pid))
+    row["after_rerun"] = _snapshot(pid)
+    session.close()
+    matrix["F_request_budget_exceeded"] = row
+
+    # G) 최상위 commit 직전 BaseException(SystemExit) -> 아무것도 반영 안 됨, 잠금 해제, 새 세션 재실행으로 수렴
+    pid = _make_platform()
+    session = SessionLocal()
+    state_g = {"die": True}
+
+    @event.listens_for(session, "before_commit")
+    def _die_before_top_level_commit(_s: Session) -> None:
+        if state_g["die"] and not _s.in_nested_transaction():
+            state_g["die"] = False
+            raise SystemExit("simulated process death")
+
+    raised = False
+    try:
+        _service(session).sync_platform(_ScriptedConnector(), pid)
+    except SystemExit:
+        raised = True
+    session.close()
+    row = {"raised_system_exit": raised, "after_first": _snapshot(pid)}
+    with ExitStack() as stack:
+        row["locks_free_after_death"] = all(stack.enter_context(cs_sync_source_lock(pid, s, engine)) for s in (CC, PR))
+    rerun_session = sessionmaker(bind=engine, autoflush=False)()
+    row["rerun"] = _summary(_service(rerun_session).sync_platform(_ScriptedConnector(), pid))
+    rerun_session.close()
+    row["after_rerun"] = _snapshot(pid)
+    matrix["G_base_exception_before_commit"] = row
+
+    return {"scenario": "atomicity_matrix", "fixed_now": FIXED_NOW.isoformat(), "matrix": matrix}
+
+
+def scenario_stale_concurrent_recovery() -> dict:
+    """두 scheduler 인스턴스가 같은 stale 행을 동시에 정리해도 오류 없이 같은 최종 값이 된다."""
+    setup = SessionLocal()
+    row = TaskExecutionHistory(
+        task_type="PRODUCT_SYNC",
+        target="product_sync",
+        trigger_type="SCHEDULE",
+        status="RUNNING",
+        started_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=21),
+    )
+    setup.add(row)
+    setup.commit()
+    row_id = row.id
+    setup.close()
+
+    barrier = threading.Barrier(2)
+    out: dict[str, Any] = {}
+
+    def _worker(key: str) -> None:
+        session = SessionLocal()
+        try:
+            barrier.wait(timeout=15)
+            out[key] = recover_stale_running_tasks(session, ["product_sync"])
+            session.commit()
+        except Exception as exc:  # noqa: BLE001
+            out[key] = {"exception": type(exc).__name__}
+        finally:
+            session.close()
+
+    threads = [threading.Thread(target=_worker, args=(k,)) for k in ("a", "b")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    check = SessionLocal()
+    final = check.execute(
+        select(TaskExecutionHistory.status, TaskExecutionHistory.error_message, TaskExecutionHistory.finished_at).where(
+            TaskExecutionHistory.id == row_id
+        )
+    ).one()
+    check.close()
+    return {
+        "scenario": "stale_concurrent_recovery",
+        "a": out.get("a"),
+        "b": out.get("b"),
+        "final_status": final[0],
+        "final_error_message": final[1],
+        "finished_at_set": final[2] is not None,
+    }
+
+
 SCENARIOS = {
     "lock_contention": scenario_lock_contention,
     "concurrent_sync_platform": scenario_concurrent_sync_platform,
     "stale_probe_sees_real_lock": scenario_stale_probe_sees_real_lock,
     "manual_vs_running_sync": scenario_manual_vs_running_sync,
     "atomic_segment_commit_failure": scenario_atomic_segment_commit_failure,
+    "atomicity_matrix": scenario_atomicity_matrix,
+    "stale_concurrent_recovery": scenario_stale_concurrent_recovery,
 }
 
 

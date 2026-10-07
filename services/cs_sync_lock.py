@@ -31,39 +31,37 @@ from sqlalchemy.engine import Connection, Engine
 
 logger = logging.getLogger(__name__)
 
-# pg_try_advisory_lock(int4, int4)의 첫 번째 인자 - 이 기능 전용 네임스페이스. 백업 잠금
-# (services/postgres_backup_service.py)과 값이 겹치지 않도록 구분한다.
-_ADVISORY_CLASSID = 0x43530001
-
-# source -> 작은 정수. objid = platform_id * _SOURCE_STRIDE + source index(int4 범위 안).
+# pg_try_advisory_lock(int4, int4) 키 설계: classid = 이 기능 전용 기준값 + source 번호, objid = platform_id.
+# platforms.id가 PostgreSQL integer(int4)라 platform_id를 그대로 objid에 쓰면 int4 전체 범위(0 ~ 2^31-1)가
+# 곱셈/오프셋 없이 충돌 없이 들어간다. 기준값(0x4353 = "CS")은 백업 잠금(0x424B5550)과 겹치지 않는다.
+_ADVISORY_CLASSID_BASE = 0x43530000
 _SOURCE_INDEX: dict[str, int] = {"COUPANG_CALL_CENTER": 0, "COUPANG_PRODUCT_INQUIRY": 1}
-_SOURCE_STRIDE = 16
 
-_local_locks: dict[int, threading.Lock] = {}
+_local_locks: dict[tuple[int, int], threading.Lock] = {}
 _local_registry_guard = threading.Lock()
 
 
-def lock_object_id(platform_id: int, source: str) -> int:
-    """(platform_id, source) -> advisory lock의 두 번째 인자. 알 수 없는 source는 거부한다
-    (잠금 키가 충돌하거나 조용히 무잠금이 되는 일이 없도록)."""
+def lock_key(platform_id: int, source: str) -> tuple[int, int]:
+    """(platform_id, source) -> advisory lock의 (classid, objid). 알 수 없는 source나 int4 범위를 벗어난
+    platform_id는 거부한다(잠금 키가 충돌하거나 조용히 무잠금이 되는 일이 없도록)."""
     if source not in _SOURCE_INDEX:
         raise ValueError(f"알 수 없는 CS 동기화 source입니다: {source}")
-    if platform_id < 0 or platform_id * _SOURCE_STRIDE + len(_SOURCE_INDEX) >= 2**31:
-        raise ValueError("platform_id가 잠금 키 범위를 벗어났습니다.")
-    return platform_id * _SOURCE_STRIDE + _SOURCE_INDEX[source]
+    if not 0 <= platform_id < 2**31:
+        raise ValueError("platform_id가 잠금 키 범위(int4)를 벗어났습니다.")
+    return _ADVISORY_CLASSID_BASE + _SOURCE_INDEX[source], platform_id
 
 
 @contextmanager
 def cs_sync_source_lock(platform_id: int, source: str, engine: Union[Engine, Connection]) -> Iterator[bool]:
     """(platform_id, source) 잠금을 논블로킹으로 시도한다. `with ... as acquired:`에서
     acquired가 True일 때만 외부 호출/DB 쓰기를 해야 한다."""
-    objid = lock_object_id(platform_id, source)
+    classid, objid = lock_key(platform_id, source)
     # Session.get_bind()는 Engine 또는 Connection일 수 있다 - 항상 Engine으로 정규화한다.
     eng = engine.engine
 
     if eng.dialect.name != "postgresql":
         with _local_registry_guard:
-            lock = _local_locks.setdefault(objid, threading.Lock())
+            lock = _local_locks.setdefault((classid, objid), threading.Lock())
         acquired = lock.acquire(blocking=False)
         try:
             yield acquired
@@ -78,16 +76,14 @@ def cs_sync_source_lock(platform_id: int, source: str, engine: Union[Engine, Con
         conn = conn.execution_options(isolation_level="AUTOCOMMIT")
         acquired = bool(
             conn.execute(
-                text("SELECT pg_try_advisory_lock(:classid, :objid)"), {"classid": _ADVISORY_CLASSID, "objid": objid}
+                text("SELECT pg_try_advisory_lock(:classid, :objid)"), {"classid": classid, "objid": objid}
             ).scalar()
         )
         yield acquired
     finally:
         if acquired:
             try:
-                conn.execute(
-                    text("SELECT pg_advisory_unlock(:classid, :objid)"), {"classid": _ADVISORY_CLASSID, "objid": objid}
-                )
+                conn.execute(text("SELECT pg_advisory_unlock(:classid, :objid)"), {"classid": classid, "objid": objid})
             except Exception:  # noqa: BLE001
                 # unlock 실패 시 이 커넥션을 풀에 돌려보내면 세션 잠금이 살아 있는 채로 재사용돼 잠금이
                 # 샌다 - 물리 연결을 폐기(invalidate)해 DB가 세션 잠금을 해제하게 한다.

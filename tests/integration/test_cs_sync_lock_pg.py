@@ -224,3 +224,90 @@ class TestSegmentCommitAtomicityOnPostgres:
         assert p["second_status"] == "SUCCESS", p
         assert p["after_second"]["cases"] == 2, p
         assert p["after_second"]["success_checkpoints"] == 2, p
+
+
+FIXED_NOW_ISO = "2026-10-07T01:00:00"  # 러너가 고정한 시계(KST 2026-10-07 10:00)
+CHUNK1_END_ISO = "2026-09-30T15:00:00"  # 2026-10-01 00:00 KST
+
+
+def _counts(snapshot: dict, short: str) -> tuple[int, int, object]:
+    row = snapshot[short]
+    return row["cases"], row["history"], row["checkpoint"]
+
+
+class TestAtomicityMatrixOnPostgres:
+    """실패 유형별로 "다른 커넥션에서 보이는(커밋된)" case/history/checkpoint 행 수를 검증한다.
+    표기: (case, history, checkpoint)  CC=콜센터, PI=상품별."""
+
+    @pytest.fixture()
+    def matrix(self, pg_sandbox):
+        return _run_scenario(pg_sandbox, "atomicity_matrix", timeout=240)["matrix"]
+
+    def test_a_failure_after_case_flush_but_before_checkpoint_leaves_nothing_then_rerun_converges(self, matrix):
+        m = matrix["A_fail_before_checkpoint"]
+        assert m["first"]["CC"]["status"] == "FAILED" and m["first"]["PI"]["status"] == "FAILED", m
+        assert m["first"]["CC"]["reason"] == "COMMIT_FAILED:RuntimeError", m
+        assert _counts(m["after_first"], "CC") == (0, 0, None), m
+        assert _counts(m["after_first"], "PI") == (0, 0, None), m
+        assert _counts(m["after_rerun"], "CC") == (1, 1, FIXED_NOW_ISO), m
+        assert _counts(m["after_rerun"], "PI") == (1, 1, FIXED_NOW_ISO), m
+
+    def test_b_commit_failure_after_checkpoint_flush_is_isolated_to_the_first_source(self, matrix):
+        m = matrix["B_flush_then_commit_failure"]
+        assert m["first"]["CC"]["status"] == "FAILED", m
+        assert m["first"]["CC"]["reason"] == "COMMIT_FAILED:RuntimeError", m
+        assert m["first"]["PI"]["status"] == "SUCCESS", m
+        assert _counts(m["after_first"], "CC") == (0, 0, None), m  # flush된 checkpoint도 남지 않는다
+        assert _counts(m["after_first"], "PI") == (1, 1, FIXED_NOW_ISO), m  # 두 번째 source는 정상 반영
+        assert _counts(m["after_rerun"], "CC") == (1, 1, FIXED_NOW_ISO), m
+        assert _counts(m["after_rerun"], "PI") == (1, 1, FIXED_NOW_ISO), m  # 중복 없이 수렴
+
+    def test_c_chunk2_failure_keeps_chunk1_and_checkpoint_at_end_of_chunk1(self, matrix):
+        m = matrix["C_chunk2_fails_after_chunk1"]
+        assert m["first"]["CC"]["status"] == "PARTIAL_SUCCESS", m
+        assert m["first"]["CC"]["reason"] == "SERVER_ERROR", m
+        assert _counts(m["after_first"], "CC") == (1, 1, CHUNK1_END_ISO), m
+        assert m["rerun"]["CC"]["status"] == "SUCCESS", m
+        assert _counts(m["after_rerun"], "CC") == (2, 2, FIXED_NOW_ISO), m
+
+    def test_d_item_level_database_error_keeps_good_items_and_does_not_advance(self, matrix):
+        m = matrix["D_item_failure_failed_gt_0"]
+        assert m["first"]["CC"]["status"] == "PARTIAL_SUCCESS", m
+        assert _counts(m["after_first"], "CC") == (1, 1, None), m
+        assert m["rerun"]["CC"]["status"] == "SUCCESS", m
+        assert _counts(m["after_rerun"], "CC") == (1, 1, FIXED_NOW_ISO), m  # good은 갱신으로 수렴, 중복 없음
+
+    def test_e_page_limit_exceeded_writes_nothing_for_that_source(self, matrix):
+        m = matrix["E_page_limit_exceeded"]
+        assert m["first"]["CC"] == {"status": "FAILED", "reason": "PAGE_LIMIT_EXCEEDED"}, m
+        assert _counts(m["after_first"], "CC") == (0, 0, None), m
+        assert _counts(m["after_first"], "PI") == (1, 1, FIXED_NOW_ISO), m
+        assert _counts(m["after_rerun"], "CC") == (1, 1, FIXED_NOW_ISO), m
+
+    def test_f_request_budget_exceeded_writes_nothing_and_defers_the_other_source(self, matrix):
+        m = matrix["F_request_budget_exceeded"]
+        assert m["first"]["CC"] == {"status": "FAILED", "reason": "REQUEST_BUDGET_EXCEEDED"}, m
+        assert m["first"]["PI"]["status"] == "DEFERRED", m
+        assert _counts(m["after_first"], "CC") == (0, 0, None), m
+        assert _counts(m["after_first"], "PI") == (0, 0, None), m
+        assert _counts(m["after_rerun"], "CC") == (1, 1, FIXED_NOW_ISO), m
+        assert _counts(m["after_rerun"], "PI") == (1, 1, FIXED_NOW_ISO), m
+
+    def test_g_base_exception_before_commit_leaves_nothing_frees_locks_and_rerun_converges(self, matrix):
+        m = matrix["G_base_exception_before_commit"]
+        assert m["raised_system_exit"] is True, m
+        assert _counts(m["after_first"], "CC") == (0, 0, None), m
+        assert _counts(m["after_first"], "PI") == (0, 0, None), m
+        assert m["locks_free_after_death"] is True, m
+        assert _counts(m["after_rerun"], "CC") == (1, 1, FIXED_NOW_ISO), m
+        assert _counts(m["after_rerun"], "PI") == (1, 1, FIXED_NOW_ISO), m
+
+
+class TestStaleRecoveryTwoInstances:
+    def test_two_instances_recovering_the_same_row_end_in_the_same_state_without_errors(self, pg_sandbox):
+        p = _run_scenario(pg_sandbox, "stale_concurrent_recovery")
+
+        assert "exception" not in p["a"] and "exception" not in p["b"], p
+        assert p["final_status"] == "FAILED", p
+        assert p["final_error_message"] == "PROCESS_INTERRUPTED", p
+        assert p["finished_at_set"] is True, p

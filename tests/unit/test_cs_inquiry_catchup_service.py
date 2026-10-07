@@ -26,6 +26,7 @@ from repositories.extra_repository import IntegrationStatusRepository
 from services.cs_channel_sync_service import COUPANG_CALL_CENTER_SOURCE, COUPANG_PRODUCT_INQUIRY_SOURCE
 from services.cs_inquiry_catchup_service import (
     CHECKPOINT_INTEGRATION_TYPE,
+    CHECKPOINT_SOURCE_CODES,
     KST,
     MAX_SEGMENT_DAYS,
     QUERIES_PER_SEGMENT,
@@ -178,10 +179,22 @@ class TestContractsAndWorstCase:
     def test_worst_case_of_one_segment_for_both_sources_equals_the_run_budget(self):
         assert worst_case_requests(CC) + worst_case_requests(PR) == settings.cs_inquiry_sync_max_requests_per_run == 45
 
-    def test_checkpoint_key_fits_integration_code_column(self):
-        assert len(checkpoint_code(99999, PR)) <= 30
+    def test_checkpoint_key_fits_integration_code_column_for_every_integer_platform_id(self):
+        longest_platform_id = 2**31 - 1  # platforms.id는 PostgreSQL integer
+        for source in SOURCES:
+            assert len(checkpoint_code(longest_platform_id, source)) <= 13 <= 30
         with pytest.raises(ValueError):
-            checkpoint_code(10**9, PR)
+            checkpoint_code(2**31, PR)
+        with pytest.raises(ValueError):
+            checkpoint_code(-1, PR)
+        with pytest.raises(ValueError):
+            checkpoint_code(1, "NOT_A_SOURCE")
+
+    def test_checkpoint_source_codes_are_unique_and_cover_all_sources(self):
+        assert set(CHECKPOINT_SOURCE_CODES) == set(SOURCES)
+        assert len(set(CHECKPOINT_SOURCE_CODES.values())) == len(CHECKPOINT_SOURCE_CODES)
+        codes = {checkpoint_code(platform_id, s) for platform_id in range(1, 2000) for s in SOURCES}
+        assert len(codes) == 1999 * len(SOURCES)  # 충돌 없음
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +279,7 @@ class TestCheckpointRepository:
         assert record is not None
         assert record is not None
         assert record.status == "NORMAL"
-        assert record.integration_code == f"{platform.id}:{CC}"
+        assert record.integration_code == f"{platform.id}:CC"
         assert repo.get_covered_until(platform.id, CC) == NOW
 
     def test_advance_is_monotonic_never_moves_backwards(self, db_session, platform):
@@ -762,10 +775,10 @@ class TestCheckpointSemantics:
     def test_ten_oclock_success_then_ten_fifteen_run_requeries_today(self):
         assert plan_segments(NOW, NOW + timedelta(minutes=15)) == [(TODAY, TODAY)]
 
-    def test_platform_id_boundary_for_checkpoint_key(self):
-        assert len(checkpoint_code(999_999, PR)) == 30  # 가장 긴 source로 정확히 30자
-        with pytest.raises(ValueError):
-            checkpoint_code(1_000_000, PR)  # 31자 - 조용히 자르지 않고 거부
+    def test_platform_ids_beyond_six_digits_still_get_a_valid_checkpoint_key(self):
+        """이전 설계(<id>:<긴 source명>)는 7자리 platform_id부터 30자를 넘어 실패했다."""
+        assert checkpoint_code(1_000_000, PR) == "1000000:PI"
+        assert checkpoint_code(2**31 - 1, CC) == "2147483647:CC"
 
 
 class TestPlanningHappensAfterTheLock:
@@ -1065,3 +1078,52 @@ class TestBudgetConfigurationAndSourceOrder:
         CsSyncCheckpointRepository(db_session).record_failure(platform.id, CC, "PAGE_LIMIT_EXCEEDED")
         db_session.flush()
         assert IntegrationStatusRepository(db_session).list_all_status() == []
+
+
+class TestNoPermanentStarvationWhenBudgetIsTight:
+    """예산이 (콜센터 최악 36 + 상품별 최악 9)=45보다 작게 설정된 환경(예: 40)에서 최악 비용이 계속되면, 항상
+    같은 source를 먼저 처리하는 구현은 한쪽을 영구히 굶긴다(36 사용 -> 남은 4 < 9). checkpoint가 뒤처진 쪽을
+    먼저 처리하므로 실행마다 번갈아 전진한다."""
+
+    def test_sources_alternate_instead_of_one_starving_the_other(self, db_session, engine, platform, monkeypatch):
+        monkeypatch.setattr(settings, "cs_inquiry_sync_max_requests_per_run", 40)
+        gap = kst_to_utc(2026, 9, 17, 0, 0)
+        for source in (CC, PR):
+            _seed_checkpoint(db_session, platform.id, source, gap)
+
+        previous = {CC: gap, PR: gap}
+        advanced: dict[str, list[bool]] = {CC: [], PR: []}
+        for run in range(6):
+            service = _service(db_session, engine, NOW + timedelta(minutes=15 * run))
+            service.sync_platform(_Connector(cost_cc=36, cost_pr=9), platform.id)
+            for source in (CC, PR):
+                current = _covered(db_session, platform.id, source)
+                assert current is not None
+                advanced[source].append(current > previous[source])
+                previous[source] = current
+
+        def longest_streak_without_progress(flags: list[bool]) -> int:
+            longest = streak = 0
+            for moved in flags:
+                streak = 0 if moved else streak + 1
+                longest = max(longest, streak)
+            return longest
+
+        # 첫 두 실행 안에 두 source가 모두 전진하고, 어느 쪽도 연속 3회를 넘게 멈춰 있지 않는다.
+        # (정렬이 없으면 같은 source가 매번 먼저 예산을 가져가 다른 쪽은 6회 내내 전진하지 못한다.)
+        assert any(advanced[CC][:2]) and any(advanced[PR][:2]), advanced
+        assert longest_streak_without_progress(advanced[CC]) <= 3, advanced
+        assert longest_streak_without_progress(advanced[PR]) <= 3, advanced
+
+    def test_equal_checkpoints_keep_a_deterministic_order_across_runs(self, db_session, engine, platform):
+        for source in (CC, PR):
+            _seed_checkpoint(db_session, platform.id, source, kst_to_utc(2026, 10, 7, 9, 0))
+        orders = []
+        for _ in range(3):
+            connector = _Connector()
+            _service(db_session, engine).sync_platform(connector, platform.id)
+            orders.append([src for src, _, _ in connector.calls])
+            # 다음 반복도 동률로 시작하도록 checkpoint를 다시 같은 값으로 맞춘다.
+            for source in (CC, PR):
+                _seed_checkpoint(db_session, platform.id, source, kst_to_utc(2026, 10, 7, 9, 0))
+        assert orders[0] == orders[1] == orders[2] == [CC, PR]

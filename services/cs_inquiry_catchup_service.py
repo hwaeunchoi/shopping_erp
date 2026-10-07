@@ -10,7 +10,7 @@ checkpoint(source별 진행 위치)
 -----------------------------
 - 키: platform_id + external_source(COUPANG_CALL_CENTER / COUPANG_PRODUCT_INQUIRY).
 - 저장소: 기존 integration_status 테이블(새 테이블/migration 없음) -
-  integration_type="CS_CHECKPOINT", integration_code="<platform_id>:<source>"(30자 이내).
+  integration_type="CS_CHECKPOINT", integration_code="<platform_id>:<CC|PI>"(source별 고정 2자 코드, 최대 13자 - platforms.id는 integer).
   last_success_at = "covered_until": 이 시각까지의 문의를 해당 source에서 완전히 가져와
   저장했다는 뜻(naive UTC). status NORMAL/ERROR, last_error_message = 안전한 오류 코드 한
   개(문의 ID/주문번호/본문/credential은 절대 저장하지 않는다), updated_at.
@@ -150,11 +150,20 @@ def worst_case_requests(source: str) -> int:
     )
 
 
+# integration_status.integration_code는 varchar(30)이고 platforms.id는 integer(최대 10자리)다. 긴 source 이름을
+# 키에 넣으면 7자리 platform_id부터 길이를 넘으므로, source마다 고정된 짧은 코드(2자)를 쓴다 -
+# "<platform_id>:<코드>"는 최대 13자라 어떤 integer platform_id에도 안전하고, 코드가 서로 다르므로 충돌하지
+# 않는다(tests가 유일성을 검증). 새 source(예: 11번가)를 추가하면 여기에도 코드를 하나 추가해야 한다.
+CHECKPOINT_SOURCE_CODES: dict[str, str] = {COUPANG_CALL_CENTER_SOURCE: "CC", COUPANG_PRODUCT_INQUIRY_SOURCE: "PI"}
+
+
 def checkpoint_code(platform_id: int, source: str) -> str:
-    code = f"{platform_id}:{source}"
-    if len(code) > 30:  # integration_status.integration_code String(30)
-        raise ValueError("checkpoint 키가 integration_code 길이(30자)를 넘습니다.")
-    return code
+    short = CHECKPOINT_SOURCE_CODES.get(source)
+    if short is None:
+        raise ValueError(f"checkpoint 코드가 정의되지 않은 source입니다: {source}")
+    if not 0 <= platform_id < 2**31:
+        raise ValueError("platform_id가 integer 범위를 벗어났습니다.")
+    return f"{platform_id}:{short}"
 
 
 class CsSyncCheckpointRepository:

@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from services.cs_sync_lock import cs_sync_source_lock, is_cs_sync_lock_held, lock_object_id
+from services.cs_sync_lock import cs_sync_source_lock, is_cs_sync_lock_held, lock_key
 
 CC = "COUPANG_CALL_CENTER"
 PR = "COUPANG_PRODUCT_INQUIRY"
@@ -42,24 +42,32 @@ def _fake_pg_engine(*, lock_result: bool = True, unlock_error: Exception | None 
 
 class TestLockKeys:
     def test_keys_are_unique_for_every_platform_and_source_in_a_realistic_range(self):
-        seen: dict[int, tuple[int, str]] = {}
-        for platform_id in range(1, 5001):
+        seen: dict[tuple[int, int], tuple[int, str]] = {}
+        for platform_id in range(0, 5001):
             for source in (CC, PR):
-                key = lock_object_id(platform_id, source)
+                key = lock_key(platform_id, source)
                 assert key not in seen, (platform_id, source, seen[key])
                 seen[key] = (platform_id, source)
 
-    def test_key_is_stable_and_within_int4(self):
-        assert lock_object_id(7, CC) == lock_object_id(7, CC)
-        assert 0 <= lock_object_id(7, PR) < 2**31
+    def test_every_integer_platform_id_maps_without_overflow_or_collision(self):
+        max_id = 2**31 - 1
+        keys = {lock_key(pid, s) for pid in (0, 1, 16, 17, 134_217_727, 134_217_728, max_id) for s in (CC, PR)}
+        assert len(keys) == 14  # 이전 설계(platform_id*16+idx)는 134,217,728부터 int4 범위를 넘었다
+        for classid, objid in keys:
+            assert 0 <= classid < 2**31 and 0 <= objid < 2**31
+
+    def test_key_is_stable_and_does_not_collide_with_the_backup_lock_namespace(self):
+        assert lock_key(7, CC) == lock_key(7, CC)
+        backup_classid = 0x424B5550
+        assert all(lock_key(7, s)[0] != backup_classid for s in (CC, PR))
 
     def test_out_of_range_platform_or_unknown_source_is_rejected(self):
         with pytest.raises(ValueError):
-            lock_object_id(2**31, CC)
+            lock_key(2**31, CC)
         with pytest.raises(ValueError):
-            lock_object_id(-1, CC)
+            lock_key(-1, CC)
         with pytest.raises(ValueError):
-            lock_object_id(1, "NOT_A_SOURCE")
+            lock_key(1, "NOT_A_SOURCE")
 
 
 class TestLocalFallbackLifecycle:

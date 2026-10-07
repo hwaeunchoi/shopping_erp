@@ -225,3 +225,18 @@ class TestStaleRecoveryStartupHook:
 
         assert captured["db"] == "fake-session"
         assert captured["targets"] == {job.id for job in build_scheduler().get_jobs()}
+
+    def test_commit_failure_while_closing_the_recovery_transaction_never_blocks_startup(self, monkeypatch):
+        """정리 자체는 끝났지만 session_scope가 닫히며 commit이 실패하는 경우도 기동을 막지 않는다."""
+        from contextlib import contextmanager
+
+        from scheduler import scheduler as scheduler_module
+
+        @contextmanager
+        def _scope():
+            yield "fake-session"
+            raise RuntimeError("synthetic commit failure on exit")
+
+        monkeypatch.setattr(scheduler_module, "session_scope", _scope)
+        monkeypatch.setattr(scheduler_module, "recover_stale_running_tasks", lambda db, targets: None)
+        scheduler_module.recover_stale_running_tasks_on_start()  # 예외 없이 반환
