@@ -69,6 +69,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine, make_url
 
 from config.settings import settings
+from core.advisory_locks import backup_lock_key
 from core.database import engine, session_scope
 from models.system import BackupHistory
 from repositories.system_repository import BackupHistoryRepository
@@ -80,10 +81,8 @@ FILE_SUFFIX = ".dump"
 SIDECAR_SUFFIX = ".sha256"
 MANIFEST_SUFFIX = ".manifest.json"
 
-# acquire_target_lock()의 동적 classid(target_type 문자열의 crc32)와 절대 겹치지
-# 않도록 이 모듈 전용 고정 상수를 쓴다. 'BKUP'을 4바이트 정수로 눌러쓴 값.
-_ADVISORY_LOCK_CLASSID = 0x424B5550
-_ADVISORY_LOCK_OBJID = 0
+# 키는 core/advisory_locks.py의 registry가 예약한 값이다('BKUP' 4바이트) - 다른 기능 영역과 classid가 다르다.
+_ADVISORY_LOCK_CLASSID, _ADVISORY_LOCK_OBJID = backup_lock_key()
 
 ERR_TOOL_MISSING = "TOOL_MISSING"
 ERR_INVALID_CONFIGURATION = "INVALID_CONFIGURATION"

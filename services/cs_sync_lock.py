@@ -29,12 +29,13 @@ from typing import Iterator, Union
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
 
+from core.advisory_locks import cs_sync_lock_key
+
 logger = logging.getLogger(__name__)
 
-# pg_try_advisory_lock(int4, int4) 키 설계: classid = 이 기능 전용 기준값 + source 번호, objid = platform_id.
+# pg_try_advisory_lock(int4, int4) 키: classid = registry가 예약한 CS 영역 기준값 + source 번호, objid = platform_id.
 # platforms.id가 PostgreSQL integer(int4)라 platform_id를 그대로 objid에 쓰면 int4 전체 범위(0 ~ 2^31-1)가
-# 곱셈/오프셋 없이 충돌 없이 들어간다. 기준값(0x4353 = "CS")은 백업 잠금(0x424B5550)과 겹치지 않는다.
-_ADVISORY_CLASSID_BASE = 0x43530000
+# 해시 없이 단사로 들어간다. 다른 기능 영역(백업·외부 명령)과의 분리는 core/advisory_locks.py가 보장한다.
 _SOURCE_INDEX: dict[str, int] = {"COUPANG_CALL_CENTER": 0, "COUPANG_PRODUCT_INQUIRY": 1}
 
 _local_locks: dict[tuple[int, int], threading.Lock] = {}
@@ -46,9 +47,7 @@ def lock_key(platform_id: int, source: str) -> tuple[int, int]:
     platform_id는 거부한다(잠금 키가 충돌하거나 조용히 무잠금이 되는 일이 없도록)."""
     if source not in _SOURCE_INDEX:
         raise ValueError(f"알 수 없는 CS 동기화 source입니다: {source}")
-    if not 0 <= platform_id < 2**31:
-        raise ValueError("platform_id가 잠금 키 범위(int4)를 벗어났습니다.")
-    return _ADVISORY_CLASSID_BASE + _SOURCE_INDEX[source], platform_id
+    return cs_sync_lock_key(platform_id, _SOURCE_INDEX[source])
 
 
 @contextmanager

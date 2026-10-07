@@ -4,7 +4,6 @@ repositories/integration_sync_repository.py
 ExternalCommand(outbox)/ExternalCommandLineResult(라인별 결과)/OrderStatusConflict 저장소.
 """
 
-import zlib
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional, cast
 
@@ -12,6 +11,7 @@ from sqlalchemy import func, select, text, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
+from core.advisory_locks import external_command_lock_key
 from models.integration_sync import (
     ExternalCommand,
     ExternalCommandLineResult,
@@ -135,8 +135,11 @@ class ExternalCommandRepository:
         _resolve_contention_target_ids()가 어느 매핑에서 시작하든 대칭적으로
         같은 전체 집합을 계산하므로(A의 형제에 B가 있으면 B의 형제에도 A가
         있음), min()도 항상 동일한 값으로 수렴해 서로 다른 매핑에서 시작해도
-        같은 잠금을 다툰다. classid(첫 번째 인자)는 target_type별로 고정된
-        상수라 서로 다른 target_type의 명령끼리는 불필요하게 묶이지 않는다.
+        같은 잠금을 다툰다. 키는 core.advisory_locks.external_command_lock_key가
+        만든다 - classid는 이 영역 전용 고정값(백업·CS 동기화 등 다른 기능과
+        구조적으로 분리)이고 objid는 (target_type, 자원 id)의 결정적 31비트
+        해시라, 서로 다른 target_type의 명령은 (해시 충돌이 없는 한) 묶이지
+        않는다. 해시 충돌은 상관없는 두 자원이 불필요하게 직렬화될 뿐이다.
 
         SQLite(단위테스트)에는 advisory lock이 없다 - 단위테스트는 단일
         커넥션·순차 실행이라 이 잠금이 없어도 안전하며, 실제 동시 worker
@@ -148,8 +151,7 @@ class ExternalCommandRepository:
         bind = self.session.get_bind()
         if bind is None or bind.dialect.name != "postgresql":
             return
-        classid = zlib.crc32(target_type.encode("utf-8")) & 0x7FFFFFFF
-        objid = min(ids) & 0x7FFFFFFF
+        classid, objid = external_command_lock_key(target_type, min(ids))
         self.session.execute(
             text("SELECT pg_advisory_xact_lock(:classid, :objid)"), {"classid": classid, "objid": objid}
         )
