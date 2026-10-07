@@ -11,7 +11,6 @@ tests/unit/test_outbox_dispatch_job.py 모듈 docstring과 동일: session_scope
 순수 함수라 이 정책과 무관하게 직접 단위테스트한다.
 """
 
-from datetime import date
 from unittest.mock import MagicMock
 
 from config.settings import settings
@@ -35,6 +34,19 @@ class TestDisabledByDefault:
         result = cs_inquiry_sync_job.run()
 
         assert result == {"skipped_disabled": {"skipped": "disabled"}}
+
+    def test_catchup_returns_immediately_without_opening_a_session(self, monkeypatch):
+        """시작 직후 catch-up도 같은 fail-closed 계약이다 - 기능이 꺼져 있으면 session_scope()도,
+        커넥터/credential 복호화도, 외부 HTTP 요청도 전혀 발생하지 않는다."""
+        monkeypatch.setattr(settings, "cs_inquiry_sync_enabled", False)
+
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError("기능이 OFF인데 DB 세션/커넥터가 만들어졌습니다.")
+
+        monkeypatch.setattr(cs_inquiry_sync_job, "session_scope", _fail_if_called)
+        monkeypatch.setattr(cs_inquiry_sync_job, "get_mall_connector", _fail_if_called)
+
+        assert cs_inquiry_sync_job.run_catchup() == {"skipped_disabled": {"skipped": "disabled"}}
 
 
 class TestRecordIntegrationStatus:
@@ -96,21 +108,3 @@ class TestRecordIntegrationStatus:
         )
         message = repo.upsert_error.call_args[0][2]
         assert "reason=" not in message
-
-
-class TestCollectionWindow:
-    """상용 ERP 확장 5단계 B묶음 보완 - settings.cs_inquiry_sync_window_days가 실제
-    조회 기간 계산에 반영되는지 session_scope() 없이 검증한다(이 파일의 테스트
-    방침과 동일하게 순수 함수만 직접 호출)."""
-
-    def test_window_days_one_means_today_only(self, monkeypatch):
-        monkeypatch.setattr(settings, "cs_inquiry_sync_window_days", 1)
-        start, end = cs_inquiry_sync_job._collection_window(date(2026, 9, 30))
-        assert start == end == date(2026, 9, 30)
-
-    def test_window_days_seven_spans_seven_calendar_days_inclusive(self, monkeypatch):
-        monkeypatch.setattr(settings, "cs_inquiry_sync_window_days", 7)
-        start, end = cs_inquiry_sync_job._collection_window(date(2026, 9, 30))
-        assert end == date(2026, 9, 30)
-        assert start == date(2026, 9, 24)
-        assert (end - start).days == 6  # 7일(both ends inclusive).

@@ -341,6 +341,8 @@ class TestCrossSourceDedup:
 
         call_center_case = CsCaseRepository(db_session).get_by_external(platform.id, COUPANG_CALL_CENTER_SOURCE, "8888")
         product_case = CsCaseRepository(db_session).get_by_external(platform.id, COUPANG_PRODUCT_INQUIRY_SOURCE, "8888")
+        assert call_center_case is not None
+        assert product_case is not None
         assert call_center_case.customer_message == "콜센터 갱신"
         assert product_case.customer_message == "상품별 갱신"
 

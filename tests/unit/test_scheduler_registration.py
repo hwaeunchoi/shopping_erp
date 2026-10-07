@@ -45,11 +45,31 @@ _UNCHANGED_POLICY_SAMPLE_JOB_IDS = ["product_sync", "ad_collect", "report_genera
 
 
 class TestSchedulerJobRegistration:
-    def test_total_job_count_is_seventeen(self):
-        """기존 16개 + backup_catchup 1개(이번 misfire 정책 변경은 job을
-        추가/삭제하지 않는다 - 개수는 그대로다)."""
+    def test_total_job_count_is_eighteen(self):
+        """기존 17개 + cs_inquiry_catchup 1개(시작 직후 1회 CS 문의 catch-up). 정기
+        cs_inquiry_sync 등록은 그대로 유지된다."""
         scheduler = build_scheduler()
-        assert len(scheduler.get_jobs()) == 17
+        assert len(scheduler.get_jobs()) == 18
+
+    def test_cs_inquiry_catchup_is_one_shot_with_safe_misfire_policy(self):
+        """시작 catch-up은 DateTrigger(재시작당 1회), misfire_grace_time=None(add_job~start 사이
+        지연으로 건너뛰어지지 않음), coalesce=True, max_instances=1 - 실패해도 자체 재시도는 없고
+        다음 15분 정기 실행이 이어받는다."""
+        scheduler = build_scheduler()
+        job = scheduler.get_job("cs_inquiry_catchup")
+        assert job is not None
+        assert isinstance(job.trigger, DateTrigger)
+        assert job.misfire_grace_time is None
+        assert job.coalesce is True
+        assert job.max_instances == 1
+
+    def test_periodic_cs_inquiry_sync_registration_is_unchanged(self):
+        scheduler = build_scheduler()
+        job = scheduler.get_job("cs_inquiry_sync")
+        assert job is not None
+        assert isinstance(job.trigger, IntervalTrigger)
+        assert job.trigger.interval.total_seconds() == 15 * 60
+        assert job.max_instances == 1
 
     def test_existing_backup_cron_trigger_and_id_are_unchanged(self):
         """cron 스케줄 자체(매일 03:00 UTC)와 job id는 이전과 동일하다 - 이번
