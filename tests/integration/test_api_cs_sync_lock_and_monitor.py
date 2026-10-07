@@ -51,6 +51,9 @@ class TestManualSyncSharesTheAutomaticRunLock:
         assert resp.json()["reason_code"] == "ALREADY_RUNNING"
         connector.fetch_inquiries.assert_not_called()
         connector.fetch_product_inquiries.assert_not_called()
+        # 두 번째 잠금(PR)은 잡았다가 첫 번째(CC)가 막혀 거절됐다 - PR 잠금이 남아 있으면 안 된다.
+        with cs_sync_source_lock(seed_data["platform_id"], PR, api_engine) as pr_free:
+            assert pr_free is True
 
     def test_single_source_sync_is_rejected_when_that_source_is_running(
         self, client, auth_headers, seed_data, api_engine

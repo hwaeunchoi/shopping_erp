@@ -130,6 +130,10 @@ def _run_scenario(sandbox: dict, scenario: str, timeout: int = 120) -> dict[str,
             "-e",
             f"CSLOCK_SCENARIO={scenario}",
             "-e",
+            f"JWT_SECRET_KEY=cslock-test-jwt-{uuid.uuid4().hex}{uuid.uuid4().hex}",
+            "-e",
+            f"CREDENTIAL_ENCRYPTION_KEY=cslock-test-cred-{uuid.uuid4().hex}{uuid.uuid4().hex}",
+            "-e",
             "MSYS_NO_PATHCONV=1",
             RUNNER_IMAGE,
             "python",
@@ -172,6 +176,7 @@ class TestConcurrentCatchupRuns:
 
         assert p["a"]["exception"] is None, p
         assert p["b"]["exception"] is None, p
+        assert p["attempts"] == 4, p  # 두 worker x 두 source의 잠금 시도가 모두 fetch 전에 끝났다(결정적 겹침)
         for source in ("COUPANG_CALL_CENTER", "COUPANG_PRODUCT_INQUIRY"):
             statuses = sorted([p["a"]["by_source"][source], p["b"]["by_source"][source]])
             assert statuses == ["ALREADY_RUNNING", "SUCCESS"], (source, p)
@@ -203,3 +208,19 @@ class TestManualSyncVersusAutomaticRun:
         assert p["manual_all_acquired"] is False, p
         assert p["manual_acquired_per_source"] == [False, False], p
         assert p["manual_all_acquired_after_auto_finished"] is True, p
+
+
+class TestSegmentCommitAtomicityOnPostgres:
+    def test_commit_failure_leaves_no_partial_state_and_rerun_converges(self, pg_sandbox):
+        p = _run_scenario(pg_sandbox, "atomic_segment_commit_failure")
+
+        # 첫 구간(콜센터)의 commit이 실패 -> 그 source의 case/history/checkpoint는 하나도 남지 않는다.
+        assert p["first_by_source"]["COUPANG_CALL_CENTER"] == "FAILED", p
+        assert p["first_reason_codes"]["COUPANG_CALL_CENTER"] == "COMMIT_FAILED:RuntimeError", p
+        # 다른 source(상품별)는 영향 없이 정상 commit - case 1, history 1, checkpoint 1.
+        assert p["first_by_source"]["COUPANG_PRODUCT_INQUIRY"] == "SUCCESS", p
+        assert p["after_first"] == {"cases": 1, "history": 1, "success_checkpoints": 1}, p
+        # 재실행하면 실패했던 source도 따라와 source마다 정확히 1건(중복 없음)으로 수렴한다.
+        assert p["second_status"] == "SUCCESS", p
+        assert p["after_second"]["cases"] == 2, p
+        assert p["after_second"]["success_checkpoints"] == 2, p

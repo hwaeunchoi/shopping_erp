@@ -181,3 +181,47 @@ class TestSchedulerJobRegistration:
         assert job is not None
         assert isinstance(job.trigger, IntervalTrigger)
         assert job.trigger.interval.total_seconds() == 42 * 60
+
+
+class TestStaleRecoveryStartupHook:
+    def test_every_scheduler_job_id_matches_the_target_name_written_to_task_history(self):
+        """stale 정리의 대상 목록은 등록된 job id에서 만든다 - job id와 _run_job이 이력에 남기는 target 이름이
+        다르면 그 작업의 잔존 RUNNING 행이 영영 정리되지 않으므로 둘이 같음을 고정한다."""
+        import re
+        from pathlib import Path
+
+        source = Path(__file__).resolve().parents[2].joinpath("scheduler", "scheduler.py").read_text(encoding="utf-8")
+        run_job_names = set(re.findall(r'_run_job\(\s*"([a-z_]+)"', source))
+        job_ids = {job.id for job in build_scheduler().get_jobs()}
+        assert job_ids == run_job_names
+
+    def test_recovery_failure_never_blocks_scheduler_startup(self, monkeypatch):
+        from scheduler import scheduler as scheduler_module
+
+        def _boom():
+            raise RuntimeError("synthetic DB outage")
+
+        monkeypatch.setattr(scheduler_module, "session_scope", _boom)
+        scheduler_module.recover_stale_running_tasks_on_start()  # 예외 없이 반환해야 한다
+
+    def test_recovery_is_called_with_all_registered_job_ids(self, monkeypatch):
+        from contextlib import contextmanager
+
+        from scheduler import scheduler as scheduler_module
+
+        captured: dict = {}
+
+        @contextmanager
+        def _scope():
+            yield "fake-session"
+
+        def _recover(db, targets):
+            captured["db"] = db
+            captured["targets"] = set(targets)
+
+        monkeypatch.setattr(scheduler_module, "session_scope", _scope)
+        monkeypatch.setattr(scheduler_module, "recover_stale_running_tasks", _recover)
+        scheduler_module.recover_stale_running_tasks_on_start()
+
+        assert captured["db"] == "fake-session"
+        assert captured["targets"] == {job.id for job in build_scheduler().get_jobs()}

@@ -24,12 +24,11 @@ import json
 import os
 import sys
 import threading
-import time
 import uuid
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator, Optional
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -42,12 +41,13 @@ scenario = os.environ["CSLOCK_SCENARIO"]
 
 os.environ["DATABASE_URL"] = f"postgresql+psycopg://{db_user}:{db_password}@{db_host}:5432/{db_name}"
 
-from sqlalchemy import func, select, text  # noqa: E402
+from sqlalchemy import event, func, select, text  # noqa: E402
+from sqlalchemy.orm import Session  # noqa: E402
 
 from config.settings import settings  # noqa: E402
 from core.database import SessionLocal, engine  # noqa: E402
 from models import Base  # noqa: E402
-from models.cs_case import CsCase  # noqa: E402
+from models.cs_case import CsCase, CsCaseHistory  # noqa: E402
 from models.extra import IntegrationStatus, TaskExecutionHistory  # noqa: E402
 from models.platform import Platform  # noqa: E402
 from services.cs_inquiry_catchup_service import CsInquiryCatchupService  # noqa: E402
@@ -77,14 +77,16 @@ def _make_platform() -> int:
     return platform_id
 
 
-class _SlowConnector:
-    """fetch마다 sleep_s초 머문다 - 다른 worker가 잠금을 시도할 시간 동안 잠금이 유지되도록."""
+class _GatedConnector:
+    """fetch는 gate Event가 열릴 때까지 머문다 - 시간(sleep)이 아니라 "다른 worker가 잠금 시도를 끝냈다"는
+    사건으로 겹침을 보장한다(타이밍에 의존하지 않는 결정적 시나리오). gate가 None이면 바로 반환한다."""
 
     supports_inquiry_sync = True
     supports_product_inquiry_sync = True
 
-    def __init__(self, sleep_s: float) -> None:
-        self.sleep_s = sleep_s
+    def __init__(self, gate: Optional[threading.Event], on_fetch: Optional[threading.Event] = None) -> None:
+        self.gate = gate
+        self.on_fetch = on_fetch
         self.calls: list[str] = []
 
     def _item(self, inquiry_id: str) -> dict[str, Any]:
@@ -98,16 +100,22 @@ class _SlowConnector:
             "customer_phone": None,
         }
 
+    def _wait(self) -> None:
+        if self.on_fetch is not None:
+            self.on_fetch.set()
+        if self.gate is not None and not self.gate.wait(timeout=30):
+            raise RuntimeError("gate timeout")
+
     def fetch_inquiries(self, start_date, end_date, *, max_pages=None, max_retries=None, request_budget=None):
         self.calls.append(CC)
         request_budget.consume("coupang")
-        time.sleep(self.sleep_s)
+        self._wait()
         return [self._item("LOCK-CC-1")]
 
     def fetch_product_inquiries(self, start_date, end_date, *, max_pages=None, max_retries=None, request_budget=None):
         self.calls.append(PR)
         request_budget.consume("coupang")
-        time.sleep(self.sleep_s)
+        self._wait()
         return [self._item("LOCK-PR-1")]
 
 
@@ -146,11 +154,13 @@ def scenario_lock_contention() -> dict:
     return {"scenario": "lock_contention", **result}
 
 
-def _sync_worker(pid: int, barrier: threading.Barrier, out: dict, key: str) -> None:
+def _sync_worker(
+    pid: int, barrier: threading.Barrier, gate: threading.Event, lock_factory: Any, out: dict, key: str
+) -> None:
     session = SessionLocal()
     try:
-        connector = _SlowConnector(sleep_s=1.5)
-        service = CsInquiryCatchupService(session)
+        connector = _GatedConnector(gate)
+        service = CsInquiryCatchupService(session, lock_factory=lock_factory)
         barrier.wait(timeout=15)
         res = service.sync_platform(connector, pid)
         out[key] = {
@@ -168,15 +178,28 @@ def _sync_worker(pid: int, barrier: threading.Barrier, out: dict, key: str) -> N
 def scenario_concurrent_sync_platform() -> dict:
     pid = _make_platform()
     barrier = threading.Barrier(2)
+    gate = threading.Event()
+    guard = threading.Lock()
+    attempts = {"n": 0}
+
+    @contextmanager
+    def counting_lock(platform_id: int, source: str) -> Iterator[bool]:
+        with cs_sync_source_lock(platform_id, source, engine) as acquired:
+            with guard:
+                attempts["n"] += 1
+                if attempts["n"] >= 4:  # 두 worker가 두 source의 잠금 시도를 모두 끝냈다 -> fetch 진행 허용
+                    gate.set()
+            yield acquired
+
     out: dict[str, Any] = {}
     threads = [
-        threading.Thread(target=_sync_worker, args=(pid, barrier, out, "a")),
-        threading.Thread(target=_sync_worker, args=(pid, barrier, out, "b")),
+        threading.Thread(target=_sync_worker, args=(pid, barrier, gate, counting_lock, out, "a")),
+        threading.Thread(target=_sync_worker, args=(pid, barrier, gate, counting_lock, out, "b")),
     ]
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=60)
+        t.join(timeout=90)
 
     check = SessionLocal()
     case_counts: dict[str, int] = {
@@ -200,6 +223,7 @@ def scenario_concurrent_sync_platform() -> dict:
         "scenario": "concurrent_sync_platform",
         "a": out.get("a"),
         "b": out.get("b"),
+        "attempts": attempts["n"],
         "case_counts": case_counts,
         "checkpoint_codes": sorted(code for code, _ in checkpoint_rows),
         "checkpoints_all_have_progress": all(ts is not None for _, ts in checkpoint_rows),
@@ -253,29 +277,27 @@ def scenario_stale_probe_sees_real_lock() -> dict:
 def scenario_manual_vs_running_sync() -> dict:
     pid = _make_platform()
     started = threading.Event()
+    release = threading.Event()
     out: dict[str, Any] = {}
-
-    class _Signalling(_SlowConnector):
-        def fetch_inquiries(self, *a, **k):
-            started.set()
-            return super().fetch_inquiries(*a, **k)
 
     def _auto() -> None:
         session = SessionLocal()
         try:
-            out["auto"] = CsInquiryCatchupService(session).sync_platform(_Signalling(sleep_s=2.0), pid)["status"]
+            connector = _GatedConnector(release, on_fetch=started)
+            out["auto"] = CsInquiryCatchupService(session).sync_platform(connector, pid)["status"]
         finally:
             session.close()
 
     t = threading.Thread(target=_auto)
     t.start()
-    started.wait(timeout=15)
+    started.wait(timeout=30)
 
     # API 수동 sync와 같은 방식: 두 source 잠금을 모두 잡아야만 진행한다.
     with ExitStack() as stack:
         acquired = [stack.enter_context(cs_sync_source_lock(pid, s, engine)) for s in (CC, PR)]
     out["manual_all_acquired"] = all(acquired)
     out["manual_acquired_per_source"] = acquired
+    release.set()
     t.join(timeout=60)
 
     with ExitStack() as stack:
@@ -284,11 +306,75 @@ def scenario_manual_vs_running_sync() -> dict:
     return {"scenario": "manual_vs_running_sync", **out}
 
 
+def _durable_counts(pid: int) -> dict[str, int]:
+    """새 커넥션에서 보이는(= 커밋된) 값만 센다."""
+    check = SessionLocal()
+    try:
+        return {
+            "cases": int(
+                check.execute(select(func.count()).select_from(CsCase).where(CsCase.platform_id == pid)).scalar_one()
+            ),
+            "history": int(
+                check.execute(
+                    select(func.count())
+                    .select_from(CsCaseHistory)
+                    .join(CsCase, CsCase.id == CsCaseHistory.case_id)
+                    .where(CsCase.platform_id == pid)
+                ).scalar_one()
+            ),
+            "success_checkpoints": int(
+                check.execute(
+                    select(func.count())
+                    .select_from(IntegrationStatus)
+                    .where(
+                        IntegrationStatus.integration_type == "CS_CHECKPOINT",
+                        IntegrationStatus.integration_code.like(f"{pid}:%"),
+                        IntegrationStatus.last_success_at.is_not(None),
+                    )
+                ).scalar_one()
+            ),
+        }
+    finally:
+        check.close()
+
+
+def scenario_atomic_segment_commit_failure() -> dict:
+    """실제 PostgreSQL에서 구간 commit이 실패하면 case/history/checkpoint가 모두 반영되지 않고, 이어서 성공한
+    다음 실행에서 source마다 정확히 1건으로 수렴한다(commit 직전 실패 = 부분 반영 없음)."""
+    pid = _make_platform()
+    session = SessionLocal()
+    state = {"fail_once": True}
+
+    @event.listens_for(session, "before_commit")
+    def _fail_first_commit(_session: Session) -> None:
+        # SAVEPOINT release(중첩 트랜잭션)에서도 before_commit이 호출되므로, 최상위 트랜잭션 commit에만 주입한다.
+        if state["fail_once"] and not _session.in_nested_transaction():
+            state["fail_once"] = False
+            raise RuntimeError("synthetic commit failure")
+
+    service = CsInquiryCatchupService(session)
+    first = service.sync_platform(_GatedConnector(None), pid)
+    after_first = _durable_counts(pid)
+
+    second = service.sync_platform(_GatedConnector(None), pid)
+    after_second = _durable_counts(pid)
+    session.close()
+    return {
+        "scenario": "atomic_segment_commit_failure",
+        "first_by_source": {s: v["status"] for s, v in first["by_source"].items()},
+        "first_reason_codes": {s: v.get("reason_code") for s, v in first["by_source"].items()},
+        "after_first": after_first,
+        "second_status": second["status"],
+        "after_second": after_second,
+    }
+
+
 SCENARIOS = {
     "lock_contention": scenario_lock_contention,
     "concurrent_sync_platform": scenario_concurrent_sync_platform,
     "stale_probe_sees_real_lock": scenario_stale_probe_sees_real_lock,
     "manual_vs_running_sync": scenario_manual_vs_running_sync,
+    "atomic_segment_commit_failure": scenario_atomic_segment_commit_failure,
 }
 
 

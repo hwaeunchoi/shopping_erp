@@ -24,7 +24,7 @@ CS 문의 동기화(자동 15분 실행 / 재시작 직후 catch-up / 수동 syn
 import logging
 import threading
 from contextlib import contextmanager
-from typing import Iterator, Optional, Union
+from typing import Iterator, Union
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
@@ -53,22 +53,13 @@ def lock_object_id(platform_id: int, source: str) -> int:
     return platform_id * _SOURCE_STRIDE + _SOURCE_INDEX[source]
 
 
-def _default_engine() -> Engine:
-    # 지연 import - 이 모듈을 import만 해서는 DB 엔진을 만들지 않는다.
-    from core.database import engine
-
-    return engine
-
-
 @contextmanager
-def cs_sync_source_lock(
-    platform_id: int, source: str, engine: Optional[Union[Engine, Connection]] = None
-) -> Iterator[bool]:
+def cs_sync_source_lock(platform_id: int, source: str, engine: Union[Engine, Connection]) -> Iterator[bool]:
     """(platform_id, source) 잠금을 논블로킹으로 시도한다. `with ... as acquired:`에서
     acquired가 True일 때만 외부 호출/DB 쓰기를 해야 한다."""
     objid = lock_object_id(platform_id, source)
     # Session.get_bind()는 Engine 또는 Connection일 수 있다 - 항상 Engine으로 정규화한다.
-    eng = (engine if engine is not None else _default_engine()).engine
+    eng = engine.engine
 
     if eng.dialect.name != "postgresql":
         with _local_registry_guard:
@@ -105,7 +96,7 @@ def cs_sync_source_lock(
         conn.close()
 
 
-def is_cs_sync_lock_held(platform_id: int, source: str, engine: Optional[Union[Engine, Connection]] = None) -> bool:
+def is_cs_sync_lock_held(platform_id: int, source: str, engine: Union[Engine, Connection]) -> bool:
     """잠금을 실제로 잡아 보지 않고 "지금 누가 들고 있는가"만 확인한다(잡았다면 즉시 놓는다).
     stale 작업 정리가 "실제 활성 실행"을 건드리지 않도록 판단하는 용도다."""
     with cs_sync_source_lock(platform_id, source, engine) as acquired:

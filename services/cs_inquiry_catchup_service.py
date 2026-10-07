@@ -36,10 +36,14 @@ settings의 max_pages_per_query(3)·max_retries_per_page(2)·max_requests_per_ru
 콜센터 = 상태 4 x 3페이지 x (1+2) = 36, 상품별 = 1 x 3 x 3 = 9 (합 45 = 예산). 구간을 시작하기
 전에 남은 예산이 그 구간의 최악 요청 수 이상일 때만 시작한다 - 부족하면 남은 구간은 다음
 15분 실행으로 넘긴다(구간을 시작해 놓고 중간에 예산이 끊겨 버리는 낭비를 없앤다).
-source는 번갈아(라운드 로빈) 처리해 한 source가 예산을 독점하지 못한다. 시작 조건이 최악 요청 수
-기준이라 보수적이다: 기본 설정에서 구간당 실제 비용이 가장 작아도(콜센터 4 + 상품별 1) 한 실행에서
-콜센터 구간은 2개까지(사용 10 -> 남은 35 < 36), 상품별 구간은 그보다 많이 시작된다. 남은 구간은
-15분 뒤 실행이 이어받는다(예: 20일 공백 = 구간 3개 -> 콜센터 2개 + 다음 실행에서 1개).
+source는 checkpoint가 더 뒤처진 쪽부터 번갈아(라운드 로빈) 처리해 한 source가 예산을 독점하지 못한다(기본
+설정에서 두 source 모두 backlog가 있으면 매 실행마다 각자 최소 1구간씩 전진한다). 시작 조건이 최악 요청
+수 기준이라 보수적이며, 한 실행에서 처리되는 구간 수는 실제 비용과 상대 source의 backlog에 따라 다르다
+(20일 공백 = 구간 3개 기준 시뮬레이션 - docs/COMMERCIAL_ERP_ROADMAP.md 표 참고):
+- 최소 비용(콜센터 4/상품별 1), 양쪽 backlog: 콜센터 2구간·상품별 3구간 -> 따라잡는 데 2회 실행.
+- 최소 비용, 콜센터만 backlog: 콜센터 3구간(상품별은 오늘 구간 1개) -> 1회 실행.
+- 최악 비용(36/9): 각 source 1구간씩 -> 3회 실행.
+구간당 최악 요청 수가 실행당 예산보다 크면(설정 오류) BUDGET_TOO_SMALL로 드러낸다.
 예산 초과(REQUEST_BUDGET_EXCEEDED)/페이지 초과(PAGE_LIMIT_EXCEEDED)로 실패한 구간은 DB에
 아무것도 쓰지 않고 checkpoint도 옮기지 않는다.
 
@@ -215,8 +219,9 @@ class CsSyncCheckpointRepository:
 
 
 class _SourceState:
-    def __init__(self, source: str, segments: list[tuple[date, date]]) -> None:
+    def __init__(self, source: str, segments: list[tuple[date, date]], covered: Optional[datetime] = None) -> None:
         self.source = source
+        self.covered = covered  # 이 실행 시작 시점의 checkpoint(라운드 로빈 순서 결정용)
         self.pending = list(segments)
         self.done = 0
         self.created = 0
@@ -247,7 +252,7 @@ class CsInquiryCatchupService:
         session: Any,
         *,
         lock_factory: Optional[LockFactory] = None,
-        now_fn: Callable[[], datetime] = _utcnow_naive,
+        now_fn: Optional[Callable[[], datetime]] = None,
     ) -> None:
         self.session = session
         # 기본 잠금은 이 세션이 바인딩된 엔진으로 건다 - 데이터를 쓰는 DB와 잠금을 거는 DB가 항상 같다.
@@ -256,7 +261,8 @@ class CsInquiryCatchupService:
             if lock_factory is not None
             else (lambda platform_id, source: cs_sync_source_lock(platform_id, source, session.get_bind()))
         )
-        self.now_fn = now_fn
+        # 기본 시계는 호출 시점에 모듈의 _utcnow_naive를 조회한다(테스트가 모듈 단위로 시계를 고정할 수 있게).
+        self.now_fn: Callable[[], datetime] = now_fn if now_fn is not None else (lambda: _utcnow_naive())
         self.sync_service = CsChannelSyncService(session)
         self.checkpoints = CsSyncCheckpointRepository(session)
 
@@ -278,28 +284,39 @@ class CsInquiryCatchupService:
         now = self.now_fn()
         budget = RequestBudget(max_requests=settings.cs_inquiry_sync_max_requests_per_run)
         by_source: dict[str, dict[str, Any]] = {}
-        states: dict[str, _SourceState] = {}
+        supported: list[str] = []
 
         for source in _INQUIRY_SOURCES:
             capability_attr = _INQUIRY_SOURCES[source][0]
-            if not getattr(connector, capability_attr, False):
+            if getattr(connector, capability_attr, False):
+                supported.append(source)
+            else:
                 by_source[source] = {"status": "UNSUPPORTED", "created": 0, "updated": 0, "failed": 0}
-                continue
-            states[source] = _SourceState(
-                source, plan_segments(self.checkpoints.get_covered_until(platform_id, source), now)
-            )
 
+        states: dict[str, _SourceState] = {}
         with ExitStack() as stack:
-            for source, state in states.items():
+            # 잠금은 항상 고정 순서(_INQUIRY_SOURCES)로 논블로킹 시도한다(대기하지 않으므로 교착 없음).
+            # 구간 계획은 잠금을 얻은 "뒤에" checkpoint를 새로 읽어 만든다 - 앞선 실행이 방금 끝낸 진행
+            # 위치를 놓치고 이미 처리한 구간을 다시 요청하지 않도록.
+            for source in supported:
                 acquired = stack.enter_context(self.lock_factory(platform_id, source))
                 if not acquired:
-                    state.stopped = True
-                    state.status = "ALREADY_RUNNING"
-                    state.reason_code = "ALREADY_RUNNING"
+                    blocked = _SourceState(source, [])
+                    blocked.stopped = True
+                    blocked.status = "ALREADY_RUNNING"
+                    blocked.reason_code = "ALREADY_RUNNING"
+                    states[source] = blocked
                     logger.info(
                         "CS 문의 동기화가 이미 실행 중이라 건너뜁니다: platform_id=%s source=%s", platform_id, source
                     )
-            self._run_rounds(connector, platform_id, now, budget, states)
+                    continue
+                covered = self.checkpoints.get_covered_until(platform_id, source)
+                states[source] = _SourceState(source, plan_segments(covered, now), covered)
+
+            # 예산 라운드 로빈은 checkpoint가 더 뒤처진 source(없으면 가장 먼저)부터 돈다 - 한 source가
+            # 계속 먼저 예산을 가져가 다른 source가 굶는 일을 막는다. 잠금 순서와는 무관하다.
+            ordered = dict(sorted(states.items(), key=lambda kv: (kv[1].covered is not None, kv[1].covered or now)))
+            self._run_rounds(connector, platform_id, now, budget, ordered)
 
         for source, state in states.items():
             by_source[source] = state.result()
@@ -314,8 +331,14 @@ class CsInquiryCatchupService:
             for source, state in states.items():
                 if state.stopped or not state.pending:
                     continue
+                worst = worst_case_requests(source)
+                if worst > budget.max_requests:
+                    # 설정 오류(구간 1개의 최악 요청 수가 실행당 예산보다 큼) - 조용히 영원히 미루지 않고
+                    # 안전한 오류 코드로 드러낸다.
+                    self._fail(state, platform_id, "BUDGET_TOO_SMALL", commit_data=False)
+                    continue
                 remaining = budget.max_requests - budget.used
-                if remaining < worst_case_requests(source):
+                if remaining < worst:
                     # 구간을 시작하지 않는다 - 남은 구간은 다음 실행에서 이어간다.
                     state.stopped = True
                     if state.done == 0:
@@ -352,8 +375,22 @@ class CsInquiryCatchupService:
         status = result.get("status")
         failed = int(result.get("failed", 0))
         if status == "SUCCESS" and failed == 0:
-            self.checkpoints.advance(platform_id, source, covered_until_after(seg_end, now))
-            self.session.commit()
+            try:
+                # 데이터(case/history)와 checkpoint를 같은 트랜잭션에서 한 번에 commit한다 - 중간에 어떤
+                # 함수도 commit하지 않는다(sync_inquiries는 SAVEPOINT만 쓴다). commit이 실패하면 둘 다
+                # 롤백돼 checkpoint만 전진하거나 데이터만 남는 일이 없다.
+                self.checkpoints.advance(platform_id, source, covered_until_after(seg_end, now))
+                self.session.commit()
+            except Exception as exc:  # noqa: BLE001 - 이 source만 실패 처리하고 다른 source는 계속
+                self.session.rollback()
+                self._fail(state, platform_id, f"COMMIT_FAILED:{type(exc).__name__}", commit_data=False)
+                logger.warning(
+                    "CS 문의 동기화 commit 실패: platform_id=%s source=%s type=%s",
+                    platform_id,
+                    source,
+                    type(exc).__name__,
+                )
+                return
             state.pending.pop(0)
             state.done += 1
             state.created += int(result.get("created", 0))

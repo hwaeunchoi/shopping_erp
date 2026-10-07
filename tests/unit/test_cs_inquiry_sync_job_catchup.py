@@ -7,7 +7,7 @@ scheduler.jobs.cs_inquiry_sync_job의 15분 정기 실행(run)·시작 직후 ca
 """
 
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
@@ -16,11 +16,14 @@ from config.settings import settings
 from repositories.cs_case_repository import CsCaseRepository
 from repositories.extra_repository import IntegrationStatusRepository
 from scheduler.jobs import cs_inquiry_sync_job
+from services import cs_inquiry_catchup_service
 from services.cs_channel_sync_service import COUPANG_CALL_CENTER_SOURCE, COUPANG_PRODUCT_INQUIRY_SOURCE
 from services.cs_inquiry_catchup_service import CsSyncCheckpointRepository
 from services.cs_sync_lock import cs_sync_source_lock
 
 CC = COUPANG_CALL_CENTER_SOURCE
+# 시계를 고정한다(KST 2026-10-07 10:00) - 날짜 경계/실행 순서에 따라 결과가 달라지지 않도록.
+FIXED_NOW = datetime(2026, 10, 7, 1, 0, 0)
 PR = COUPANG_PRODUCT_INQUIRY_SOURCE
 
 
@@ -38,7 +41,7 @@ class _Connector:
             {
                 "platform_inquiry_id": "c-1",
                 "content": "문의",
-                "inquiry_at": datetime.now(timezone.utc).replace(tzinfo=None),
+                "inquiry_at": FIXED_NOW,
                 "raw_status": "progress:requestAnswer",
                 "needs_answer": True,
                 "platform_order_no": None,
@@ -58,6 +61,7 @@ def wired(monkeypatch, db_session, platform):
     monkeypatch.setattr(settings, "cs_inquiry_sync_enabled", True)
     monkeypatch.setattr(settings, "cs_inquiry_sync_window_days", 1)
     db_session.commit()  # fixture가 flush만 한 platform 행을 보존한다
+    monkeypatch.setattr(cs_inquiry_catchup_service, "_utcnow_naive", lambda: FIXED_NOW)
 
     @contextmanager
     def _scope():
@@ -113,7 +117,7 @@ class TestPeriodicRun:
 
 class TestStartupCatchup:
     def test_runs_exactly_once_when_period_is_unprocessed_then_skips_up_to_date(self, wired, db_session, platform):
-        three_days_ago = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=3)
+        three_days_ago = FIXED_NOW - timedelta(days=3)
         for source in (CC, PR):
             CsSyncCheckpointRepository(db_session).advance(platform.id, source, three_days_ago)
         db_session.commit()

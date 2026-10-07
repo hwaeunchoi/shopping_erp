@@ -734,3 +734,334 @@ class TestStartupUpToDateCheck:
         for source in SOURCES:
             _seed_checkpoint(db_session, platform.id, source, kst_to_utc(2026, 10, 6, 23, 55))
         assert _service(db_session, engine, just_after_midnight).is_up_to_date(platform.id, list(SOURCES)) is False
+
+
+# ---------------------------------------------------------------------------
+# 감사 보강: 날짜 의미·계획 시점·commit 격리·부분실패·예산 설정 오류·source 순서
+# ---------------------------------------------------------------------------
+
+
+class TestCheckpointSemantics:
+    def test_checkpoint_is_never_in_the_future(self):
+        """어떤 구간 끝(과거~오늘)에 대해서도 covered_until은 실행 시작 시각을 넘지 않는다."""
+        for offset in range(0, 30):
+            seg_end = TODAY - timedelta(days=offset)
+            assert covered_until_after(seg_end, NOW) <= NOW
+
+    def test_past_segment_checkpoint_is_exactly_start_of_next_kst_day_so_next_plan_has_no_gap_or_overlap(self):
+        seg_end = date(2026, 10, 3)
+        covered = covered_until_after(seg_end, NOW)
+        assert kst_date(covered) == date(2026, 10, 4)
+        assert plan_segments(covered, NOW)[0][0] == date(2026, 10, 4)
+
+    def test_sunday_last_success_then_monday_run_includes_sunday_again(self):
+        sunday_evening = kst_to_utc(2026, 10, 4, 17, 0)  # 일
+        monday = kst_to_utc(2026, 10, 5, 9, 0)  # 월
+        assert plan_segments(sunday_evening, monday) == [(date(2026, 10, 4), date(2026, 10, 5))]
+
+    def test_ten_oclock_success_then_ten_fifteen_run_requeries_today(self):
+        assert plan_segments(NOW, NOW + timedelta(minutes=15)) == [(TODAY, TODAY)]
+
+    def test_platform_id_boundary_for_checkpoint_key(self):
+        assert len(checkpoint_code(999_999, PR)) == 30  # 가장 긴 source로 정확히 30자
+        with pytest.raises(ValueError):
+            checkpoint_code(1_000_000, PR)  # 31자 - 조용히 자르지 않고 거부
+
+
+class TestPlanningHappensAfterTheLock:
+    def test_checkpoint_is_read_only_while_the_source_lock_is_held(self, db_session, engine, platform, monkeypatch):
+        """앞선 실행이 방금 끝낸 진행 위치를 놓치지 않도록, 구간 계획용 checkpoint 읽기는 잠금을 얻은 뒤여야 한다."""
+        service = _service(db_session, engine)
+        seen: dict[str, bool] = {}
+        original = service.checkpoints.get_covered_until
+
+        def _spy(platform_id: int, source: str):
+            with cs_sync_source_lock(platform_id, source, engine) as acquired:
+                seen[source] = acquired is False  # 우리가 이미 들고 있으면 다시 못 잡는다
+            return original(platform_id, source)
+
+        monkeypatch.setattr(service.checkpoints, "get_covered_until", _spy)
+        service.sync_platform(_Connector(), platform.id)
+
+        assert seen == {CC: True, PR: True}
+
+
+class _ByCallConnector(_Connector):
+    """콜센터 호출 순번별로 항목/오류를 정한다(구간 1은 성공, 구간 2는 실패 같은 시나리오)."""
+
+    def __init__(self, cc_plan: list[Any], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.cc_plan = cc_plan
+
+    def fetch_inquiries(self, start_date, end_date, *, max_pages=None, max_retries=None, request_budget=None):
+        idx = len([c for c in self.calls if c[0] == CC])
+        outcome = self.cc_plan[idx] if idx < len(self.cc_plan) else []
+        self.calls.append((CC, start_date, end_date))
+        self.budgets.append(request_budget)
+        self._spend(request_budget, self.cost_cc)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+class TestPartialProgressAcrossChunks:
+    def test_first_chunk_committed_second_chunk_fails_checkpoint_stays_at_end_of_first(
+        self, db_session, engine, platform
+    ):
+        start = kst_to_utc(2026, 9, 17, 0, 0)
+        _seed_checkpoint(db_session, platform.id, CC, start)
+        connector = _ByCallConnector(
+            [[_item("c1")], MarketplaceExternalAPIError("coupang", "SERVER_ERROR", True, http_status=500)]
+        )
+
+        result = _service(db_session, engine).sync_platform(connector, platform.id)
+
+        repo = CsCaseRepository(db_session)
+        assert repo.get_by_external(platform.id, CC, "c1") is not None  # 구간 1 데이터는 보존
+        assert _covered(db_session, platform.id, CC) == kst_to_utc(2026, 9, 24, 0, 0)  # 구간 1 끝
+        assert result["by_source"][CC]["status"] == "PARTIAL_SUCCESS"
+        assert result["by_source"][CC]["segments_done"] == 1
+        assert result["by_source"][CC]["segments_pending"] == 2
+        assert connector.calls_for(CC) == [
+            (date(2026, 9, 17), date(2026, 9, 23)),
+            (date(2026, 9, 24), date(2026, 9, 30)),
+        ]  # 실패한 구간 뒤 구간은 시도하지 않는다
+
+    def test_real_savepoint_item_failure_keeps_other_items_but_does_not_advance(
+        self, db_session, engine, platform, monkeypatch
+    ):
+        """항목 하나의 저장이 DB 오류로 실패(SAVEPOINT 롤백)하면 failed>0 - 나머지 항목은 멱등 보존, checkpoint 불변."""
+        from sqlalchemy.exc import IntegrityError
+
+        db_session.commit()
+        old = kst_to_utc(2026, 10, 7, 9, 0)
+        _seed_checkpoint(db_session, platform.id, CC, old)
+        original_add = CsCaseRepository.add
+
+        def _add(self, case):
+            if case.external_inquiry_id == "bad":
+                raise IntegrityError("INSERT", {}, Exception("synthetic"))
+            return original_add(self, case)
+
+        monkeypatch.setattr(CsCaseRepository, "add", _add)
+        connector = _Connector(cc_items=[_item("good"), _item("bad")])
+
+        result = _service(db_session, engine).sync_platform(connector, platform.id)
+
+        assert result["by_source"][CC]["status"] == "PARTIAL_SUCCESS"
+        assert result["by_source"][CC]["failed"] == 1
+        assert CsCaseRepository(db_session).get_by_external(platform.id, CC, "good") is not None
+        assert _covered(db_session, platform.id, CC) == old  # 부분 실패면 전진하지 않는다
+
+
+@pytest.fixture()
+def sp_engine(tmp_path):
+    """SAVEPOINT가 실제 중첩 트랜잭션으로 동작하는 파일 기반 SQLite 엔진. pysqlite 기본 설정은 명시적 BEGIN
+    없이 만든 SAVEPOINT의 RELEASE를 실제 commit으로 만들어(SQLAlchemy 문서의 "pysqlite savepoint" 한계)
+    원자성/롤백 검증이 거짓 결과를 낸다 - 공식 우회(isolation_level=None + 명시적 BEGIN)를 적용한다. 파일
+    기반이라 다른 커넥션에서 "커밋된 것만 보이는지"도 검증할 수 있다. PostgreSQL에서의 같은 증명은
+    tests/integration/test_cs_sync_lock_pg.py(격리 컨테이너)가 한다."""
+    from sqlalchemy import create_engine, event
+
+    from models import Base
+
+    eng = create_engine(f"sqlite:///{tmp_path / 'sp.db'}", connect_args={"check_same_thread": False})
+
+    @event.listens_for(eng, "connect")
+    def _no_implicit_begin(dbapi_connection, _record):
+        dbapi_connection.isolation_level = None
+
+    @event.listens_for(eng, "begin")
+    def _explicit_begin(conn):
+        conn.exec_driver_sql("BEGIN")
+
+    Base.metadata.create_all(eng)
+    yield eng
+    eng.dispose()
+
+
+def _sp_writer(sp_engine):
+    from sqlalchemy.orm import sessionmaker
+
+    from models.platform import Platform
+
+    session = sessionmaker(bind=sp_engine, autoflush=False)()
+    platform = Platform(
+        code="atomic", name="a", connector_class="CoupangConnector", settlement_cycle_days=15, is_active=True
+    )
+    session.add(platform)
+    session.commit()
+    return session, platform.id
+
+
+class TestCommitFailureIsolation:
+    def test_checkpoint_write_failure_rolls_back_that_sources_data_and_other_source_continues(
+        self, sp_engine, monkeypatch
+    ):
+        session, pid = _sp_writer(sp_engine)
+        service = _service(session, sp_engine)
+        original = service.checkpoints.advance
+
+        def _advance(platform_id: int, source: str, covered_until: datetime) -> None:
+            if source == CC:
+                raise RuntimeError("synthetic checkpoint write failure")
+            original(platform_id, source, covered_until)
+
+        monkeypatch.setattr(service.checkpoints, "advance", _advance)
+
+        result = service.sync_platform(_Connector(cc_items=[_item("1")], pr_items=[_item("2")]), pid)
+
+        assert result["by_source"][CC]["status"] == "FAILED"
+        assert result["by_source"][CC]["reason_code"] == "COMMIT_FAILED:RuntimeError"
+        assert CsCaseRepository(session).get_by_external(pid, CC, "1") is None  # 데이터도 롤백
+        assert _covered(session, pid, CC) is None
+        assert result["by_source"][PR]["status"] == "SUCCESS"  # 다른 source는 계속
+        assert CsCaseRepository(session).get_by_external(pid, PR, "2") is not None
+        session.close()
+
+
+class TestTransactionAtomicityWithSeparateConnections:
+    """파일 기반 SQLite로 "다른 커넥션에서 보이는 것"을 검증한다(인메모리 SQLite는 커넥션을 공유해
+    미커밋 데이터가 보이므로 원자성 증명에 쓸 수 없다)."""
+
+    @pytest.fixture()
+    def file_engine(self, sp_engine):
+        return sp_engine
+
+    def _writer(self, file_engine):
+        return _sp_writer(file_engine)
+
+    def _visible_from_another_connection(self, file_engine, platform_id: int) -> tuple[int, Optional[datetime]]:
+        from sqlalchemy.orm import sessionmaker
+
+        other = sessionmaker(bind=file_engine)()
+        try:
+            cases = len(
+                [
+                    c
+                    for c in (
+                        CsCaseRepository(other).get_by_external(platform_id, CC, "1"),
+                        CsCaseRepository(other).get_by_external(platform_id, PR, "2"),
+                    )
+                    if c is not None
+                ]
+            )
+            return cases, CsSyncCheckpointRepository(other).get_covered_until(platform_id, CC)
+        finally:
+            other.close()
+
+    def test_success_makes_cases_and_checkpoint_visible_together(self, file_engine):
+        session, pid = self._writer(file_engine)
+        service = _service(session, file_engine)
+        service.sync_platform(_Connector(cc_items=[_item("1")], pr_items=[_item("2")]), pid)
+
+        cases, checkpoint = self._visible_from_another_connection(file_engine, pid)
+        assert cases == 2
+        assert checkpoint == NOW
+        session.close()
+
+    def test_commit_failure_leaves_neither_cases_nor_checkpoint_durable(self, file_engine, monkeypatch):
+        """case upsert와 checkpoint advance는 끝났지만 commit이 실패하면 둘 다 반영되지 않는다."""
+        session, pid = self._writer(file_engine)
+        service = _service(session, file_engine)
+        real_commit = session.commit
+        state = {"armed": True}
+
+        def _failing_commit():
+            if state["armed"]:
+                state["armed"] = False
+                raise RuntimeError("synthetic commit failure")
+            return real_commit()
+
+        monkeypatch.setattr(session, "commit", _failing_commit)
+        result = service.sync_platform(_Connector(cc_items=[_item("1")], pr_items=[_item("2")]), pid)
+
+        assert result["by_source"][CC]["status"] == "FAILED"
+        cases, checkpoint = self._visible_from_another_connection(file_engine, pid)
+        assert checkpoint is None
+        assert cases == 1  # 실패한 CC의 데이터는 없고, 이어서 성공한 PR 데이터만 있다
+        session.close()
+
+    def test_process_death_before_commit_means_rerun_converges_without_duplicates(self, file_engine, monkeypatch):
+        """commit 직전에 프로세스가 죽는 상황(BaseException) - 아무것도 남지 않고 잠금은 해제되며, 재실행하면
+        같은 구간을 다시 가져와 정확히 1건으로 수렴한다."""
+        from sqlalchemy.orm import sessionmaker
+
+        session, pid = self._writer(file_engine)
+        service = _service(session, file_engine)
+
+        def _die() -> None:
+            raise SystemExit("simulated process death")
+
+        monkeypatch.setattr(session, "commit", _die)
+        with pytest.raises(SystemExit):
+            service.sync_platform(_Connector(cc_items=[_item("1")]), pid)
+        session.close()  # 프로세스 종료 = 미커밋 트랜잭션 폐기
+        assert self._visible_from_another_connection(file_engine, pid) == (0, None)
+        with cs_sync_source_lock(pid, CC, file_engine) as acquired:
+            assert acquired is True  # 예외/종료 경로에서도 잠금이 해제됐다
+
+        rerun_session = sessionmaker(bind=file_engine, autoflush=False)()
+        _service(rerun_session, file_engine).sync_platform(_Connector(cc_items=[_item("1")]), pid)
+        rerun_session.close()
+        cases, checkpoint = self._visible_from_another_connection(file_engine, pid)
+        assert cases == 1
+        assert checkpoint == NOW
+
+
+class TestBudgetConfigurationAndSourceOrder:
+    def test_worst_case_larger_than_budget_is_reported_not_silently_deferred(
+        self, db_session, engine, platform, monkeypatch
+    ):
+        db_session.commit()
+        monkeypatch.setattr(settings, "cs_inquiry_sync_max_requests_per_run", 30)  # 콜센터 최악 36 > 30
+        connector = _Connector()
+
+        result = _service(db_session, engine).sync_platform(connector, platform.id)
+
+        assert result["by_source"][CC]["status"] == "FAILED"
+        assert result["by_source"][CC]["reason_code"] == "BUDGET_TOO_SMALL"
+        assert connector.calls_for(CC) == []  # 요청은 한 번도 보내지 않았다
+        assert result["by_source"][PR]["status"] == "SUCCESS"  # 최악 9 <= 30이라 상품별은 진행
+        record = IntegrationStatusRepository(db_session).get_by_type_and_code(
+            CHECKPOINT_INTEGRATION_TYPE, checkpoint_code(platform.id, CC)
+        )
+        assert record is not None
+        assert record.last_error_message == "BUDGET_TOO_SMALL"
+
+    def test_source_with_older_checkpoint_goes_first(self, db_session, engine, platform):
+        _seed_checkpoint(db_session, platform.id, CC, kst_to_utc(2026, 10, 7, 9, 30))  # 더 최신
+        _seed_checkpoint(db_session, platform.id, PR, kst_to_utc(2026, 10, 7, 8, 0))  # 더 뒤처짐
+        connector = _Connector()
+
+        _service(db_session, engine).sync_platform(connector, platform.id)
+
+        assert [src for src, _, _ in connector.calls][0] == PR
+
+    def test_source_without_checkpoint_goes_before_one_with_checkpoint(self, db_session, engine, platform):
+        _seed_checkpoint(db_session, platform.id, PR, kst_to_utc(2026, 10, 7, 8, 0))
+        connector = _Connector()
+
+        _service(db_session, engine).sync_platform(connector, platform.id)
+
+        assert [src for src, _, _ in connector.calls][0] == CC
+
+    def test_both_sources_with_backlog_each_advance_at_least_one_chunk_every_run_even_at_max_cost(
+        self, db_session, engine, platform
+    ):
+        gap = kst_to_utc(2026, 9, 17, 0, 0)
+        for source in (CC, PR):
+            _seed_checkpoint(db_session, platform.id, source, gap)
+        previous = {CC: gap, PR: gap}
+        for run in range(3):
+            service = _service(db_session, engine, NOW + timedelta(minutes=15 * run))
+            service.sync_platform(_Connector(cost_cc=36, cost_pr=9), platform.id)
+            for source in (CC, PR):
+                current = _covered(db_session, platform.id, source)
+                assert current is not None and current > previous[source], (run, source)
+                previous[source] = current
+
+    def test_checkpoint_rows_with_error_status_are_also_hidden_from_integration_listing(self, db_session, platform):
+        CsSyncCheckpointRepository(db_session).record_failure(platform.id, CC, "PAGE_LIMIT_EXCEEDED")
+        db_session.flush()
+        assert IntegrationStatusRepository(db_session).list_all_status() == []
