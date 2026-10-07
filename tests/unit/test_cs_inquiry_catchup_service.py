@@ -1127,3 +1127,142 @@ class TestNoPermanentStarvationWhenBudgetIsTight:
             for source in (CC, PR):
                 _seed_checkpoint(db_session, platform.id, source, kst_to_utc(2026, 10, 7, 9, 0))
         assert orders[0] == orders[1] == orders[2] == [CC, PR]
+
+
+class TestFailureRecordingIsResilientAndSafe:
+    def test_failure_to_record_a_failure_keeps_the_original_reason_and_other_sources_running(
+        self, db_session, engine, platform, monkeypatch
+    ):
+        db_session.commit()
+        service = _service(db_session, engine)
+
+        def _record_failure_is_broken(platform_id: int, source: str, error_code: str) -> None:
+            raise RuntimeError("synthetic: cannot write the error row")
+
+        monkeypatch.setattr(service.checkpoints, "record_failure", _record_failure_is_broken)
+        connector = _Connector(
+            pr_items=[_item("2")],
+            cc_error=MarketplaceExternalAPIError("coupang", "SERVER_ERROR", True, http_status=500),
+        )
+
+        result = service.sync_platform(connector, platform.id)  # 예외 없이 반환해야 한다
+
+        assert result["by_source"][CC]["status"] == "FAILED"
+        assert result["by_source"][CC]["reason_code"] == "SERVER_ERROR"  # 원래 사유가 가려지지 않는다
+        assert result["by_source"][PR]["status"] == "SUCCESS"  # 다른 source는 계속
+        assert CsCaseRepository(db_session).get_by_external(platform.id, PR, "2") is not None
+        assert _covered(db_session, platform.id, CC) is None  # 실패 기록 실패가 checkpoint를 만들지 않는다
+
+    def test_commit_failure_message_is_never_stored_only_the_exception_class(
+        self, db_session, engine, platform, monkeypatch
+    ):
+        db_session.commit()
+        service = _service(db_session, engine)
+
+        def _advance(platform_id: int, source: str, covered_until: datetime) -> None:
+            raise RuntimeError("민감한 본문 010-1234-5678 token=abcdef")
+
+        monkeypatch.setattr(service.checkpoints, "advance", _advance)
+        service.sync_platform(_Connector(cc_items=[_item("1")]), platform.id)
+
+        record = IntegrationStatusRepository(db_session).get_by_type_and_code(
+            CHECKPOINT_INTEGRATION_TYPE, checkpoint_code(platform.id, CC)
+        )
+        assert record is not None
+        assert record.last_error_message == "COMMIT_FAILED:RuntimeError"
+        assert "010" not in record.last_error_message and "token" not in record.last_error_message
+
+    def test_error_status_returns_to_normal_when_the_same_source_succeeds_next_run(self, db_session, engine, platform):
+        failing = _Connector(cc_error=MarketplaceExternalAPIError("coupang", "SERVER_ERROR", True, http_status=500))
+        _service(db_session, engine).sync_platform(failing, platform.id)
+        record = IntegrationStatusRepository(db_session).get_by_type_and_code(
+            CHECKPOINT_INTEGRATION_TYPE, checkpoint_code(platform.id, CC)
+        )
+        assert record is not None and record.status == "ERROR"
+
+        _service(db_session, engine).sync_platform(_Connector(), platform.id)
+
+        db_session.refresh(record)
+        assert record.status == "NORMAL"
+        assert record.last_error_message is None
+        assert record.last_success_at is not None
+
+
+class TestPartialSuccessContractA:
+    """계약 A: 항목별 성공 데이터는 보존(commit)하고 checkpoint는 전진하지 않는다. 다음 실행은 같은 구간 전체를
+    다시 조회하며 upsert로 수렴하고, 이미 저장된 case의 로컬 필드는 훼손되지 않는다."""
+
+    def test_rerun_after_partial_failure_converges_and_keeps_local_fields(
+        self, db_session, engine, platform, monkeypatch
+    ):
+        from sqlalchemy.exc import IntegrityError
+
+        db_session.commit()
+        original_add = CsCaseRepository.add
+
+        def _add(self, case):
+            if case.external_inquiry_id == "bad":
+                raise IntegrityError("INSERT", {}, Exception("synthetic"))
+            return original_add(self, case)
+
+        monkeypatch.setattr(CsCaseRepository, "add", _add)
+        first = _service(db_session, engine).sync_platform(
+            _Connector(cc_items=[_item("good"), _item("bad")]), platform.id
+        )
+        assert first["by_source"][CC]["status"] == "PARTIAL_SUCCESS"
+        assert _covered(db_session, platform.id, CC) is None
+
+        # 담당자가 이미 저장된 case에 로컬 작업을 했다.
+        repo = CsCaseRepository(db_session)
+        good = repo.get_by_external(platform.id, CC, "good")
+        assert good is not None
+        good.tags = "vip"
+        good.reply_draft = "내부 답변 초안"
+        good.status = "IN_PROGRESS"
+        db_session.commit()
+
+        monkeypatch.setattr(CsCaseRepository, "add", original_add)  # 문제가 해결된 다음 실행
+        second = _service(db_session, engine, NOW + timedelta(minutes=15)).sync_platform(
+            _Connector(cc_items=[_item("good"), _item("bad")]), platform.id
+        )
+
+        assert second["by_source"][CC]["status"] == "SUCCESS"
+        assert _covered(db_session, platform.id, CC) == NOW + timedelta(minutes=15)  # 이제 전진
+        db_session.expire_all()
+        good = repo.get_by_external(platform.id, CC, "good")
+        assert good is not None
+        assert (good.tags, good.reply_draft, good.status) == ("vip", "내부 답변 초안", "IN_PROGRESS")
+        assert repo.get_by_external(platform.id, CC, "bad") is not None  # 이제 저장됨
+        total = len(
+            [
+                c
+                for c in (repo.get_by_external(platform.id, CC, "good"), repo.get_by_external(platform.id, CC, "bad"))
+                if c
+            ]
+        )
+        assert total == 2  # 중복 생성 없이 정확히 2건
+
+    def test_permanently_failing_item_keeps_blocking_the_checkpoint_run_after_run(
+        self, db_session, engine, platform, monkeypatch
+    ):
+        """계약 A의 알려진 한계: 영구 실패 항목이 있으면 checkpoint가 계속 막힌다(그리고 드러난다)."""
+        from sqlalchemy.exc import IntegrityError
+
+        db_session.commit()
+        original_add = CsCaseRepository.add
+
+        def _add(self, case):
+            if case.external_inquiry_id == "poison":
+                raise IntegrityError("INSERT", {}, Exception("synthetic"))
+            return original_add(self, case)
+
+        monkeypatch.setattr(CsCaseRepository, "add", _add)
+        for run in range(3):
+            service = _service(db_session, engine, NOW + timedelta(minutes=15 * run))
+            result = service.sync_platform(_Connector(cc_items=[_item("ok"), _item("poison")]), platform.id)
+            assert result["by_source"][CC]["status"] == "PARTIAL_SUCCESS"
+            assert _covered(db_session, platform.id, CC) is None  # 계속 전진하지 않는다
+        record = IntegrationStatusRepository(db_session).get_by_type_and_code(
+            CHECKPOINT_INTEGRATION_TYPE, checkpoint_code(platform.id, CC)
+        )
+        assert record is not None and record.status == "ERROR"  # 운영자가 볼 수 있다

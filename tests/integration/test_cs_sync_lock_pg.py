@@ -311,3 +311,17 @@ class TestStaleRecoveryTwoInstances:
         assert p["final_status"] == "FAILED", p
         assert p["final_error_message"] == "PROCESS_INTERRUPTED", p
         assert p["finished_at_set"] is True, p
+
+
+class TestInt4BoundaryPlatformIds:
+    def test_checkpoint_and_lock_work_for_the_whole_integer_range(self, pg_sandbox):
+        p = _run_scenario(pg_sandbox, "int4_boundary_ids")
+
+        for pid, row in p["ids"].items():
+            for source in ("COUPANG_CALL_CENTER", "COUPANG_PRODUCT_INQUIRY"):
+                assert row[f"{source}:held_then_second_attempt"] == [True, False], (pid, row)  # 같은 키는 하나만
+                assert row[f"{source}:sibling_source_acquired"] is True, (pid, row)  # 다른 source는 막지 않는다
+                assert row[f"{source}:reacquired_after_release"] is True, (pid, row)  # unlock이 같은 두 키로 해제
+        assert p["adjacent_platforms_independent"] == [True, True], p
+        assert p["checkpoint_rows_stored"] == p["expected_rows"] == 10, p
+        assert p["max_code_length"] <= 13 <= 30, p  # varchar(30) 안, 가장 긴 키 "2147483647:CC"

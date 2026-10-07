@@ -11,7 +11,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from services.cs_sync_lock import cs_sync_source_lock, is_cs_sync_lock_held, lock_key
+from services.cs_inquiry_catchup_service import CHECKPOINT_SOURCE_CODES, SOURCES
+from services.cs_sync_lock import _SOURCE_INDEX, cs_sync_source_lock, is_cs_sync_lock_held, lock_key
 
 CC = "COUPANG_CALL_CENTER"
 PR = "COUPANG_PRODUCT_INQUIRY"
@@ -68,6 +69,41 @@ class TestLockKeys:
             lock_key(-1, CC)
         with pytest.raises(ValueError):
             lock_key(1, "NOT_A_SOURCE")
+
+
+class TestKeyConsistencyAndNamespaces:
+    def test_lock_source_numbers_and_checkpoint_codes_cover_exactly_the_same_sources(self):
+        assert set(_SOURCE_INDEX) == set(SOURCES) == set(CHECKPOINT_SOURCE_CODES)
+        assert len(set(_SOURCE_INDEX.values())) == len(_SOURCE_INDEX)  # 번호 단사
+
+    def test_lock_classids_never_equal_the_other_advisory_lock_namespaces_in_use(self):
+        """repositories/integration_sync_repository.acquire_target_lock은 classid=crc32(target_type)&0x7FFFFFFF를
+        쓴다(해시라 구조적 분리는 불가능) - 현재 코드베이스가 쓰는 target_type 전부와 백업 잠금 classid가 이 기능의
+        classid와 다름을 감사 시점 값으로 고정한다. 새 target_type이 생기면 이 목록에 추가해 확인한다."""
+        import zlib
+
+        known_target_types = [
+            "CS_CASE",
+            "FULFILLMENT_ORDER_ITEM",
+            "FULFILLMENT_INVENTORY",
+            "ORDER",
+            "PRODUCT_OPTION_PUBLISH_DRAFT",
+            "PRODUCT_PLATFORM_MAP",
+            "PRODUCT_PUBLISH_DRAFT",
+            "SHIPMENT",
+        ]
+        others = {zlib.crc32(t.encode("utf-8")) & 0x7FFFFFFF for t in known_target_types} | {0x424B5550}
+        mine = {lock_key(1, s)[0] for s in SOURCES}
+        assert mine.isdisjoint(others)
+
+    def test_key_is_injective_in_both_components(self):
+        """(classid, objid) -> (source, platform_id)를 복원할 수 있으면 서로 다른 입력이 같은 키를 가질 수 없다."""
+        for source in SOURCES:
+            for platform_id in (0, 1, 2**30, 2**31 - 1):
+                classid, objid = lock_key(platform_id, source)
+                assert objid == platform_id
+                assert classid - lock_key(0, source)[0] == 0
+        assert len({lock_key(5, s)[0] for s in SOURCES}) == len(SOURCES)
 
 
 class TestLocalFallbackLifecycle:

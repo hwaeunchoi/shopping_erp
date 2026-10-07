@@ -640,6 +640,48 @@ def scenario_stale_concurrent_recovery() -> dict:
     }
 
 
+def scenario_int4_boundary_ids() -> dict:
+    """platforms.id(integer)의 양 끝 값으로 checkpoint 생성과 advisory lock 획득·해제·충돌 여부를 실제 PostgreSQL로 확인."""
+    out: dict[str, Any] = {"ids": {}}
+    boundary_ids = [0, 1, 2**30, 2**31 - 2, 2**31 - 1]
+    session = SessionLocal()
+    repo = None
+    from services.cs_inquiry_catchup_service import CsSyncCheckpointRepository, checkpoint_code
+
+    repo = CsSyncCheckpointRepository(session)
+    for pid in boundary_ids:
+        row: dict[str, Any] = {}
+        for source in (CC, PR):
+            with cs_sync_source_lock(pid, source, engine) as first:
+                with cs_sync_source_lock(pid, source, engine) as same:
+                    row[f"{source}:held_then_second_attempt"] = [first, same]
+                other = PR if source == CC else CC
+                with cs_sync_source_lock(pid, other, engine) as sibling:
+                    row[f"{source}:sibling_source_acquired"] = sibling
+            with cs_sync_source_lock(pid, source, engine) as again:
+                row[f"{source}:reacquired_after_release"] = again
+            repo.advance(pid, source, FIXED_NOW)
+        session.commit()
+        out["ids"][str(pid)] = row
+    codes = [checkpoint_code(pid, s) for pid in boundary_ids for s in (CC, PR)]
+    lengths = session.execute(
+        select(func.max(func.char_length(IntegrationStatus.integration_code))).where(
+            IntegrationStatus.integration_type == "CS_CHECKPOINT", IntegrationStatus.integration_code.in_(codes)
+        )
+    ).scalar_one()
+    stored = session.execute(
+        select(func.count())
+        .select_from(IntegrationStatus)
+        .where(IntegrationStatus.integration_type == "CS_CHECKPOINT", IntegrationStatus.integration_code.in_(codes))
+    ).scalar_one()
+    session.close()
+    # 다른 platform끼리도 서로 막지 않는다(경계 쌍).
+    with cs_sync_source_lock(2**31 - 1, CC, engine) as a, cs_sync_source_lock(2**31 - 2, CC, engine) as b:
+        out["adjacent_platforms_independent"] = [a, b]
+    out.update({"checkpoint_rows_stored": int(stored), "expected_rows": len(codes), "max_code_length": int(lengths)})
+    return {"scenario": "int4_boundary_ids", **out}
+
+
 SCENARIOS = {
     "lock_contention": scenario_lock_contention,
     "concurrent_sync_platform": scenario_concurrent_sync_platform,
@@ -648,6 +690,7 @@ SCENARIOS = {
     "atomic_segment_commit_failure": scenario_atomic_segment_commit_failure,
     "atomicity_matrix": scenario_atomicity_matrix,
     "stale_concurrent_recovery": scenario_stale_concurrent_recovery,
+    "int4_boundary_ids": scenario_int4_boundary_ids,
 }
 
 

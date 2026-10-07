@@ -15,8 +15,10 @@ checkpoint(source별 진행 위치)
   저장했다는 뜻(naive UTC). status NORMAL/ERROR, last_error_message = 안전한 오류 코드 한
   개(문의 ID/주문번호/본문/credential은 절대 저장하지 않는다), updated_at.
 - 전진 조건(전부 충족): fetch·정규화·DB 저장 성공 + failed=0 + 요청예산/페이지 제한 초과
-  없음 + commit 성공. 데이터 저장과 checkpoint 갱신은 같은 트랜잭션이라 한쪽만 반영되는
-  일이 없다. 실패/부분실패/rollback이면 전진하지 않는다(단조 증가만 허용 - 뒤로 가지 않음).
+  없음 + commit 성공. checkpoint가 전진할 때는 항상 같은 트랜잭션의 데이터와 함께다(commit이 실패하면 둘 다
+  롤백). 실패/rollback이면 전진하지 않고(단조 증가만 허용 - 뒤로 가지 않음), 항목 일부만 실패한
+  PARTIAL_SUCCESS는 "계약 A"를 따른다 - 항목별로 성공한 case/history는 commit하되 checkpoint는 전진하지
+  않아 다음 실행이 같은 구간 전체를 다시 조회한다(unique 제약 + upsert로 중복 없이 수렴).
 
 조회 구간 계산(모두 Asia/Seoul 날짜 기준, 요청은 날짜 단위)
 ------------------------------------------------------
@@ -51,7 +53,7 @@ source는 checkpoint가 더 뒤처진 쪽부터 번갈아(라운드 로빈) 처�
 """
 
 import logging
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, ContextManager, Optional
 
@@ -412,8 +414,9 @@ class CsInquiryCatchupService:
             state.status = "UNSUPPORTED"
             return
 
-        # PARTIAL_SUCCESS(항목 일부 실패): 이미 저장된 항목은 멱등이므로 보존(commit)하되 checkpoint는
-        # 전진하지 않는다. FAILED/DISABLED 등은 쓰기가 없으므로 rollback.
+        # PARTIAL_SUCCESS(항목 일부 실패) = 계약 A: 항목별 SAVEPOINT로 성공한 case/history는 실패 기록과 함께
+        # commit하고 checkpoint는 전진하지 않는다(다음 실행이 같은 구간을 다시 조회, upsert로 수렴).
+        # FAILED/DISABLED 등은 쓰기가 없으므로 rollback.
         keep_data = status == "PARTIAL_SUCCESS"
         reason = str(result.get("reason_code") or status or "UNKNOWN")
         state.created += int(result.get("created", 0)) if keep_data else 0
@@ -426,8 +429,19 @@ class CsInquiryCatchupService:
     def _fail(
         self, state: _SourceState, platform_id: int, reason: str, *, commit_data: bool, partial: bool = False
     ) -> None:
-        self.checkpoints.record_failure(platform_id, state.source, reason)
-        self.session.commit()  # (commit_data=True면 보존된 데이터와 함께, False면 checkpoint 오류 기록만)
+        try:
+            self.checkpoints.record_failure(platform_id, state.source, reason)
+            self.session.commit()  # (commit_data=True면 보존된 데이터와 함께, False면 오류 기록만)
+        except Exception as exc:  # noqa: BLE001
+            # 실패 "기록" 자체가 실패해도 원래 실패 사유를 가리거나 다른 source를 막지 않는다.
+            with suppress(Exception):  # 연결이 이미 죽었어도 아래 결과 보고는 계속한다
+                self.session.rollback()
+            logger.warning(
+                "CS 문의 동기화 실패 기록 저장 실패: platform_id=%s source=%s type=%s",
+                platform_id,
+                state.source,
+                type(exc).__name__,
+            )
         state.stopped = True
         # 앞선 구간을 이미 성공시킨 source는 완전 실패로 위장하지 않는다(진행분은 checkpoint에 남아 있다).
         state.status = "PARTIAL_SUCCESS" if (partial or state.done > 0) else "FAILED"
