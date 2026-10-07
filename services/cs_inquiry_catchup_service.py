@@ -53,7 +53,7 @@ source는 checkpoint가 더 뒤처진 쪽부터 번갈아(라운드 로빈) 처�
 """
 
 import logging
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, ContextManager, Optional
 
@@ -376,7 +376,7 @@ class CsInquiryCatchupService:
                 request_budget=budget,
             )
         except Exception as exc:  # noqa: BLE001 - source 단위 격리(예상 밖 예외도 다른 source는 계속)
-            self.session.rollback()
+            self._rollback_quietly()
             self._fail(state, platform_id, f"INTERNAL_ERROR:{type(exc).__name__}", commit_data=False)
             logger.warning(
                 "CS 문의 동기화 예외: platform_id=%s source=%s type=%s", platform_id, source, type(exc).__name__
@@ -393,7 +393,7 @@ class CsInquiryCatchupService:
                 self.checkpoints.advance(platform_id, source, covered_until_after(seg_end, now))
                 self.session.commit()
             except Exception as exc:  # noqa: BLE001 - 이 source만 실패 처리하고 다른 source는 계속
-                self.session.rollback()
+                self._rollback_quietly()
                 self._fail(state, platform_id, f"COMMIT_FAILED:{type(exc).__name__}", commit_data=False)
                 logger.warning(
                     "CS 문의 동기화 commit 실패: platform_id=%s source=%s type=%s",
@@ -409,7 +409,7 @@ class CsInquiryCatchupService:
             return
 
         if status == "UNSUPPORTED":
-            self.session.rollback()
+            self._rollback_quietly()
             state.stopped = True
             state.status = "UNSUPPORTED"
             return
@@ -423,8 +423,16 @@ class CsInquiryCatchupService:
         state.updated += int(result.get("updated", 0)) if keep_data else 0
         state.failed += failed
         if not keep_data:
-            self.session.rollback()
+            self._rollback_quietly()
         self._fail(state, platform_id, reason, commit_data=keep_data, partial=keep_data)
+
+    def _rollback_quietly(self) -> None:
+        """rollback이 실패해도(연결 끊김 등) 원래 실패 사유를 가리거나 다른 source를 막지 않는다. 삼키는 범위는
+        rollback 호출 하나뿐이고 예외 메시지는 남기지 않는다(클래스 이름만 로그)."""
+        try:
+            self.session.rollback()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("CS 문의 동기화 rollback 실패: type=%s", type(exc).__name__)
 
     def _fail(
         self, state: _SourceState, platform_id: int, reason: str, *, commit_data: bool, partial: bool = False
@@ -434,8 +442,7 @@ class CsInquiryCatchupService:
             self.session.commit()  # (commit_data=True면 보존된 데이터와 함께, False면 오류 기록만)
         except Exception as exc:  # noqa: BLE001
             # 실패 "기록" 자체가 실패해도 원래 실패 사유를 가리거나 다른 source를 막지 않는다.
-            with suppress(Exception):  # 연결이 이미 죽었어도 아래 결과 보고는 계속한다
-                self.session.rollback()
+            self._rollback_quietly()  # 연결이 이미 죽었어도 아래 결과 보고는 계속한다
             logger.warning(
                 "CS 문의 동기화 실패 기록 저장 실패: platform_id=%s source=%s type=%s",
                 platform_id,
