@@ -616,8 +616,9 @@ scheduler job은 17개 -> 18개(`cs_inquiry_catchup` 추가).
 - 전진 조건(전부 충족): fetch·정규화·DB 저장 성공 + `failed=0` + 요청 예산/페이지 제한 초과 없음 + commit 성공.
   **checkpoint가 전진할 때는 항상 같은 트랜잭션의 데이터와 함께** commit된다(commit이 실패하면 데이터와 checkpoint가
   둘 다 롤백). 실패·rollback이면 전진하지 않고(오류 코드만 기록), 값은 단조 증가만 허용한다(뒤로 가지 않음).
-  실패 기록은 데이터 트랜잭션과 분리된 짧은 트랜잭션이며, 그 기록 자체가 실패해도 원래 실패 사유를 가리거나 다른
-  source를 중단하지 않는다.
+  실패 기록은 데이터 트랜잭션과 분리된 짧은 트랜잭션이며, 그 기록(commit)이나 그 앞의 rollback 자체가 실패해도
+  원래 실패 사유를 가리거나 다른 source를 중단하지 않는다 - 삼키는 범위는 rollback/기록 호출 하나뿐이고 로그에는 예외
+  클래스 이름만 남긴다(메시지·문의 ID·본문 없음).
 - **`PARTIAL_SUCCESS` 계약(계약 A)**: 한 구간의 항목 일부가 DB 오류로 실패하면(`failed > 0`) 항목별 SAVEPOINT로
   성공한 case/history는 **먼저 저장(commit)될 수 있고**, checkpoint는 전진하지 않는다. 따라서 (1) 부분 성공 데이터가
   checkpoint보다 앞서 존재할 수 있고, (2) 다음 실행은 같은 구간 전체를 다시 조회하며, (3) unique 제약
@@ -684,7 +685,7 @@ scheduler job은 17개 -> 18개(`cs_inquiry_catchup` 추가).
 
 - 잠금 단위: **(platform_id, source)**. 같은 플랫폼의 같은 source만 서로 막고, 다른 source/다른 플랫폼은 막지 않는다.
 - 구현(`services/cs_sync_lock.py`): PostgreSQL 세션 advisory lock(`pg_try_advisory_lock(classid=0x43530000+source 번호, objid=platform_id)`,
-  int4 전체 범위, 백업 잠금 0x424B5550과 다른 네임스페이스, 논블로킹)을 전용 AUTOCOMMIT 커넥션에 건다(백업과 같은 패턴). 호출자 세션의 commit/rollback과 무관하고, 정상/예외 종료 시
+  int4 전체 범위, 아래 registry 표의 다른 영역과 classid가 다름, 논블로킹)을 전용 AUTOCOMMIT 커넥션에 건다(백업과 같은 패턴). 호출자 세션의 commit/rollback과 무관하고, 정상/예외 종료 시
   unlock, unlock 실패 시 커넥션을 폐기해 잠금이 풀에 남지 않게 한다. 커넥션이 죽으면 DB가 자동 해제한다.
   SQLite에서는 프로세스 내 잠금으로 대체한다 - **프로세스 간 보호는 PostgreSQL에서만 보장**되므로 SQLite로 여러
   프로세스를 운영하는 구성에서는 동시 실행 방지가 성립하지 않는다(운영은 PostgreSQL). 잠금은 항상 호출 세션이
@@ -694,11 +695,31 @@ scheduler job은 17개 -> 18개(`cs_inquiry_catchup` 추가).
   `ALREADY_RUNNING`은 연동 상태를 오류로 기록하지 않는다. 수동 sync API는 HTTP 200에 `status=ALREADY_RUNNING`,
   `reason_code=ALREADY_RUNNING`으로 응답한다(프론트 `CsSyncResult.status` 타입에 반영 - 화면은 상태 문자열을 그대로
   표시하므로 번들은 바뀌지 않는다).
-- 잠금 네임스페이스: 이 기능의 키는 `(0x43530000+source 번호, platform_id)`로 (source, platform_id)에서 구조적으로
-  단사(서로 다른 입력은 서로 다른 키)이고 int4 안이다. 같은 PostgreSQL 인스턴스의 다른 advisory lock - 백업
-  (`0x424B5550`)과 외부 명령 대상 잠금(`classid=crc32(target_type)&0x7FFFFFFF`, 해시라 구조적 분리는 불가) - 와는
-  현재 코드베이스의 모든 값(백업 + target_type 8종)이 서로 다름을 확인했고 테스트가 그 목록을 고정한다. 새
-  target_type을 추가하면 그 테스트 목록에도 추가한다.
+- 잠금 네임스페이스(구조적 분리): advisory lock은 같은 PostgreSQL 인스턴스에서 모든 기능이 키 공간 하나를 공유하고
+  세션 수준·트랜잭션 수준도 같은 공간이다. 그래서 **`core/advisory_locks.py` registry 한 곳**이 기능 영역마다 고정
+  classid를 예약하고, 영역 안의 개별 자원은 objid로만 구분한다(키를 만드는 코드는 전부 이 모듈 함수를 쓴다).
+
+  | 기능 | classid(예약 범위) | objid | 수준 | 호출 주체 | 동시 실행 범위 |
+  |---|---|---|---|---|---|
+  | PostgreSQL 백업 | `0x424B5550` (고정 1개) | 0 | 세션 | scheduler(03:00·catch-up)·수동 실행 | 시스템 전체 1개 |
+  | CS 문의 동기화 | `0x43530000 ~ 0x4353FFFF` (`+source 번호`) | `platform_id` (해시 없음, int4 전체) | 세션 | scheduler(15분·시작 catch-up)·수동 sync API | (platform, source)별 1개 |
+  | 외부 명령 대상(상품 동기화·발행·출고 재고/주문라인) | `0x4558434D` (고정 1개) | `hash(target_type, 자원 id)` 31비트 | 트랜잭션 | API(출고·발행)·scheduler dispatch worker | 같은 (target_type, 자원)별 1개 |
+
+  - 외부 명령 영역은 예전에 `classid=crc32(target_type)`을 썼다 - 가변 문자열이 classid가 되므로 미래의
+    target_type이 다른 영역의 classid와 같아질 수 있어 "현재 8종은 안 겹친다"는 구조적 보장이 아니었다. 지금은
+    classid가 입력과 무관한 고정값이라 **어떤 target_type을 추가해도 다른 영역과 충돌할 수 없다**.
+  - objid 해시(blake2b 4바이트 → 31비트)는 결정적(프로세스·호스트와 무관)이라 같은 자원은 항상 같은 키를 얻는다.
+    다른 두 자원의 해시가 우연히 같으면 상관없는 두 자원이 불필요하게 직렬화될 뿐이다(보수적 상호 배제, 정확성
+    손실 없음). 확률은 동시에 잡힌 자원 n개 기준 약 n²/2³² 수준이다.
+  - CS·백업 키는 해시가 아니라 (source 번호, platform_id)에서 복원 가능한 단사다. 예약 범위가 서로소이고 signed int4
+    안이며 새 영역은 registry의 `RESERVED_CLASSID_RANGES`에 추가해야 한다(테스트가 서로소·int4·모든 lock SQL
+    사용 모듈의 registry 사용을 검증한다).
+  - 외부 명령 키 변경의 배포 영향: 키는 런타임 상태일 뿐이라 migration·데이터 변경은 필요 없다. 다만 키 형식이 바뀌므로
+    **구 이미지 프로세스와 신 이미지 프로세스가 동시에 같은 외부 대상을 처리하면 서로 다른 키를 잡아 그 순간의
+    상호 배제가 없다.** api와 scheduler를 함께 교체하면 몇 초간 구/신 프로세스가 공존할 수 있다(같은 서비스의 구/신은
+    compose recreate가 겹치지 않게 교체하지만 서로 다른 서비스 사이는 보장하지 않는다). 배포 게이트: 교체 직전 `external_commands`에
+    진행 중(PENDING/RUNNING/RETRY_WAIT) 명령이 없음을 확인하거나, scheduler를 먼저 정지한 뒤 api → scheduler 순으로
+    교체한다. (현재 운영은 `external_commands` 0건이라 게이트가 자명하게 통과한다.)
 
 #### 6) stale RUNNING 정리 (재시작 잔존 이력)
 
