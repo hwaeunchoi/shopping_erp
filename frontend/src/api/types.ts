@@ -1390,7 +1390,7 @@ export interface CsDashboardSummary {
 
 export interface CsSyncResult {
   platform_code: string
-  status: 'SUCCESS' | 'PARTIAL_SUCCESS' | 'FAILED' | 'UNSUPPORTED' | 'DISABLED'
+  status: 'SUCCESS' | 'PARTIAL_SUCCESS' | 'FAILED' | 'UNSUPPORTED' | 'DISABLED' | 'ALREADY_RUNNING'
   created: number
   updated: number
   failed: number
