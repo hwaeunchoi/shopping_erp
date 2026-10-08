@@ -8,13 +8,13 @@ tests/unit/test_outbox_dispatch_job.py 모듈 docstring과 동일).
 함수라 이 정책과 무관하게 직접 단위테스트한다.
 """
 
-from config.settings import settings
+from config.settings import Settings, settings
 from scheduler.jobs import settlement_sync_job
 
 
 class TestDisabledByDefault:
     def test_default_is_disabled(self):
-        assert settings.settlement_sync_enabled is False
+        assert Settings(_env_file=None).settlement_sync_enabled is False  # type: ignore[call-arg]  # .env 비의존
 
     def test_run_returns_immediately_without_opening_a_session(self, monkeypatch):
         monkeypatch.setattr(settings, "settlement_sync_enabled", False)

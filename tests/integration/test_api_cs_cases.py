@@ -329,7 +329,11 @@ class TestDashboardAndSync:
         body = resp.json()
         assert "by_status" in body and "unassigned_count" in body and "overdue_count" in body
 
-    def test_sync_disabled_by_default_makes_no_external_call(self, client, auth_headers, seed_data):
+    def test_sync_disabled_by_default_makes_no_external_call(self, client, auth_headers, seed_data, monkeypatch):
+        from config.settings import settings
+
+        # 기본값(꺼짐) 상황을 명시한다 - 운영 .env가 true여도 이 테스트는 호스트 설정에 의존하지 않는다.
+        monkeypatch.setattr(settings, "cs_inquiry_sync_enabled", False)
         resp = client.post(
             "/api/cs-cases/sync", json={"platform_id": seed_data["platform_id"], "days": 7}, headers=auth_headers
         )

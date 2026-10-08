@@ -12,13 +12,13 @@ tests/unit/test_outbox_dispatch_job.py 모듈 docstring과 동일: session_scope
 
 from unittest.mock import MagicMock
 
-from config.settings import settings
+from config.settings import Settings, settings
 from scheduler.jobs import claim_sync_job
 
 
 class TestDisabledByDefault:
     def test_default_is_disabled(self):
-        assert settings.claim_sync_enabled is False
+        assert Settings(_env_file=None).claim_sync_enabled is False  # type: ignore[call-arg]  # .env 비의존
 
     def test_run_returns_immediately_without_opening_a_session(self, monkeypatch):
         """기능이 꺼져 있으면(기본값) session_scope()조차 호출하지 않는다 - 커넥터
