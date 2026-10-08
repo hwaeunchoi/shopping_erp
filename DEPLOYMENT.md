@@ -640,5 +640,10 @@ scheduler 모두에 같은 표현식으로 전달됩니다. 기본값은 코드(
 5. 비활성화는 같은 경로다: 한 줄을 `false`로 되돌리고 api와 scheduler를 재생성한다. 이미 수집된
    case/history/checkpoint는 삭제하지 않는다.
 
+Docker Compose의 우선순위는 **프로세스(셸) 환경변수 > `.env`**입니다. 운영자의 셸에 `CS_INQUIRY_SYNC_ENABLED` 같은
+변수가 남아 있으면 `.env` 값이 무시되므로, 재생성 전에 셸에 같은 이름의 변수가 없는지 확인하고 재생성 후에는 반드시
+컨테이너 내부 값(`docker exec <컨테이너> python -c "from config.settings import settings as s; print(s.cs_inquiry_sync_enabled)"`)
+을 확인합니다.
+
 임시 override 파일(`-f override.yml`)로 환경변수를 주입하는 방식은 운영 절차로 사용하지 않습니다 - base compose만
 다시 적용하면 조용히 꺼지거나 켜져 9.4와 같은 사고가 납니다. 값은 항상 `.env` → base compose 경로로만 바꿉니다.

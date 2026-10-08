@@ -6,9 +6,11 @@ CS 문의 자동수집 설정이 docker-compose.yml을 거쳐 api/scheduler 컨�
 배경: .env는 이미지에 들어가지 않으므로(.dockerignore) compose가 `environment:`로 전달하지 않은 값은 컨테이너 안에서
 적용되지 않는다. CS_INQUIRY_SYNC_ENABLED가 전달되지 않아 .env를 true로 바꿔도 플래그가 켜지지 않던 사고의 재발 방지.
 
-격리: 운영 .env를 읽지 않는다. 항상 임시 디렉터리에 compose 파일 사본과 (함정용) 가짜 .env를 두고, 명시한 --env-file과
-정리된 자식 프로세스 환경으로 `docker compose config`를 실행한다. 합성 secret만 쓰고 실패 메시지에 compose 전체
-출력을 싣지 않는다.
+격리: 운영 .env를 읽지 않는다. 항상 임시 디렉터리에 compose 파일 사본과 (함정용) 가짜 .env를 두고, 명시한 --env-file로
+`docker compose config`를 실행한다. 주의: Docker Compose의 실제 우선순위는 **프로세스 환경변수 > --env-file**이다(셸에
+같은 이름의 변수가 있으면 env-file 값을 덮어쓴다). 그래서 이 테스트의 헬퍼는 자식 프로세스 환경을 PATH 등 최소 항목만
+남기고 정리해, 호스트 환경변수가 결과에 영향을 줄 수 없게 만든다(우선순위 자체가 아니라 '차단'으로 격리한다). 합성 secret만
+쓰고 실패 메시지에 compose 전체 출력을 싣지 않는다.
 """
 
 import json
@@ -210,7 +212,9 @@ class TestRenderedEnvironment:
             assert env["CS_INQUIRY_SYNC_ENABLED"] == "false"
             assert env["CS_INQUIRY_SYNC_MAX_REQUESTS_PER_RUN"] == "45"
 
-    def test_hostile_host_environment_cannot_change_the_explicit_env_file_result(self, tmp_path, monkeypatch):
+    def test_scrubbed_child_environment_blocks_host_variables_so_the_env_file_decides(self, tmp_path, monkeypatch):
+        """호스트(부모 프로세스)에 적대적인 변수가 있어도 헬퍼가 자식 환경을 정리하므로 env-file 값만 쓰인다.
+        (Compose 자체의 우선순위 때문이 아니다 - 아래 test_compose_gives_process_environment_priority_over_env_file 참고)"""
         monkeypatch.setenv("CS_INQUIRY_SYNC_ENABLED", "true")
         monkeypatch.setenv("CS_INQUIRY_SYNC_MAX_REQUESTS_PER_RUN", "99999")
         rendered = _render(tmp_path, "CS_INQUIRY_SYNC_ENABLED=false\nCS_INQUIRY_SYNC_MAX_REQUESTS_PER_RUN=45\n")
@@ -218,6 +222,38 @@ class TestRenderedEnvironment:
             env = _cs_env(rendered, service)
             assert env["CS_INQUIRY_SYNC_ENABLED"] == "false"
             assert env["CS_INQUIRY_SYNC_MAX_REQUESTS_PER_RUN"] == "45"
+
+    def test_compose_gives_process_environment_priority_over_env_file(self, tmp_path):
+        """실제 Compose 동작의 기록: 자식 프로세스 환경에 변수가 있으면 --env-file 값보다 우선한다. 운영자의 셸에 같은 이름의
+        변수가 남아 있으면 .env가 무시되므로, 운영 절차는 활성화 전후 컨테이너 내부 값을 반드시 확인한다(DEPLOYMENT.md 10절)."""
+        work = tmp_path / "proj"
+        work.mkdir()
+        shutil.copyfile(COMPOSE_PATH, work / "docker-compose.yml")
+        env_file = tmp_path / "explicit.env"
+        env_file.write_text(_BASE_ENV_FILE + "CS_INQUIRY_SYNC_ENABLED=false\n", encoding="utf-8")
+        child_env = {**_clean_child_env(), "CS_INQUIRY_SYNC_ENABLED": "true"}
+        result = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "--env-file",
+                str(env_file),
+                "-f",
+                "docker-compose.yml",
+                "config",
+                "--format",
+                "json",
+            ],
+            cwd=work,
+            env=child_env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+        assert result.returncode == 0
+        assert _cs_env(json.loads(result.stdout), "api")["CS_INQUIRY_SYNC_ENABLED"] == "true"
 
     def test_a_dotenv_in_the_project_directory_is_not_auto_loaded_when_an_env_file_is_given(self, tmp_path):
         """운영 .env 자동 로딩에 의존하지 않는다는 증거: 프로젝트 디렉터리의 가짜 .env(true)는 무시된다."""
