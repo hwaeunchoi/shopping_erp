@@ -542,7 +542,8 @@
   `source="COUPANG_CALL_CENTER"`도 1회 확인한다. (4) 둘 다 문제없으면
   아래 자동 활성화 절차로 진행한다.
 - **비활성화 및 롤백 절차**: `.env`의 `CS_INQUIRY_SYNC_ENABLED`를 다시
-  `false`로 되돌리기만 하면 즉시 모든 자동/수동 CS 문의 동기화가
+  `false`로 되돌리고 **api와 scheduler를 compose로 재생성**하면(컨테이너 환경은 생성 시점에 고정되고, `.env`는
+  docker-compose.yml이 전달해야만 적용된다 - DEPLOYMENT.md 10절) 모든 자동/수동 CS 문의 동기화가
   `DISABLED`로 돌아간다(세션도 열지 않고 커넥터도 만들지 않음 - 기존
   방어 로직 그대로). **이미 수집된 `cs_cases`/`cs_case_history` 데이터는
   삭제하지 않는다** - 비활성화는 신규 수집만 멈추는 스위치다. 호출량 설정

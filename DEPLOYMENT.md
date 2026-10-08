@@ -602,3 +602,43 @@ docker inspect -f '{{.Config.Image}} {{.Image}}' erp-api erp-scheduler erp-web
 고려하십시오. 그 전에 폐기하면, 아직 `.env`에 값이 없는 상태에서 누군가
 base compose만 재적용할 경우 다시 9.1의 위험한 상태로 되돌아갑니다. 폐기는
 이 문서의 범위가 아니라 별도 운영 판단 사항입니다.
+
+
+## 10. CS 문의 자동수집 설정 전달과 활성화/비활성화 절차
+
+### 10.1 설정은 compose를 거쳐야 컨테이너에 적용된다
+
+`.env`는 이미지에 들어가지 않으므로(`.dockerignore`) `docker-compose.yml`의 `environment:`로 전달되지 않은 값은
+컨테이너 안에서 적용되지 않습니다(백업 플래그와 같은 원리 - 7.1, 7.4). CS 문의 자동수집의 아래 변수는 api와
+scheduler 모두에 같은 표현식으로 전달됩니다. 기본값은 코드(`config/settings.py`)의 기본값과 같고, 테스트
+(`tests/unit/test_compose_cs_settings_contract.py`)가 이를 강제합니다.
+
+| 환경변수 | Settings 필드 | 기본값 | api | scheduler |
+|---|---|---:|---|---|
+| `CS_INQUIRY_SYNC_ENABLED` | `cs_inquiry_sync_enabled` | `false` | 수동 sync API(`/api/cs-cases/sync`) | 15분 정기 실행·시작 catch-up |
+| `CS_INQUIRY_SYNC_WINDOW_DAYS` | `cs_inquiry_sync_window_days` | `1` | - | checkpoint 없는 첫 실행의 조회 범위 |
+| `CS_INQUIRY_SYNC_MAX_PAGES_PER_QUERY` | `cs_inquiry_sync_max_pages_per_query` | `3` | 수동 sync | 정기·catch-up |
+| `CS_INQUIRY_SYNC_MAX_RETRIES_PER_PAGE` | `cs_inquiry_sync_max_retries_per_page` | `2` | 수동 sync | 정기·catch-up |
+| `CS_INQUIRY_SYNC_MAX_REQUESTS_PER_RUN` | `cs_inquiry_sync_max_requests_per_run` | `45` | 수동 sync | 정기·catch-up(플랫폼당 요청 예산) |
+| `CS_INQUIRY_SYNC_INTERVAL_MINUTES` | `cs_inquiry_sync_interval_minutes` | `15` | - | 정기 실행 주기 |
+| `TASK_STALE_RUNNING_THRESHOLD_MINUTES` | `task_stale_running_threshold_minutes` | `360` | 작업 모니터(`running-tasks`) | 시작 시 stale RUNNING 정리 |
+
+- web/db/redis에는 전달하지 않습니다. Secret/credential은 새로 전달하지 않습니다(API 키는 DB에 암호화 저장).
+- api에서 쓰지 않는 값(window·interval)까지 양쪽에 같은 표현식으로 전달하는 이유: 두 프로세스의 Settings가 달라
+  운영 진단(`docker exec ... settings`)이 어긋나는 일을 막고, 계약 테스트를 "양쪽 동일"이라는 단순한 규칙으로
+  유지하기 위해서입니다.
+- 빈 값(`CS_INQUIRY_SYNC_ENABLED=`)은 `:-` 문법 때문에 기본값으로 폴백합니다.
+
+### 10.2 활성화 절차 (켜기와 끄기는 같은 경로)
+
+1. 사전 게이트(백업·DB revision·health·`external_commands` 진행 0건 등)를 통과시킨다.
+2. scheduler를 정지하고 `.env`의 `CS_INQUIRY_SYNC_ENABLED` 한 줄만 `true`로 원자적으로 바꾼다(snapshot 보존).
+3. **api와 scheduler를 `--no-deps`로 재생성**한다. 환경변수가 바뀐 컨테이너는 단순 `restart`로는 새 값을 받지
+   못할 수 있으므로(컨테이너 환경은 생성 시점에 고정) `docker compose up -d --no-deps api scheduler`처럼
+   compose로 재생성한다. web/postgres/redis는 건드리지 않는다.
+4. api/scheduler 내부 `settings.cs_inquiry_sync_enabled`가 `True`인지 확인한 뒤 첫 catch-up을 관찰한다.
+5. 비활성화는 같은 경로다: 한 줄을 `false`로 되돌리고 api와 scheduler를 재생성한다. 이미 수집된
+   case/history/checkpoint는 삭제하지 않는다.
+
+임시 override 파일(`-f override.yml`)로 환경변수를 주입하는 방식은 운영 절차로 사용하지 않습니다 - base compose만
+다시 적용하면 조용히 꺼지거나 켜져 9.4와 같은 사고가 납니다. 값은 항상 `.env` → base compose 경로로만 바꿉니다.
