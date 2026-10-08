@@ -89,6 +89,17 @@ services:
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY is required}
       CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY:?CREDENTIAL_ENCRYPTION_KEY is required}
       DEBUG: "false"
+      # 채널 CS(고객문의) 자동수집 설정(config/settings.py의 cs_inquiry_sync_* 필드와 1:1) - compose가 전달하지
+      # 않으면 .env 값은 컨테이너 안에서 적용되지 않는다(.env는 이미지에 들어가지 않는다). 모든 기본값은
+      # 코드 기본값과 같고 활성화 플래그 기본값은 false다. api(수동 sync API)와 scheduler(15분 정기 실행)가
+      # 같은 값을 보도록 양쪽에 똑같이 전달한다(제한값이 서로 다르면 수동/자동 호출량 계산이 어긋난다).
+      CS_INQUIRY_SYNC_ENABLED: ${CS_INQUIRY_SYNC_ENABLED:-false}
+      CS_INQUIRY_SYNC_WINDOW_DAYS: ${CS_INQUIRY_SYNC_WINDOW_DAYS:-1}
+      CS_INQUIRY_SYNC_MAX_PAGES_PER_QUERY: ${CS_INQUIRY_SYNC_MAX_PAGES_PER_QUERY:-3}
+      CS_INQUIRY_SYNC_MAX_RETRIES_PER_PAGE: ${CS_INQUIRY_SYNC_MAX_RETRIES_PER_PAGE:-2}
+      CS_INQUIRY_SYNC_MAX_REQUESTS_PER_RUN: ${CS_INQUIRY_SYNC_MAX_REQUESTS_PER_RUN:-45}
+      CS_INQUIRY_SYNC_INTERVAL_MINUTES: ${CS_INQUIRY_SYNC_INTERVAL_MINUTES:-15}
+      TASK_STALE_RUNNING_THRESHOLD_MINUTES: ${TASK_STALE_RUNNING_THRESHOLD_MINUTES:-360}
     ports:
       - "8000:8000"
     command: sh -c "alembic upgrade head && python scripts/init_db.py && uvicorn api.main:app --host 0.0.0.0 --port 8000"
@@ -117,6 +128,17 @@ services:
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY is required}
       CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY:?CREDENTIAL_ENCRYPTION_KEY is required}
       DEBUG: "false"
+      # 채널 CS(고객문의) 자동수집 설정(config/settings.py의 cs_inquiry_sync_* 필드와 1:1) - compose가 전달하지
+      # 않으면 .env 값은 컨테이너 안에서 적용되지 않는다(.env는 이미지에 들어가지 않는다). 모든 기본값은
+      # 코드 기본값과 같고 활성화 플래그 기본값은 false다. api(수동 sync API)와 scheduler(15분 정기 실행)가
+      # 같은 값을 보도록 양쪽에 똑같이 전달한다(제한값이 서로 다르면 수동/자동 호출량 계산이 어긋난다).
+      CS_INQUIRY_SYNC_ENABLED: ${CS_INQUIRY_SYNC_ENABLED:-false}
+      CS_INQUIRY_SYNC_WINDOW_DAYS: ${CS_INQUIRY_SYNC_WINDOW_DAYS:-1}
+      CS_INQUIRY_SYNC_MAX_PAGES_PER_QUERY: ${CS_INQUIRY_SYNC_MAX_PAGES_PER_QUERY:-3}
+      CS_INQUIRY_SYNC_MAX_RETRIES_PER_PAGE: ${CS_INQUIRY_SYNC_MAX_RETRIES_PER_PAGE:-2}
+      CS_INQUIRY_SYNC_MAX_REQUESTS_PER_RUN: ${CS_INQUIRY_SYNC_MAX_REQUESTS_PER_RUN:-45}
+      CS_INQUIRY_SYNC_INTERVAL_MINUTES: ${CS_INQUIRY_SYNC_INTERVAL_MINUTES:-15}
+      TASK_STALE_RUNNING_THRESHOLD_MINUTES: ${TASK_STALE_RUNNING_THRESHOLD_MINUTES:-360}
       # PostgreSQL 예약 백업(services/postgres_backup_service.py, 상용 ERP 확장) -
       # 기본 false. api/web에는 이 플래그·마운트를 두지 않는다(백업은 scheduler만
       # 수행한다). 활성화 절차·호스트 ACL 설정은 DEPLOYMENT.md 참고.
