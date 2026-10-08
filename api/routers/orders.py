@@ -624,7 +624,7 @@ def _claim_http_status(result: dict) -> int:
     responses={404: {"description": "플랫폼을 찾을 수 없습니다."}},
 )
 def sync_claims(payload: OrderSyncRequest, db: Session = Depends(get_db)) -> JSONResponse:
-    if not settings.claims_settlement_sync_enabled:
+    if not settings.claim_sync_enabled:
         # 실계정 검증 승인 전 기본 차단 - 커넥터를 만들지도, 플랫폼을 조회하지도 않고
         # 즉시 반환한다(외부 호출 0건). 기존 응답 계약(구조화 body + _claim_http_status)
         # 은 그대로 유지한다 - UNSUPPORTED는 이미 501로 매핑되어 있다.

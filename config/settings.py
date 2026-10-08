@@ -59,15 +59,20 @@ class Settings(BaseSettings):
     # 이 잡도 실 채널 API(fetch_orders)를 호출하므로 위 플래그와 별개로 기본 차단한다.
     channel_status_sync_enabled: bool = False
 
-    # 상용 ERP 확장(2단계) - 취소/반품/교환 클레임 수집 + 정산(회차 요약/주문단위 상세)
-    # 수집을 자동(scheduler.jobs.claim_sync_job/settlement_sync_job) + 수동(POST
-    # /api/orders/sync-claims, /api/settlements/sync) 모두 이 플래그로 통제한다.
-    # False(기본값)면 실제 채널 호출 없이 안전하게 차단된다 - 실계정 검증 승인 후
-    # 운영자가 명시적으로 켜야 한다. 환불 실행/취소 승인/반품 완료 처리/교환
-    # 재발송처럼 채널에 "쓰는" 클레임 처리 액션은 이 플래그와 무관하게 이번 단계
-    # 범위 밖이다(Stage 2-B, docs/COMMERCIAL_ERP_ROADMAP.md 참고) - 아직 구현되지
-    # 않았다.
-    claims_settlement_sync_enabled: bool = False
+    # 상용 ERP 확장(2단계) - 클레임(취소/반품/교환) 수집과 정산 수집은 서로 독립된 두 플래그로 통제한다.
+    # 예전에는 claims_settlement_sync_enabled 하나가 둘을 함께 켰다 - 클레임만 켜려 해도 정산 수집
+    # (매일 07:30 settlement_sync_job + POST /api/settlements/sync)이 같이 켜져 분리했다.
+    #
+    # claim_sync_enabled(CLAIM_SYNC_ENABLED): scheduler.jobs.claim_sync_job(취소·반품·교환 자동 수집) +
+    #   POST /api/orders/sync-claims. False(기본값)면 세션·credential 복호화·HTTP·DB 쓰기가 전혀 없다.
+    # settlement_sync_enabled(SETTLEMENT_SYNC_ENABLED): scheduler.jobs.settlement_sync_job +
+    #   POST /api/settlements/sync. 마찬가지로 False(기본값)면 아무 것도 하지 않는다.
+    #
+    # 예전 환경변수 CLAIMS_SETTLEMENT_SYNC_ENABLED는 더 이상 읽지 않는다(deprecated) - 새 플래그 둘 중 어느
+    # 쪽도 자동으로 켜지 않는다(예전 값이 true였다면 정산까지 의도치 않게 켜질 수 있어 일부러 전파하지
+    # 않는다). 운영자가 새 플래그를 각각 명시적으로 켜야 한다. 실계정 검증 승인 후에만 켠다.
+    claim_sync_enabled: bool = False
+    settlement_sync_enabled: bool = False
 
     # 상용 ERP 확장(3단계, 첫 묶음) - 기존 채널 상품(옵션)의 재고 수량/판매상태 전송을
     # 자동(scheduler.jobs.product_sync_dispatch_job) + 수동(POST /api/products/

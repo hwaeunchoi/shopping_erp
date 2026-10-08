@@ -14,10 +14,10 @@ from scheduler.jobs import settlement_sync_job
 
 class TestDisabledByDefault:
     def test_default_is_disabled(self):
-        assert settings.claims_settlement_sync_enabled is False
+        assert settings.settlement_sync_enabled is False
 
     def test_run_returns_immediately_without_opening_a_session(self, monkeypatch):
-        monkeypatch.setattr(settings, "claims_settlement_sync_enabled", False)
+        monkeypatch.setattr(settings, "settlement_sync_enabled", False)
 
         def _fail_if_called(*args, **kwargs):
             raise AssertionError("기능이 OFF인데 session_scope()가 호출되었습니다(DB/외부 호출 발생).")

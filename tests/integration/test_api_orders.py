@@ -263,13 +263,13 @@ class _StubClaimConnector:
 
 
 class TestSyncClaims:
-    """settings.claims_settlement_sync_enabled는 기본 False(실전송 기본 차단)이므로,
+    """settings.claim_sync_enabled는 기본 False(실전송 기본 차단)이므로,
     capability(지원/미지원) 자체를 검증하는 이 클래스의 나머지 테스트에서는 켜 둔다 -
     TestSyncClaimsDisabledByDefault만 자체적으로 다시 꺼서 기본 차단을 검증한다."""
 
     @pytest.fixture(autouse=True)
     def _enable_claims_settlement_sync(self, monkeypatch):
-        monkeypatch.setattr(settings, "claims_settlement_sync_enabled", True)
+        monkeypatch.setattr(settings, "claim_sync_enabled", True)
 
     def _post(self, client, auth_headers, seed_data):
         return client.post(
@@ -371,7 +371,7 @@ class TestSyncClaimsDisabledByDefault:
     확인한다."""
 
     def test_sync_claims_returns_501_without_touching_connector(self, client, auth_headers, seed_data, monkeypatch):
-        monkeypatch.setattr(settings, "claims_settlement_sync_enabled", False)
+        monkeypatch.setattr(settings, "claim_sync_enabled", False)
         called = {"n": 0}
 
         def _fail_if_called(*a, **k):
@@ -400,7 +400,7 @@ class TestSyncClaimsDisabledByDefault:
     def test_sync_claims_disabled_even_for_unknown_platform(self, client, auth_headers, monkeypatch):
         """플랫폼 조회조차 하지 않는다 - 존재하지 않는 platform_id를 줘도 404가 아니라
         여전히 501(비활성화)이다."""
-        monkeypatch.setattr(settings, "claims_settlement_sync_enabled", False)
+        monkeypatch.setattr(settings, "claim_sync_enabled", False)
 
         resp = client.post(
             "/api/orders/sync-claims",

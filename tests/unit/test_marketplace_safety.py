@@ -225,7 +225,7 @@ class TestSchedulerChannelIsolation:
         tests/unit/test_settlement_sync_service.py에서 이미 별도로 검증됨)."""
         from config.settings import settings
 
-        monkeypatch.setattr(settings, "claims_settlement_sync_enabled", True)
+        monkeypatch.setattr(settings, "settlement_sync_enabled", True)
 
         good, bad = two_active_platforms
         good_conn = _StubConnector(settlements=[], settlement_details=[], supports_settlement=True)

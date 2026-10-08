@@ -102,12 +102,12 @@ class TestDiscrepancies:
 
 
 class TestSyncSettlements:
-    """POST /sync - settings.claims_settlement_sync_enabled 기본 False이므로 이 클래스는
+    """POST /sync - settings.settlement_sync_enabled 기본 False이므로 이 클래스는
     켜 두고, TestSyncDisabledByDefault만 자체적으로 다시 꺼서 기본 차단을 검증한다."""
 
     @pytest.fixture(autouse=True)
     def _enable(self, monkeypatch):
-        monkeypatch.setattr(settings, "claims_settlement_sync_enabled", True)
+        monkeypatch.setattr(settings, "settlement_sync_enabled", True)
 
     def _post(self, client, auth_headers, seed_data):
         return client.post(
@@ -157,7 +157,7 @@ class TestSyncSettlements:
 
 class TestSyncDisabledByDefault:
     def test_sync_returns_501_without_touching_connector(self, client, auth_headers, seed_data, monkeypatch):
-        monkeypatch.setattr(settings, "claims_settlement_sync_enabled", False)
+        monkeypatch.setattr(settings, "settlement_sync_enabled", False)
         called = {"n": 0}
 
         def _fail_if_called(*a, **k):

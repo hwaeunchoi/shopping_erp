@@ -177,12 +177,12 @@ def _settlement_sync_http_status(overall: str, settlements: dict, details: dict)
     description="지정한 플랫폼에서 [start_date, end_date] 구간의 정산 회차 요약과 주문단위 상세를 "
     "capability 기준으로 수집하고 대사(reconciliation)한다. 기능별 결과(SUCCESS/UNSUPPORTED/FAILED)를 "
     "구조화해 반환하며, HTTP 상태는 전체 결과에 따라 200/409/501/502/503/500이 될 수 있으나 body 형식은 "
-    "동일하다. settings.claims_settlement_sync_enabled가 False(기본값)면 커넥터를 만들지 않고 즉시 "
+    "동일하다. settings.settlement_sync_enabled가 False(기본값)면 커넥터를 만들지 않고 즉시 "
     "501(UNSUPPORTED, reason_code=FEATURE_DISABLED)로 응답한다.",
     responses={404: {"description": "플랫폼을 찾을 수 없습니다."}},
 )
 def sync_settlements(payload: SettlementSyncRequest, db: Session = Depends(get_db)) -> JSONResponse:
-    if not settings.claims_settlement_sync_enabled:
+    if not settings.settlement_sync_enabled:
         disabled = {"status": "UNSUPPORTED", "count": 0, "reason_code": "FEATURE_DISABLED", "retryable": False}
         disabled_result = {"overall_status": "UNSUPPORTED", "settlements": disabled, "settlement_details": disabled}
         return JSONResponse(status_code=status.HTTP_501_NOT_IMPLEMENTED, content=disabled_result)

@@ -100,6 +100,10 @@ services:
       CS_INQUIRY_SYNC_MAX_REQUESTS_PER_RUN: ${CS_INQUIRY_SYNC_MAX_REQUESTS_PER_RUN:-45}
       CS_INQUIRY_SYNC_INTERVAL_MINUTES: ${CS_INQUIRY_SYNC_INTERVAL_MINUTES:-15}
       TASK_STALE_RUNNING_THRESHOLD_MINUTES: ${TASK_STALE_RUNNING_THRESHOLD_MINUTES:-360}
+      # 클레임(취소·반품·교환) 수집과 정산 수집의 활성화 플래그 - 서로 독립이고 기본값은 모두 false다. compose가
+      # 전달하지 않으면 .env 값은 컨테이너에서 적용되지 않는다. 예전 CLAIMS_SETTLEMENT_SYNC_ENABLED는 읽지 않는다.
+      CLAIM_SYNC_ENABLED: ${CLAIM_SYNC_ENABLED:-false}
+      SETTLEMENT_SYNC_ENABLED: ${SETTLEMENT_SYNC_ENABLED:-false}
     ports:
       - "8000:8000"
     command: sh -c "alembic upgrade head && python scripts/init_db.py && uvicorn api.main:app --host 0.0.0.0 --port 8000"
@@ -139,6 +143,10 @@ services:
       CS_INQUIRY_SYNC_MAX_REQUESTS_PER_RUN: ${CS_INQUIRY_SYNC_MAX_REQUESTS_PER_RUN:-45}
       CS_INQUIRY_SYNC_INTERVAL_MINUTES: ${CS_INQUIRY_SYNC_INTERVAL_MINUTES:-15}
       TASK_STALE_RUNNING_THRESHOLD_MINUTES: ${TASK_STALE_RUNNING_THRESHOLD_MINUTES:-360}
+      # 클레임(취소·반품·교환) 수집과 정산 수집의 활성화 플래그 - 서로 독립이고 기본값은 모두 false다. compose가
+      # 전달하지 않으면 .env 값은 컨테이너에서 적용되지 않는다. 예전 CLAIMS_SETTLEMENT_SYNC_ENABLED는 읽지 않는다.
+      CLAIM_SYNC_ENABLED: ${CLAIM_SYNC_ENABLED:-false}
+      SETTLEMENT_SYNC_ENABLED: ${SETTLEMENT_SYNC_ENABLED:-false}
       # PostgreSQL 예약 백업(services/postgres_backup_service.py, 상용 ERP 확장) -
       # 기본 false. api/web에는 이 플래그·마운트를 두지 않는다(백업은 scheduler만
       # 수행한다). 활성화 절차·호스트 ACL 설정은 DEPLOYMENT.md 참고.

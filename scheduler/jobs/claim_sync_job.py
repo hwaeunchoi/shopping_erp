@@ -16,7 +16,7 @@ sync_cancellations_by_candidate_orders()도 호출한다 - 별개 capability
 results[code]["cancellations_by_order_lookup"]에 따로 담긴다. 이 경로는 자체
 회전식 체크포인트로 매 실행 요청 수를 제한한다(ClaimSyncService 참고).
 
-기본 차단: settings.claims_settlement_sync_enabled가 False(기본값)이면 이 잡은
+기본 차단: settings.claim_sync_enabled가 False(기본값)이면 이 잡은
 아무 것도 하지 않고 즉시 반환한다(세션도 열지 않고 커넥터도 만들지 않는다 - 외부
 HTTP 요청이 0건임을 보장한다). 실계정 검증 승인 후 운영자가 명시적으로 켜야 한다.
 
@@ -64,7 +64,7 @@ def _safe_error_summary(exc: Exception) -> str:
 
 
 def run() -> dict[str, dict]:
-    if not settings.claims_settlement_sync_enabled:
+    if not settings.claim_sync_enabled:
         logger.debug("클레임/정산 수집 기능이 비활성화(OFF) 상태라 claim_sync_job을 건너뜁니다.")
         return {"skipped_disabled": {"skipped": "disabled"}}
 

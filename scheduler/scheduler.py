@@ -223,7 +223,7 @@ def build_scheduler() -> BlockingScheduler:
     # 채널 상태 읽기 전용 재조회 - order_collect_job과 조회 범위가 겹치므로 주기를 다르게
     # 둬 과도한 중복 채널 호출을 피한다(order_collect_job.py는 그대로 둔다).
     scheduler.add_job(run_channel_status_sync, IntervalTrigger(minutes=15), id="channel_status_sync", max_instances=1)
-    # 취소/반품/교환 클레임 자동 수집 - 상용 ERP 확장(2단계, 기본 OFF: claims_settlement_sync_enabled).
+    # 취소/반품/교환 클레임 자동 수집 - 상용 ERP 확장(2단계, 기본 OFF: claim_sync_enabled).
     scheduler.add_job(run_claim_sync, IntervalTrigger(minutes=20), id="claim_sync", max_instances=1)
     # 재고/판매상태 전송 outbox 실행 - 상용 ERP 확장(3단계 첫 묶음, 기본 OFF:
     # product_channel_sync_enabled). outbox_dispatch_job(송장 전용)과는 완전히 분리된

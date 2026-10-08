@@ -37,6 +37,9 @@ CS_FIELDS = [
     "cs_inquiry_sync_max_requests_per_run",
     "cs_inquiry_sync_interval_minutes",
     "task_stale_running_threshold_minutes",
+    # 클레임/정산 수집 플래그(서로 독립, 기본 false)
+    "claim_sync_enabled",
+    "settlement_sync_enabled",
 ]
 ENV_NAMES = [f.upper() for f in CS_FIELDS]
 PASSED_TO = ("api", "scheduler")

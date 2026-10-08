@@ -5,7 +5,7 @@ scheduler/jobs/settlement_sync_job.py
 주문단위 상세를 수집하고 대사한다(services.settlement_sync_service.SettlementSyncService
 참고 - capability 인지 + 기능별 SAVEPOINT 격리).
 
-기본 차단: settings.claims_settlement_sync_enabled가 False(기본값)이면 이 잡은
+기본 차단: settings.settlement_sync_enabled가 False(기본값)이면 이 잡은
 아무 것도 하지 않고 즉시 반환한다(세션도 열지 않고 커넥터도 만들지 않는다 - 외부
 HTTP 요청이 0건임을 보장한다). 실계정 검증 승인 후 운영자가 명시적으로 켜야 한다.
 
@@ -64,7 +64,7 @@ def _safe_error_summary(exc: Exception) -> str:
 
 
 def run() -> dict[str, dict]:
-    if not settings.claims_settlement_sync_enabled:
+    if not settings.settlement_sync_enabled:
         logger.debug("클레임/정산 수집 기능이 비활성화(OFF) 상태라 settlement_sync_job을 건너뜁니다.")
         return {"skipped_disabled": {"skipped": "disabled"}}
 
