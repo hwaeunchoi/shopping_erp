@@ -28,6 +28,27 @@ class TestFlagDefaultsAndEnvMapping:
         assert parsed.settlement_sync_enabled is False
         assert not hasattr(parsed, "claims_settlement_sync_enabled")
 
+    def test_legacy_variable_is_ignored_even_when_present_at_import_time(self):
+        """Settings 모듈을 "새 프로세스"에서 import하며(클래스 정의 시점에 환경이 이미 있다) 예전 변수가 어느 플래그도
+        켜지 못하는지 확인한다 - 정의 시점에 환경을 읽는 구현도 잡아낸다."""
+        import os
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        repo = Path(__file__).resolve().parent.parent.parent
+        env = {k: v for k, v in os.environ.items() if k not in ("CLAIM_SYNC_ENABLED", "SETTLEMENT_SYNC_ENABLED")}
+        env[LEGACY] = "true"
+        code = (
+            "from config.settings import Settings; s = Settings(_env_file=None); "
+            "print(s.claim_sync_enabled, s.settlement_sync_enabled)"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", code], cwd=repo, env=env, capture_output=True, text=True, timeout=60
+        )
+        assert out.returncode == 0
+        assert out.stdout.strip() == "False False"
+
     def test_each_new_variable_enables_only_its_own_feature(self, monkeypatch):
         monkeypatch.setenv("CLAIM_SYNC_ENABLED", "true")
         only_claim = Settings(_env_file=None)  # type: ignore[call-arg]

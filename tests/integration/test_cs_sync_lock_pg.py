@@ -107,7 +107,7 @@ def pg_sandbox():
         _docker("network", "rm", network, check=False)
 
 
-def _run_scenario(sandbox: dict, scenario: str, timeout: int = 120) -> dict[str, Any]:
+def _run_scenario(sandbox: dict, scenario: str, timeout: int = 120, script: str = RUNNER_SCRIPT_REL) -> dict[str, Any]:
     result = subprocess.run(
         [
             "docker",
@@ -137,7 +137,7 @@ def _run_scenario(sandbox: dict, scenario: str, timeout: int = 120) -> dict[str,
             "MSYS_NO_PATHCONV=1",
             RUNNER_IMAGE,
             "python",
-            RUNNER_SCRIPT_REL,
+            script,
         ],
         capture_output=True,
         text=True,
