@@ -647,3 +647,26 @@ Docker Compose의 우선순위는 **프로세스(셸) 환경변수 > `.env`**입
 
 임시 override 파일(`-f override.yml`)로 환경변수를 주입하는 방식은 운영 절차로 사용하지 않습니다 - base compose만
 다시 적용하면 조용히 꺼지거나 켜져 9.4와 같은 사고가 납니다. 값은 항상 `.env` → base compose 경로로만 바꿉니다.
+
+### 10.3 클레임(취소·반품·교환) 수집과 정산 수집 플래그
+
+두 기능은 서로 독립된 플래그로 켠다(둘 다 기본 `false`). 예전 `CLAIMS_SETTLEMENT_SYNC_ENABLED`는 **더 이상 읽지 않으며**(deprecated)
+새 플래그를 자동으로 켜지도 않는다 - `.env`에 남아 있어도 아무 효과가 없으므로 정리하는 편이 좋다.
+
+| 환경변수 | Settings 필드 | 기본값 | 통제 대상 |
+|---|---|---:|---|
+| `CLAIM_SYNC_ENABLED` | `claim_sync_enabled` | `false` | `claim_sync` job, `POST /api/orders/sync-claims` |
+| `SETTLEMENT_SYNC_ENABLED` | `settlement_sync_enabled` | `false` | `settlement_sync` job, `POST /api/settlements/sync` |
+| `CLAIM_SYNC_WINDOW_DAYS` | `claim_sync_window_days` | `3` | 조회 기간(일) |
+| `CLAIM_SYNC_MAX_PAGES_PER_QUERY` | `claim_sync_max_pages_per_query` | `3` | 쿼리당 최대 페이지 |
+| `CLAIM_SYNC_MAX_RETRIES_PER_PAGE` | `claim_sync_max_retries_per_page` | `2` | 429 재시도 |
+| `CLAIM_SYNC_MAX_REQUESTS_PER_RUN` | `claim_sync_max_requests_per_run` | `105` | 플랫폼당 실행 1회의 HTTP 요청 절대 상한(계산식은 roadmap 문서) |
+| `CLAIM_SYNC_INTERVAL_MINUTES` | `claim_sync_interval_minutes` | `20` | scheduler 주기 |
+| `CLAIM_CANCEL_DETAIL_MAX_ORDERS_PER_RUN` | `claim_cancel_detail_max_orders_per_run` | `20` | 실행당 취소 단건 조회 주문 수 |
+
+- 모두 compose가 api와 scheduler에 같은 표현식으로 전달한다(web/postgres/redis 제외). 값을 바꾸면 10.2와 같은 경로로 api와 scheduler를
+  재생성해야 적용되고, 재생성 후 컨테이너 내부 값을 확인한다.
+- 플래그를 켜기 전에 확인할 것: 백업·DB revision·health·`external_commands` 진행 0건, 셸에 같은 이름의 환경변수가 없을 것(프로세스 환경이
+  `.env`보다 우선), 그리고 실계정 읽기 검증 승인.
+- 복구: 이상이 보이면 한 줄을 `false`로 되돌리고 api·scheduler를 재생성한다. 실패한 claim 수집은 다음 실행이 같은 기간을 다시
+  조회하므로 별도 보정이 필요 없고, 이미 저장된 claim은 지우지 않는다.

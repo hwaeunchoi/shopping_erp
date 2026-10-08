@@ -148,6 +148,88 @@
   실패/외부성공-로컬커밋실패)은 절대 자동 재시도하지 않고 UNKNOWN/RECONCILIATION_REQUIRED로
   전환" 원칙과 DB-atomic claim/lease 동시성 제어를 그대로 적용해야 한다.
 
+### 2-A단계 보완 - 클레임(취소·반품·교환) 수집: 플래그 분리 + 호출량 안전 상한 (구현 완료, feature 브랜치 `feature/claim-sync-safety-and-flag-split`)
+
+> 이 보완은 코드·테스트·문서까지다. 운영 병합·배포와 `CLAIM_SYNC_ENABLED` 활성화는 각각 별도 승인 후 진행한다
+> (기본값 `False` - 꺼져 있으면 세션·credential 복호화·외부 HTTP·DB 쓰기가 전혀 없다). 새 테이블·Alembic migration은
+> 없다(head `9162c416e673` 그대로 - `(order_id, platform_claim_id)` unique 인덱스와 `claim_unmatched_items`,
+> `claim_collection_cursors`가 이미 있다).
+
+#### 배경 (2026-10 운영 진단)
+
+운영의 `claim_sync` job(20분 주기)은 등록돼 있었지만 최근 7일 72회 실행이 모두 `skipped_disabled`였다 - 플래그가
+꺼져 있었고(`CLAIMS_SETTLEMENT_SYNC_ENABLED=false`), compose가 그 변수를 컨테이너에 전달하지도 않았다. 또 이 플래그 하나가
+정산 수집(`settlement_sync` 매일 07:30 + `POST /api/settlements/sync`)까지 함께 켜는 구조였고, 반품·교환 페이지네이션에는
+상한이 없었으며 취소 단건 조회는 실행당 50주문이었다.
+
+#### 1) 플래그 분리
+
+| 플래그 (환경변수) | 통제 대상 | 기본값 |
+|---|---|---|
+| `claim_sync_enabled` (`CLAIM_SYNC_ENABLED`) | `claim_sync` job(취소·반품·교환), `POST /api/orders/sync-claims` | `false` |
+| `settlement_sync_enabled` (`SETTLEMENT_SYNC_ENABLED`) | `settlement_sync` job, `POST /api/settlements/sync` | `false` |
+
+- 예전 `CLAIMS_SETTLEMENT_SYNC_ENABLED`는 **deprecated이고 더 이상 읽지 않는다**. 새 플래그 어느 쪽도 자동으로 켜지 않는다
+  (예전 값이 true였다면 정산까지 의도치 않게 켜질 수 있어 일부러 전파하지 않는다) - 운영자가 각각 명시적으로 켠다.
+- 한 플래그를 켜도 다른 기능은 세션·credential 복호화·HTTP·DB 쓰기가 0건이다(자동 job·수동 API 모두 테스트로 고정).
+
+#### 2) 요청량 계산 (플랫폼 1개, 실행 1회)
+
+| 항목 | 계산 | 기본값 최악 |
+|---|---|---:|
+| 반품 | 상태 4종(RU/UC/CC/PR) x 31일 창 1개 x 최대 3페이지 x (최초 1 + retry 2) | 36 |
+| 교환 | 7일 창 1개 x 최대 3페이지 x (1 + 2) | 9 |
+| 목록 소계 | | **45** |
+| 취소 단건 조회 | 20주문 x 1페이지(고정) x (1 + 2) | 60 |
+| **총 최악 = `CLAIM_SYNC_MAX_REQUESTS_PER_RUN`** | | **105** |
+
+정상 실행은 반품 4 + 교환 1 + 취소 조회 최대 20 = 25회 안팎이다. 조회 창이 늘어나면(수동 sync의 긴 기간 등) 창 개수만큼 늘어나고,
+커넥터가 실제 쿼리 구조에서 그 최악치를 계산해(`estimate_claim_requests`) 기능을 시작하기 전에 예산에 들어가는지 확인한다.
+
+#### 3) 호출량 제한
+
+- 설정(모두 `config/settings.py` `claim_sync_*`, compose가 api·scheduler에 같은 값으로 전달): 조회 3일, 쿼리당 3페이지,
+  페이지당 retry 2, 실행당 예산 105, 주기 20분, 취소 단건 조회 20주문.
+- 첫 요청과 429 재시도는 모두 **전송 직전에** 공유 `RequestBudget`을 소비한다. 예산이 모자라면 네트워크로 나가기 전에
+  `REQUEST_BUDGET_EXCEEDED`로 막힌다. 반품·교환·취소 단건 조회가 하나의 예산을 공유한다.
+- 사전 검사: 기능의 최악 요청 수가 실행당 예산보다 크면 요청 없이 `BUDGET_TOO_SMALL`(설정 오류), 이번 실행의 남은 예산이
+  모자라면 요청 없이 `REQUEST_BUDGET_EXCEEDED`로 그 기능만 실패한다.
+- 페이지: 다음 `nextToken`이 있는데 `max_pages`에 도달하면 **다음 요청을 보내지 않고** `PAGE_LIMIT_EXCEEDED`.
+  이미 쓴 `nextToken`이 다시 오면 `PAGINATION_LOOP`, 데이터가 빈 페이지에 `nextToken`이 오면 `PAGINATION_ANOMALY`
+  (모두 retry 불가) - 상한을 주지 않는 기존 호출부도 무한 순회하지 않는다.
+
+#### 4) 취소 단건 조회 (후보 주문 순환)
+
+- 실행당 최대 `claim_cancel_detail_max_orders_per_run`(20)개, 목록 조회와 같은 예산을 공유하며 각 주문 전에 "최초+retry" 최악치가
+  남은 예산에 드는지 확인한다(아니면 요청 없이 멈추고 다음 실행이 이어간다).
+- 회전식 cursor(`claim_collection_cursors`, platform+유형당 1행): 후보(배송 전 상태 주문) N개를 N/20 x 20분에 한 바퀴 돈다
+  (쿠팡 후보 약 300건이면 약 5시간).
+- 개별 주문 오류(`PAGE_LIMIT_EXCEEDED`/`PAGINATION_*`/`BAD_RESPONSE`/`PARSE_FAILED` 등)는 그 주문만 건너뛰고 cursor를 전진시킨다 -
+  한 주문의 영구 오류가 같은 자리에서 매번 배치를 멈춰 뒤 후보를 굶기지 않는다(건너뛴 주문은 다음 회전에서 다시 확인). 건너뜀이
+  연속 3회면 공통 문제로 보고 멈춘다. 공통 원인(인증 거부/429/5xx/timeout/연결 실패/예산 소진)은 즉시 멈추고 cursor는 실패한 주문
+  앞에 남아 다음 실행이 그 주문부터 다시 시도한다.
+- 로그에는 reason code·platform id·건수만 남고 주문번호·credential·고객정보는 남기지 않는다.
+
+#### 5) 저장·dedup·미매칭 정책
+
+- 식별: `(order_id, platform_claim_id)` unique(교환/반품/취소 각각). 같은 claim 재수집은 새로 만들지 않고 갱신하며, 오래된 응답이
+  이미 반영된 상태를 되돌리지 못한다. 동시에 같은 claim을 저장해도 행은 1개다(SAVEPOINT가 패자를 `DB_WRITE_FAILED`로 격리).
+- 주문 연결: `platform_order_no`로 주문을 찾아 정확히 연결하고, 없으면 `claim_unmatched_items`에 보존한다(조용히 버리지 않음).
+  다음 sync가 시작될 때 주문이 생긴 미매칭을 먼저 실제 claim으로 승격하며 중복은 없다.
+- 트랜잭션: 반품·교환·취소는 각각 SAVEPOINT 안에서 "전부 조회한 뒤 저장"한다 - 조회 중 실패하면 그 기능은 아무 것도 저장하지
+  않고(부분 저장 없음) 다른 기능은 계속된다. 실패한 기능은 다음 실행(20분 뒤)이 같은 기간을 다시 조회한다. 최상위 commit이
+  실패하면 전부 롤백되고(반품·교환·미매칭 0건) 재실행하면 한 건으로 수렴한다(격리 PostgreSQL 테스트).
+- 알려진 한계: 조회 창은 `[오늘-3일, 오늘)` 반열린 구간이라 오늘 접수된 claim은 다음 날부터 보인다. 쿠팡 반품 API의 `createdAtTo`
+  경계 의미를 공식 문서로 확인하지 못해 임의로 늘리지 않았다.
+
+#### 6) 활성화 전 남은 단계
+
+1. 이 브랜치 검토 후 merge·push(별도 승인), api/scheduler 이미지 빌드·배포(compose 계약 포함, 별도 승인).
+2. 실계정 읽기 검증 1회 승인(예상 최대 요청 수는 위 표 - 반품 4 + 교환 1, 취소 조회 제외 수동 경로) - 응답 구조·`createdAtTo`
+   경계·페이지 수를 확인한다.
+3. `CLAIM_SYNC_ENABLED=true`는 정산(`SETTLEMENT_SYNC_ENABLED`)과 별개로 켠다. 이상이 있으면 같은 경로(`.env` → compose → api·scheduler
+   재생성)로 즉시 끈다. 이미 저장된 claim은 지우지 않는다.
+
 ### 3단계 - 상품/재고 동기화 (구현 완료 - 네이버·쿠팡 MockTransport 계약 검증, 실계정 미검증)
 
 - **실제 구현된 범위**: 내부 상품/옵션 → 채널 "쓰기" 4종을 outbox(`ExternalCommand`)
