@@ -40,6 +40,13 @@ CS_FIELDS = [
     # 클레임/정산 수집 플래그(서로 독립, 기본 false)
     "claim_sync_enabled",
     "settlement_sync_enabled",
+    # 클레임 수집 호출량 제한
+    "claim_sync_window_days",
+    "claim_sync_max_pages_per_query",
+    "claim_sync_max_retries_per_page",
+    "claim_sync_max_requests_per_run",
+    "claim_sync_interval_minutes",
+    "claim_cancel_detail_max_orders_per_run",
 ]
 ENV_NAMES = [f.upper() for f in CS_FIELDS]
 PASSED_TO = ("api", "scheduler")

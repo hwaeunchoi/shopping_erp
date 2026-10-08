@@ -74,6 +74,29 @@ class Settings(BaseSettings):
     claim_sync_enabled: bool = False
     settlement_sync_enabled: bool = False
 
+    # claim_sync 호출량 안전 상한 - CS 문의 수집(cs_inquiry_sync_*)과 같은 fail-closed 구조다. 공식 쿠팡 rate limit은
+    # 요청 수/시간으로 공개돼 있지 않아 아래 값은 공식 한도가 아니라 이 ERP의 보수적 내부 예산이다.
+    #
+    # 조회 기간(일) - 최근 N일을 매 실행 다시 조회한다(claim ID 기반 dedup이라 재조회는 안전하다).
+    claim_sync_window_days: int = 3
+    # 쿼리 1개(반품은 상태 x 31일 창, 교환은 7일 창) 안에서 허용하는 최대 페이지 수. 다음 페이지가 더 있는데 이
+    # 상한에 도달하면 다음 요청을 보내지 않고 PAGE_LIMIT_EXCEEDED로 그 기능(반품 또는 교환)을 실패 처리한다.
+    claim_sync_max_pages_per_query: int = 3
+    # 페이지 1회 요청당 HTTP 429 재시도 횟수(재시도도 아래 요청 예산을 소비한다).
+    claim_sync_max_retries_per_page: int = 2
+    # 플랫폼 1개당 scheduler 1회 실행(또는 수동 sync 1회)에서 실제로 나가는 HTTP 요청의 절대 상한(최초 시도 +
+    # 재시도 + 모든 페이지 + 취소 단건 조회 전부 합산). 기본값 계산(쿠팡, 창 3일):
+    #   반품  = 상태 4종 x 31일 창 1개 x 3페이지 x (1+2) = 36
+    #   교환  = 7일 창 1개 x 3페이지 x (1+2)               =  9   -> 목록 최악 45
+    #   취소 단건 조회 = 20주문 x 1페이지 x (1+2)            = 60   -> 총 최악 105
+    # 정상 실행은 반품 4 + 교환 1 + 취소 조회 최대 20 = 25회 안팎이다.
+    claim_sync_max_requests_per_run: int = 105
+    # scheduler 실행 주기(분) - scheduler/scheduler.py의 IntervalTrigger가 이 값을 읽는다.
+    claim_sync_interval_minutes: int = 20
+    # 실행당 취소 단건 조회(후보 주문) 최대 개수 - 예전에는 50개였다. 후보(배송 전 상태 주문)가 많으면 회전식
+    # cursor로 여러 실행에 나눠 훑는다(후보 N개를 한 바퀴 도는 시간 = N / 20 x 20분).
+    claim_cancel_detail_max_orders_per_run: int = 20
+
     # 상용 ERP 확장(3단계, 첫 묶음) - 기존 채널 상품(옵션)의 재고 수량/판매상태 전송을
     # 자동(scheduler.jobs.product_sync_dispatch_job) + 수동(POST /api/products/
     # platform-map/{id}/sync-inventory, /sync-sale-status) 모두 이 플래그로 통제한다.

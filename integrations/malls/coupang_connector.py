@@ -528,24 +528,50 @@ class CoupangConnector(BaseMallConnector):
         raw_items = self._fetch_raw_settlement_histories(start_date, end_date, access_key, secret_key)
         return self._normalize_settlement_histories(raw_items)
 
-    def fetch_returns(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+    def fetch_returns(
+        self,
+        start_date: date,
+        end_date: date,
+        *,
+        max_pages: Optional[int] = None,
+        max_retries: Optional[int] = None,
+        request_budget: Optional[RequestBudget] = None,
+    ) -> list[dict[str, Any]]:
         """반품 목록 조회(공식 문서: developers.coupang.com/ko/api/returns/
         return-cancellation-request-list-query, 2026-09 조회) - status 코드별로 순회해
-        기간 내 전체를 모은다(모듈 상수 RETURN_STATUS_CODES 참고)."""
+        기간 내 전체를 모은다(모듈 상수 RETURN_STATUS_CODES 참고). max_pages/max_retries/request_budget은
+        호출량 제한(기본값 None = 페이지 상한·예산 없음, 단 같은 nextToken 반복·빈 페이지 token 이상 응답은 항상 차단)."""
         credentials = self._get_credentials()
         if credentials is None:
             raise MarketplaceCredentialMissingError("coupang")
         access_key, secret_key, vendor_id = credentials
-        raw_items = self._fetch_raw_return_requests(start_date, end_date, access_key, secret_key, vendor_id)
+        raw_items = self._fetch_raw_return_requests(
+            start_date,
+            end_date,
+            access_key,
+            secret_key,
+            vendor_id,
+            max_pages=max_pages,
+            max_retries=max_retries,
+            request_budget=request_budget,
+        )
         return self._normalize_return_requests(raw_items)
 
-    def fetch_cancellation_status(self, platform_order_no: str, since: date) -> Optional[dict[str, Any]]:
+    def fetch_cancellation_status(
+        self,
+        platform_order_no: str,
+        since: date,
+        *,
+        max_retries: Optional[int] = None,
+        request_budget: Optional[RequestBudget] = None,
+    ) -> Optional[dict[str, Any]]:
         """지정한 주문 하나의 취소 여부를 조회한다(모듈 상단 CANCEL_LOOKUP_WINDOW_DAYS
         주석의 공식 문서 근거 참고) - orderId+cancelType=CANCEL 조합, status 파라미터
         제외. 조회기간은 [since, 오늘] 중 최근 CANCEL_LOOKUP_WINDOW_DAYS일로 제한한다
         (그보다 오래전에 발생한 취소는 이 방식으로 확인할 수 없다는 한계가 있다 -
         services.claim_sync_service의 후보 선정 자체가 배송 전 상태의 주문만 대상으로
-        하므로 실무적으로는 이 범위 밖 사례가 드물 것으로 본다)."""
+        하므로 실무적으로는 이 범위 밖 사례가 드물 것으로 본다). 단건 조회라 페이지는 1로 고정한다
+        (다음 페이지가 있으면 PAGE_LIMIT_EXCEEDED - 그 주문만 이번 회차에서 건너뛴다)."""
         credentials = self._get_credentials()
         if credentials is None:
             raise MarketplaceCredentialMissingError("coupang")
@@ -553,7 +579,14 @@ class CoupangConnector(BaseMallConnector):
         today = date.today()
         window_start = max(since, today - timedelta(days=CANCEL_LOOKUP_WINDOW_DAYS))
         raw_items = self._fetch_raw_cancel_by_order(
-            window_start, today, platform_order_no, access_key, secret_key, vendor_id
+            window_start,
+            today,
+            platform_order_no,
+            access_key,
+            secret_key,
+            vendor_id,
+            max_retries=max_retries,
+            request_budget=request_budget,
         )
         normalized = self._normalize_cancel_requests(raw_items)
         return normalized[0] if normalized else None
@@ -620,16 +653,51 @@ class CoupangConnector(BaseMallConnector):
         )
         return self._normalize_online_inquiries(raw_items)
 
-    def fetch_exchanges(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+    def fetch_exchanges(
+        self,
+        start_date: date,
+        end_date: date,
+        *,
+        max_pages: Optional[int] = None,
+        max_retries: Optional[int] = None,
+        request_budget: Optional[RequestBudget] = None,
+    ) -> list[dict[str, Any]]:
         """교환 목록 조회(공식 문서: developers.coupang.com/ko/api/exchanges/
         query-a-list-of-exchange-requests, 2026-09 조회) - 조회기간 최대 7일이라
-        내부적으로 7일 단위로 나눠 호출한다."""
+        내부적으로 7일 단위로 나눠 호출한다. 호출량 제한 파라미터는 fetch_returns()와 같다."""
         credentials = self._get_credentials()
         if credentials is None:
             raise MarketplaceCredentialMissingError("coupang")
         access_key, secret_key, vendor_id = credentials
-        raw_items = self._fetch_raw_exchange_requests(start_date, end_date, access_key, secret_key, vendor_id)
+        raw_items = self._fetch_raw_exchange_requests(
+            start_date,
+            end_date,
+            access_key,
+            secret_key,
+            vendor_id,
+            max_pages=max_pages,
+            max_retries=max_retries,
+            request_budget=request_budget,
+        )
         return self._normalize_exchange_requests(raw_items)
+
+    def estimate_claim_requests(
+        self, feature: str, start_date: date, end_date: date, max_pages: int, max_retries: int
+    ) -> Optional[int]:
+        """claim 수집 한 번의 "최악" HTTP 요청 수 = 쿼리 수 x 쿼리당 최대 페이지 x (최초 1 + retry).
+        쿼리 수는 실제 조회 구조에서 나온다: 반품 = 상태 코드(RETURN_STATUS_CODES) x 31일 창,
+        교환 = 7일 창, 취소 단건 조회 = 1(페이지 1로 고정)."""
+        days = max((end_date - start_date).days, 0)
+        attempts = 1 + max_retries
+        if feature == "returns":
+            windows = -(-days // RETURN_MAX_RANGE_DAYS)
+            return len(RETURN_STATUS_CODES) * windows * max_pages * attempts
+        if feature == "exchanges":
+            windows = -(-days // EXCHANGE_MAX_RANGE_DAYS)
+            return windows * max_pages * attempts
+        if feature == "cancellation_lookup":
+            return attempts
+        return None
 
     def fetch_settlement_details(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
         """매출내역(주문 단위 정산 상세) 조회(공식 문서: developers.coupang.com/ko/api/
@@ -1165,8 +1233,71 @@ class CoupangConnector(BaseMallConnector):
 
     # --- 반품 목록 조회 ---
 
+    def _collect_token_pages(
+        self,
+        path: str,
+        base_params: list[tuple[str, str]],
+        access_key: str,
+        secret_key: str,
+        *,
+        max_pages: Optional[int],
+        max_retries: Optional[int],
+        request_budget: Optional[RequestBudget],
+    ) -> list[dict[str, Any]]:
+        """한 쿼리(상태 x 기간 창 1개)의 nextToken 페이지를 끝까지 모으되 무한 순회를 막는다.
+
+        - 첫 요청과 모든 다음 페이지/429 재시도가 request_budget을 소비한다(전송 직전 차단).
+        - 다음 페이지가 있는데 max_pages에 도달하면 다음 요청을 보내지 않고 PAGE_LIMIT_EXCEEDED.
+        - 이미 사용한 nextToken이 다시 오면(반복) PAGINATION_LOOP, 데이터가 빈 페이지인데 nextToken이
+          오면(이상 응답) PAGINATION_ANOMALY - 둘 다 재시도해도 소용없는 오류(retryable=False)다.
+        - 쿼리 파라미터 순서는 서명에 쓴 쿼리와 전송 쿼리가 같도록 고정한다(nextToken은 항상 마지막).
+        """
+        items: list[dict[str, Any]] = []
+        token = ""
+        used_tokens: set[str] = set()
+        pages = 0
+        while True:
+            params = list(base_params)
+            if token:
+                params.append(("nextToken", token))
+            query = urlencode(params)
+            authorization = self._authorization(access_key, secret_key, "GET", path, query)
+            response = self._request_with_retry(
+                "GET",
+                f"{path}?{query}",
+                headers={"Authorization": authorization},
+                max_retries=max_retries,
+                request_budget=request_budget,
+            )
+            raise_for_status("coupang", response.status_code)
+            pages += 1
+            with external_call("coupang"):
+                payload = response.json()
+                data = payload.get("data", []) or []
+                next_token = payload.get("nextToken") or ""
+            items.extend(data)
+            if not next_token:
+                return items
+            if next_token == token or next_token in used_tokens:
+                raise MarketplaceExternalAPIError("coupang", "PAGINATION_LOOP", False)
+            if not data:
+                raise MarketplaceExternalAPIError("coupang", "PAGINATION_ANOMALY", False)
+            if max_pages is not None and pages >= max_pages:
+                raise MarketplaceExternalAPIError("coupang", "PAGE_LIMIT_EXCEEDED", False)
+            used_tokens.add(next_token)
+            token = next_token
+
     def _fetch_raw_return_requests(
-        self, start_date: date, end_date: date, access_key: str, secret_key: str, vendor_id: str
+        self,
+        start_date: date,
+        end_date: date,
+        access_key: str,
+        secret_key: str,
+        vendor_id: str,
+        *,
+        max_pages: Optional[int] = None,
+        max_retries: Optional[int] = None,
+        request_budget: Optional[RequestBudget] = None,
     ) -> list[dict[str, Any]]:
         path = RETURN_REQUEST_PATH_TMPL.format(vendor_id=vendor_id)
         raw_items: list[dict[str, Any]] = []
@@ -1175,28 +1306,22 @@ class CoupangConnector(BaseMallConnector):
             window_start = start_date
             while window_start < end_date:
                 window_end = min(window_start + timedelta(days=RETURN_MAX_RANGE_DAYS), end_date)
-                next_token = ""
-                while True:
-                    params: list[tuple[str, str]] = [
-                        ("createdAtFrom", window_start.isoformat()),
-                        ("createdAtTo", window_end.isoformat()),
-                        ("status", status_value),
-                        ("maxPerPage", str(RETURN_MAX_PER_PAGE)),
-                    ]
-                    if next_token:
-                        params.append(("nextToken", next_token))
-                    query = urlencode(params)
-                    authorization = self._authorization(access_key, secret_key, "GET", path, query)
-                    response = self._request_with_retry(
-                        "GET", f"{path}?{query}", headers={"Authorization": authorization}
+                raw_items.extend(
+                    self._collect_token_pages(
+                        path,
+                        [
+                            ("createdAtFrom", window_start.isoformat()),
+                            ("createdAtTo", window_end.isoformat()),
+                            ("status", status_value),
+                            ("maxPerPage", str(RETURN_MAX_PER_PAGE)),
+                        ],
+                        access_key,
+                        secret_key,
+                        max_pages=max_pages,
+                        max_retries=max_retries,
+                        request_budget=request_budget,
                     )
-                    raise_for_status("coupang", response.status_code)
-                    with external_call("coupang"):
-                        payload = response.json()
-                        raw_items.extend(payload.get("data", []) or [])
-                        next_token = payload.get("nextToken") or ""
-                    if not next_token:
-                        break
+                )
                 window_start = window_end
 
         return raw_items
@@ -1391,34 +1516,35 @@ class CoupangConnector(BaseMallConnector):
         return normalized
 
     def _fetch_raw_cancel_by_order(
-        self, start_date: date, end_date: date, platform_order_no: str, access_key: str, secret_key: str, vendor_id: str
+        self,
+        start_date: date,
+        end_date: date,
+        platform_order_no: str,
+        access_key: str,
+        secret_key: str,
+        vendor_id: str,
+        *,
+        max_retries: Optional[int] = None,
+        request_budget: Optional[RequestBudget] = None,
     ) -> list[dict[str, Any]]:
         """단일 주문의 취소 여부를 orderId+cancelType=CANCEL로 조회한다(status는
-        쿼리에서 제외 - 모듈 상단 CANCEL_LOOKUP_WINDOW_DAYS 주석 참고). 단건이라
-        nextToken 반복은 방어적으로만 유지한다(사실상 1페이지로 끝난다)."""
+        쿼리에서 제외 - 모듈 상단 CANCEL_LOOKUP_WINDOW_DAYS 주석 참고). 단건이라 페이지는 1로
+        고정한다 - 다음 페이지가 있으면 PAGE_LIMIT_EXCEEDED(다음 페이지 요청은 보내지 않는다)."""
         path = RETURN_REQUEST_PATH_TMPL.format(vendor_id=vendor_id)
-        raw_items: list[dict[str, Any]] = []
-        next_token = ""
-        while True:
-            params: list[tuple[str, str]] = [
+        return self._collect_token_pages(
+            path,
+            [
                 ("createdAtFrom", start_date.isoformat()),
                 ("createdAtTo", end_date.isoformat()),
                 ("cancelType", "CANCEL"),
                 ("orderId", platform_order_no),
-            ]
-            if next_token:
-                params.append(("nextToken", next_token))
-            query = urlencode(params)
-            authorization = self._authorization(access_key, secret_key, "GET", path, query)
-            response = self._request_with_retry("GET", f"{path}?{query}", headers={"Authorization": authorization})
-            raise_for_status("coupang", response.status_code)
-            with external_call("coupang"):
-                payload = response.json()
-                raw_items.extend(payload.get("data", []) or [])
-                next_token = payload.get("nextToken") or ""
-            if not next_token:
-                break
-        return raw_items
+            ],
+            access_key,
+            secret_key,
+            max_pages=1,
+            max_retries=max_retries,
+            request_budget=request_budget,
+        )
 
     @staticmethod
     def _normalize_cancel_requests(raw_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1433,7 +1559,16 @@ class CoupangConnector(BaseMallConnector):
     # --- 교환 목록 조회 ---
 
     def _fetch_raw_exchange_requests(
-        self, start_date: date, end_date: date, access_key: str, secret_key: str, vendor_id: str
+        self,
+        start_date: date,
+        end_date: date,
+        access_key: str,
+        secret_key: str,
+        vendor_id: str,
+        *,
+        max_pages: Optional[int] = None,
+        max_retries: Optional[int] = None,
+        request_budget: Optional[RequestBudget] = None,
     ) -> list[dict[str, Any]]:
         path = EXCHANGE_REQUEST_PATH_TMPL.format(vendor_id=vendor_id)
         raw_items: list[dict[str, Any]] = []
@@ -1441,24 +1576,20 @@ class CoupangConnector(BaseMallConnector):
         window_start = start_date
         while window_start < end_date:
             window_end = min(window_start + timedelta(days=EXCHANGE_MAX_RANGE_DAYS), end_date)
-            next_token = ""
-            while True:
-                params: list[tuple[str, str]] = [
-                    ("createdAtFrom", f"{window_start.isoformat()}T00:00:00"),
-                    ("createdAtTo", f"{window_end.isoformat()}T00:00:00"),
-                ]
-                if next_token:
-                    params.append(("nextToken", next_token))
-                query = urlencode(params)
-                authorization = self._authorization(access_key, secret_key, "GET", path, query)
-                response = self._request_with_retry("GET", f"{path}?{query}", headers={"Authorization": authorization})
-                raise_for_status("coupang", response.status_code)
-                with external_call("coupang"):
-                    payload = response.json()
-                    raw_items.extend(payload.get("data", []) or [])
-                    next_token = payload.get("nextToken") or ""
-                if not next_token:
-                    break
+            raw_items.extend(
+                self._collect_token_pages(
+                    path,
+                    [
+                        ("createdAtFrom", f"{window_start.isoformat()}T00:00:00"),
+                        ("createdAtTo", f"{window_end.isoformat()}T00:00:00"),
+                    ],
+                    access_key,
+                    secret_key,
+                    max_pages=max_pages,
+                    max_retries=max_retries,
+                    request_budget=request_budget,
+                )
+            )
             window_start = window_end
 
         return raw_items

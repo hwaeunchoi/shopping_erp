@@ -44,10 +44,10 @@ class StubClaimConnector:
     def fetch_cancellations(self, s, e):
         return self._feature("cancellations")
 
-    def fetch_returns(self, s, e):
+    def fetch_returns(self, s, e, **limits):
         return self._feature("returns")
 
-    def fetch_exchanges(self, s, e):
+    def fetch_exchanges(self, s, e, **limits):
         return self._feature("exchanges")
 
 
@@ -508,7 +508,7 @@ class StubCancellationLookupConnector:
         self._errors = errors or {}
         self.calls: list[str] = []
 
-    def fetch_cancellation_status(self, platform_order_no, since):
+    def fetch_cancellation_status(self, platform_order_no, since, **limits):
         self.calls.append(platform_order_no)
         if platform_order_no in self._errors:
             raise self._errors[platform_order_no]
@@ -535,7 +535,7 @@ class TestCancellationOrderLookup:
         _make_order_with_status(db_session, platform, "O-CANCELED", "CANCELED")
         conn = StubCancellationLookupConnector(results={o1.platform_order_no: None})
 
-        ClaimSyncService(db_session).sync_cancellations_by_candidate_orders(conn, platform.id, max_requests=10)
+        ClaimSyncService(db_session).sync_cancellations_by_candidate_orders(conn, platform.id, max_orders=10)
 
         assert conn.calls == ["O-NEW"]
 
@@ -555,20 +555,20 @@ class TestCancellationOrderLookup:
     def test_batch_is_limited_and_checkpoint_persists_across_calls(self, db_session, platform):
         """max_requests보다 후보가 많으면 이번 실행은 앞쪽만 처리하고, 다음 호출은
         체크포인트(마지막으로 본 Order.id)부터 이어서 처리한다(전체 무제한 순회 금지).
-        max_requests=1로 둬 이번 실행이 정확히 예산만큼만 채워지게 해서(끝에 도달하지
+        max_orders=1로 둬 이번 실행이 정확히 예산만큼만 채워지게 해서(끝에 도달하지
         않음) 회전(wrap-around) 보충 로직이 끼어들지 않는 상태로 체크포인트 이어받기만
         검증한다(회전 자체는 test_wraps_around_after_reaching_the_end에서 별도 검증)."""
         orders = [_make_order_with_status(db_session, platform, f"O-{i}", "NEW") for i in range(3)]
         conn = StubCancellationLookupConnector(results={o.platform_order_no: None for o in orders})
         svc = ClaimSyncService(db_session)
 
-        svc.sync_cancellations_by_candidate_orders(conn, platform.id, max_requests=1)
+        svc.sync_cancellations_by_candidate_orders(conn, platform.id, max_orders=1)
         assert conn.calls == ["O-0"]
 
-        svc.sync_cancellations_by_candidate_orders(conn, platform.id, max_requests=1)
+        svc.sync_cancellations_by_candidate_orders(conn, platform.id, max_orders=1)
         assert conn.calls == ["O-0", "O-1"]
 
-        svc.sync_cancellations_by_candidate_orders(conn, platform.id, max_requests=1)
+        svc.sync_cancellations_by_candidate_orders(conn, platform.id, max_orders=1)
         assert conn.calls == ["O-0", "O-1", "O-2"]
 
     def test_wraps_around_after_reaching_the_end(self, db_session, platform):
@@ -576,11 +576,11 @@ class TestCancellationOrderLookup:
         conn = StubCancellationLookupConnector(results={o.platform_order_no: None for o in orders})
         svc = ClaimSyncService(db_session)
 
-        svc.sync_cancellations_by_candidate_orders(conn, platform.id, max_requests=2)
+        svc.sync_cancellations_by_candidate_orders(conn, platform.id, max_orders=2)
         assert conn.calls == ["O-0", "O-1"]
 
-        # 후보가 2건뿐인데 max_requests=2를 다 채우지 못했으니(끝에 도달) 처음부터 다시 순회한다.
-        svc.sync_cancellations_by_candidate_orders(conn, platform.id, max_requests=2)
+        # 후보가 2건뿐인데 max_orders=2를 다 채우지 못했으니(끝에 도달) 처음부터 다시 순회한다.
+        svc.sync_cancellations_by_candidate_orders(conn, platform.id, max_orders=2)
         assert conn.calls == ["O-0", "O-1", "O-0", "O-1"]
 
     def test_external_error_stops_batch_and_checkpoint_does_not_pass_it(self, db_session, platform):
@@ -683,15 +683,15 @@ class TestCancellationOrderLookup:
         svc = ClaimSyncService(db_session)
 
         conn_p1 = StubCancellationLookupConnector(results={"P1-O1": None, "P1-O2": None})
-        svc.sync_cancellations_by_candidate_orders(conn_p1, platform.id, max_requests=1)
+        svc.sync_cancellations_by_candidate_orders(conn_p1, platform.id, max_orders=1)
         assert conn_p1.calls == ["P1-O1"]  # platform 1의 커서만 P1-O1까지 전진.
 
         conn_p2 = StubCancellationLookupConnector(results={"P2-O1": None})
-        svc.sync_cancellations_by_candidate_orders(conn_p2, second_platform.id, max_requests=10)
+        svc.sync_cancellations_by_candidate_orders(conn_p2, second_platform.id, max_orders=10)
         assert conn_p2.calls == ["P2-O1"]  # platform 2는 platform 1의 진행 위치와 무관하게 처음부터.
 
         # platform 1을 이어서 실행하면 앞서 멈춘 지점(P1-O2)부터 이어간다 - platform 2
         # 실행이 platform 1의 커서에 영향을 주지 않았음을 확인한다.
         conn_p1_again = StubCancellationLookupConnector(results={"P1-O2": None})
-        svc.sync_cancellations_by_candidate_orders(conn_p1_again, platform.id, max_requests=1)
+        svc.sync_cancellations_by_candidate_orders(conn_p1_again, platform.id, max_orders=1)
         assert conn_p1_again.calls == ["P1-O2"]

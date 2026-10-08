@@ -644,6 +644,7 @@ def sync_claims(payload: OrderSyncRequest, db: Session = Depends(get_db)) -> JSO
 
     # 미검증 채널은 팩토리가 MarketplaceCapabilityUnsupportedError -> 전역 핸들러 501.
     connector = get_mall_connector(platform.connector_class, session=db, platform_id=platform.id)
+    # 자동 수집과 같은 호출량 제한(페이지 상한·retry·요청 예산)을 쓴다 - 수동 호출도 무제한 경로가 없다.
     result = ClaimSyncService(db).sync_claims(connector, platform.id, payload.start_date, payload.end_date)
     try:
         db.commit()

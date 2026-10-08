@@ -43,13 +43,11 @@ from integrations.malls.errors import (
 )
 from repositories.extra_repository import IntegrationStatusRepository
 from repositories.platform_repository import PlatformRepository
-from services.claim_sync_service import ClaimSyncService
+from services.claim_sync_service import ClaimSyncService, build_claim_sync_limits
 
 INTEGRATION_TYPE = "CLAIM"
 
 logger = logging.getLogger(__name__)
-
-COLLECT_WINDOW_DAYS = 3
 
 
 def _safe_error_summary(exc: Exception) -> str:
@@ -71,18 +69,28 @@ def run() -> dict[str, dict]:
     results: dict[str, dict] = {}
     with session_scope() as db:
         end_date = date.today()
-        start_date = end_date - timedelta(days=COLLECT_WINDOW_DAYS)
+        start_date = end_date - timedelta(days=max(1, settings.claim_sync_window_days))
         sync_service = ClaimSyncService(db)
         integration_status_repo = IntegrationStatusRepository(db)
 
         for platform in PlatformRepository(db).list_active():
             try:
                 connector = get_mall_connector(platform.connector_class, session=db, platform_id=platform.id)
-                result = sync_service.sync_claims(connector, platform.id, start_date, end_date)
+                # 플랫폼 1개당 요청 예산 1개를 목록 조회(반품·교환)와 취소 단건 조회가 공유한다 -
+                # 실행 전체의 실제 HTTP 요청 수가 settings.claim_sync_max_requests_per_run을 넘지 못한다.
+                limits = build_claim_sync_limits()
+                result = sync_service.sync_claims(connector, platform.id, start_date, end_date, limits)
                 # "후보 주문 단건 조회" 방식 취소 수집(기간 대량조회가 안 되는 채널 전용,
                 # 예: 쿠팡) - sync_claims()와 별개 capability라 결과도 별도 키로 담는다.
                 result["cancellations_by_order_lookup"] = sync_service.sync_cancellations_by_candidate_orders(
-                    connector, platform.id
+                    connector, platform.id, settings.claim_cancel_detail_max_orders_per_run, limits
+                )
+                result["requests_used"] = limits.budget.used
+                logger.info(
+                    "클레임 수집 요청 사용량: platform=%s, used=%s/%s",
+                    platform.code,
+                    limits.budget.used,
+                    limits.budget.max_requests,
                 )
                 results[platform.code] = result
                 _record_integration_status(integration_status_repo, platform.code, result.get("overall_status"))

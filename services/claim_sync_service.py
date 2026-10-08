@@ -36,16 +36,19 @@ ERP의 Cancellation/Return/Exchange 레코드로 미러링한다.
 
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Callable, Optional
 
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from config.settings import settings
 from integrations.malls.errors import (
     MarketplaceCapabilityUnsupportedError,
     MarketplaceCredentialMissingError,
     MarketplaceExternalAPIError,
+    RequestBudget,
 )
 from models.order import Cancellation, ClaimUnmatched, Exchange, Return
 from repositories.order_repository import (
@@ -72,8 +75,51 @@ _TERMINAL_STATUSES = {"COMPLETED", "REFUNDED", "REJECTED"}
 # (models.order.ClaimCollectionCursor - 실제 Cancellation.claim_type이 아니라
 # 진행 위치 구분용 키다).
 CANCELLATION_ORDER_LOOKUP_CURSOR_TYPE = "CANCELLATION_ORDER_LOOKUP"
-# 실행 1회당 최대 조회 요청 수 - 전체 주문을 무제한 순회하지 않기 위한 예산.
-DEFAULT_CANCELLATION_LOOKUP_BATCH = 50
+# 취소 단건 조회 후보 주문의 실행당 기본 상한(settings.claim_cancel_detail_max_orders_per_run이 우선한다).
+DEFAULT_CANCELLATION_LOOKUP_BATCH = 20
+
+# 취소 단건 조회 중 이 reason을 만나면 같은 일이 다음 주문에도 반복될 가능성이 높아(인증/레이트리밋/서버·네트워크
+# 장애/예산 소진) 이번 배치를 즉시 멈춘다. 그 밖의 오류(페이지 상한·nextToken 이상·응답 형식 등)는 그 주문만
+# 건너뛰고(cursor는 전진) 다음 주문을 계속 확인한다 - 한 주문의 영구 오류가 회전을 막아 다른 후보를 굶기지 않게 한다.
+_BATCH_STOP_REASONS = frozenset(
+    {
+        "AUTH_FAILED",
+        "RATE_LIMITED",
+        "SERVER_ERROR",
+        "TIMEOUT",
+        "CONNECT_FAILED",
+        "TRANSPORT_ERROR",
+        "REQUEST_BUDGET_EXCEEDED",
+    }
+)
+# 건너뛴 주문이 연속으로 이 횟수에 이르면 개별 주문 문제가 아니라 공통 문제로 보고 배치를 멈춘다.
+_MAX_CONSECUTIVE_ORDER_SKIPS = 3
+
+
+@dataclass
+class ClaimSyncLimits:
+    """클레임 수집 1회(플랫폼 1개)의 호출량 제한. budget은 목록 조회(반품·교환)와 취소 단건 조회가 공유한다."""
+
+    max_pages: int
+    max_retries: int
+    budget: RequestBudget
+
+
+def build_claim_sync_limits() -> ClaimSyncLimits:
+    return ClaimSyncLimits(
+        max_pages=settings.claim_sync_max_pages_per_query,
+        max_retries=settings.claim_sync_max_retries_per_page,
+        budget=RequestBudget(max_requests=settings.claim_sync_max_requests_per_run),
+    )
+
+
+def _estimate(connector: Any, feature: str, start: date, end: date, limits: ClaimSyncLimits) -> Optional[int]:
+    """커넥터가 알려주는 해당 기능 1회의 최악 요청 수(없으면 None - 사전 예산 검사를 건너뛴다)."""
+    estimator = getattr(connector, "estimate_claim_requests", None)
+    if estimator is None:
+        return None
+    result = estimator(feature, start, end, limits.max_pages, limits.max_retries)
+    return int(result) if isinstance(result, int) and not isinstance(result, bool) else None
 
 
 class ClaimSyncService:
@@ -86,15 +132,32 @@ class ClaimSyncService:
         self.unmatched_repo = ClaimUnmatchedRepository(session)
         self.cursor_repo = ClaimCollectionCursorRepository(session)
 
-    def sync_claims(self, connector: Any, platform_id: int, start_date: date, end_date: date) -> dict[str, Any]:
+    def sync_claims(
+        self,
+        connector: Any,
+        platform_id: int,
+        start_date: date,
+        end_date: date,
+        limits: Optional[ClaimSyncLimits] = None,
+    ) -> dict[str, Any]:
         """취소/반품/교환을 capability 기준으로 미러링하고 구조화된 기능별 결과를 반환한다.
 
+        호출량 제한(limits, 생략하면 settings 기본값으로 만든다 - 무제한 경로는 없다): 반품·교환은 각각 쿼리당
+        max_pages/retry/공유 요청 예산이 적용되고, 기능을 시작하기 전에 커넥터가 추정한 "최악 요청 수"가 예산의 남은
+        양보다 크면 네트워크 요청 없이 그 기능만 실패(BUDGET_TOO_SMALL: 예산 자체가 모자람 / REQUEST_BUDGET_EXCEEDED:
+        이번 실행의 남은 예산이 모자람)로 처리한다.
+
+        DB 쓰기 정책: 각 기능은 SAVEPOINT 안에서 "전부 조회한 뒤 저장"한다 - 조회 중 PAGE_LIMIT_EXCEEDED 등으로
+        실패하면 그 기능은 아무 것도 저장하지 않고(부분 저장 없음) 다른 기능은 영향 없이 계속된다. 실패한 기능은 다음
+        실행(기본 20분 뒤)에서 같은 기간을 다시 조회한다.
+
         반환:
-            {"overall_status": str,
+            {"overall_status": str, "requests_used": int,
              "cancellations": {...}, "returns": {...}, "exchanges": {...},
              "skipped_no_order": int, "resolved_unmatched": int}
         각 기능 결과: {"status", "count", "reason_code", "retryable"}.
         """
+        limits = limits or build_claim_sync_limits()
         resolved_unmatched = self._resolve_pending_unmatched(platform_id)
         skipped = {"count": 0}
 
@@ -108,31 +171,52 @@ class ClaimSyncService:
         )
         returns = self._sync_feature(
             supported=getattr(connector, "supports_return_sync", False),
-            fetch=lambda: connector.fetch_returns(start_date, end_date),
+            fetch=lambda: connector.fetch_returns(
+                start_date,
+                end_date,
+                max_pages=limits.max_pages,
+                max_retries=limits.max_retries,
+                request_budget=limits.budget,
+            ),
             persist=lambda raw: self._persist_claim(
                 "RETURN", platform_id, raw, skipped, self.return_repo, RETURN_TRANSITIONS
             ),
             feature="returns",
+            worst_case=lambda: _estimate(connector, "returns", start_date, end_date, limits),
+            budget=limits.budget,
         )
         exchanges = self._sync_feature(
             supported=getattr(connector, "supports_exchange_sync", False),
-            fetch=lambda: connector.fetch_exchanges(start_date, end_date),
+            fetch=lambda: connector.fetch_exchanges(
+                start_date,
+                end_date,
+                max_pages=limits.max_pages,
+                max_retries=limits.max_retries,
+                request_budget=limits.budget,
+            ),
             persist=lambda raw: self._persist_claim(
                 "EXCHANGE", platform_id, raw, skipped, self.exchange_repo, EXCHANGE_TRANSITIONS
             ),
             feature="exchanges",
+            worst_case=lambda: _estimate(connector, "exchanges", start_date, end_date, limits),
+            budget=limits.budget,
         )
 
         features = {"cancellations": cancellations, "returns": returns, "exchanges": exchanges}
         return {
             "overall_status": self._overall_status(features),
+            "requests_used": limits.budget.used,
             **features,
             "skipped_no_order": skipped["count"],
             "resolved_unmatched": resolved_unmatched,
         }
 
     def sync_cancellations_by_candidate_orders(
-        self, connector: Any, platform_id: int, max_requests: int = DEFAULT_CANCELLATION_LOOKUP_BATCH
+        self,
+        connector: Any,
+        platform_id: int,
+        max_orders: Optional[int] = None,
+        limits: Optional[ClaimSyncLimits] = None,
     ) -> dict[str, Any]:
         """ "후보 주문 단건 조회" 방식의 취소 수집(상용 ERP 확장 2단계-A 보완) -
         기간만으로 대량조회가 안 되는 채널(쿠팡 등, supports_cancellation_lookup_by_order
@@ -140,7 +224,7 @@ class ClaimSyncService:
         별개 경로이며, 같은 sync_claims() 호출 안에 넣지 않고 별도로 호출한다(스케줄러가
         둘 다 호출 - scheduler/jobs/claim_sync_job.py 참고).
 
-        회전식 체크포인트(ClaimCollectionCursor)로 Order.id 오름차순 최대 max_requests건만
+        회전식 체크포인트(ClaimCollectionCursor)로 Order.id 오름차순 최대 max_orders건만(기본 settings.claim_cancel_detail_max_orders_per_run)
         조회해(전체 무제한 순회 금지) 매 실행 요청 수를 예산 내로 제한한다. 배송 전
         상태(NEW/PREPARING/SHIPPING)의 주문만 후보로 삼는다(repositories.order_repository.
         CANCELLATION_LOOKUP_CANDIDATE_STATUSES 참고).
@@ -160,15 +244,20 @@ class ClaimSyncService:
         관건). 반대로 후보 전체를 한 바퀴 도는 데(회전 주기) max_requests와 실행
         빈도 대비 후보 수가 너무 많아 CANCEL_LOOKUP_WINDOW_DAYS일을 초과하면, 그
         간격 동안 발생한 취소가 어느 창에도 걸리지 않아 놓칠 수 있다 - 운영자는
-        (비활성 상태로 오래 머무는 후보 수) / (실행당 max_requests * 실행 빈도)가
+        (비활성 상태로 오래 머무는 후보 수) / (실행당 max_orders * 실행 빈도)가
         CANCEL_LOOKUP_WINDOW_DAYS일보다 작게 유지되도록 스케줄/배치 크기를
         조정해야 한다.
 
-        한 후보 주문의 외부 API 호출 실패(MarketplaceExternalAPIError - 429/timeout/
-        연결실패/파싱실패 등, 이미 커넥터의 _request_with_retry가 재시도를 소진한
-        뒤 던진 것)를 만나면 그 지점에서 이번 배치를 멈춘다(이후 후보는 이번 실행에서
-        시도하지 않음 - 레이트리밋 등 채널 쪽 문제일 가능성이 높은데 계속 밀어붙이지
-        않기 위함). 커서는 실패한 주문 **이전까지** 성공적으로 확인된 위치에만
+        호출량: 이 조회는 목록 조회(반품·교환)와 같은 요청 예산(limits.budget)을 공유한다. 각 주문을 확인하기
+        전에 "최초 1회 + retry" 최악치가 남은 예산 안에 드는지 확인하고, 아니면 네트워크 요청 없이 배치를 멈춘다.
+
+        한 후보 주문의 외부 API 호출 실패 중 공통 원인일 가능성이 높은 것(인증 거부/429/5xx/timeout/연결 실패/
+        예산 소진 - _BATCH_STOP_REASONS)을 만나면 그 지점에서 이번 배치를 멈춘다(이후 후보는 이번 실행에서
+        시도하지 않음 - 레이트리밋 등 채널 쪽 문제일 가능성이 높은데 계속 밀어붙이지 않기 위함). 그 밖의
+        개별 주문 오류(PAGE_LIMIT_EXCEEDED/PAGINATION_*/BAD_RESPONSE/PARSE_FAILED 등)는 그 주문만 건너뛰고
+        cursor를 그 주문 뒤로 전진시킨다 - 한 주문의 영구 오류가 같은 자리에서 매번 배치를 멈춰 뒤 후보를 굶기지
+        않는다(건너뛴 주문은 다음 회전에서 다시 확인한다). 건너뜀이 연속 _MAX_CONSECUTIVE_ORDER_SKIPS회에
+        이르면 공통 문제로 보고 멈춘다. 커서는 실패한 주문 **이전까지** 성공적으로 확인된 위치에만
         전진한다 - 실패한 주문은 다음 실행에서 맨 먼저 다시 시도되어 영구적으로
         누락되지 않는다(재조회는 claim_id 기반 dedup이라 중복 생성도 없다).
         인증정보 누락처럼 이후 모든 호출이 똑같이 실패할 오류는 예외로 전파해
@@ -178,34 +267,61 @@ class ClaimSyncService:
         if not getattr(connector, "supports_cancellation_lookup_by_order", False):
             return _feature_result("UNSUPPORTED", 0, "CAPABILITY_UNSUPPORTED", False)
 
+        limits = limits or build_claim_sync_limits()
+        batch = max_orders if max_orders is not None else settings.claim_cancel_detail_max_orders_per_run
+        batch = max(0, min(batch, DEFAULT_CANCELLATION_LOOKUP_BATCH * 5))
+        if batch == 0:
+            return _feature_result("SUCCESS", 0, None, None, checked=0, skipped_failed=0)
+        per_order_worst = _estimate(connector, "cancellation_lookup", date.today(), date.today(), limits)
+        if per_order_worst is None:
+            per_order_worst = 1 + limits.max_retries
+
         savepoint = self.session.begin_nested()
         try:
             cursor = self.cursor_repo.get_or_create(platform_id, CANCELLATION_ORDER_LOOKUP_CURSOR_TYPE)
-            candidates = self.order_repo.list_cancellation_lookup_candidates(
-                platform_id, cursor.last_order_id, max_requests
-            )
-            if len(candidates) < max_requests:
+            candidates = self.order_repo.list_cancellation_lookup_candidates(platform_id, cursor.last_order_id, batch)
+            if len(candidates) < batch:
                 seen_ids = {o.id for o in candidates}
-                wrapped = self.order_repo.list_cancellation_lookup_candidates(
-                    platform_id, 0, max_requests - len(candidates)
-                )
+                wrapped = self.order_repo.list_cancellation_lookup_candidates(platform_id, 0, batch - len(candidates))
                 candidates += [o for o in wrapped if o.id not in seen_ids]
 
             skipped = {"count": 0}
             count = 0
+            checked = 0
+            skipped_failed = 0
+            consecutive_skips = 0
             last_safe_id = cursor.last_order_id
             failure: Optional[MarketplaceExternalAPIError] = None
             for order in candidates:
+                if limits.budget.max_requests - limits.budget.used < per_order_worst:
+                    break  # 남은 예산이 이 주문의 최악치보다 작다 - 네트워크 요청 없이 멈춘다(다음 실행이 이어간다).
                 try:
-                    raw = connector.fetch_cancellation_status(order.platform_order_no, order.order_date.date())
+                    raw = connector.fetch_cancellation_status(
+                        order.platform_order_no,
+                        order.order_date.date(),
+                        max_retries=limits.max_retries,
+                        request_budget=limits.budget,
+                    )
                 except MarketplaceExternalAPIError as e:
                     logger.warning(
-                        "취소 후보 주문 조회 실패(이번 배치 중단, 다음 실행에서 재시도): platform_id=%s, reason=%s",
+                        "취소 후보 주문 조회 실패: platform_id=%s, reason=%s, batch_stop=%s",
                         platform_id,
                         e.reason_code,
+                        e.reason_code in _BATCH_STOP_REASONS,
                     )
-                    failure = e
-                    break
+                    if e.reason_code in _BATCH_STOP_REASONS:
+                        failure = e
+                        break
+                    # 개별 주문 오류 - 이 주문만 건너뛰고 cursor를 전진시켜 뒤 후보를 계속 확인한다.
+                    skipped_failed += 1
+                    consecutive_skips += 1
+                    last_safe_id = order.id
+                    if consecutive_skips >= _MAX_CONSECUTIVE_ORDER_SKIPS:
+                        failure = e
+                        break
+                    continue
+                consecutive_skips = 0
+                checked += 1
                 # 조회 자체는 성공했다(취소 없음/있음 둘 다 "확인 완료") - 여기까지 온
                 # 주문만 커서 전진 대상이다.
                 last_safe_id = order.id
@@ -221,10 +337,11 @@ class ClaimSyncService:
             cursor.updated_at = datetime.now(timezone.utc)
             self.session.flush()
             savepoint.commit()
+            extra = {"checked": checked, "skipped_failed": skipped_failed}
             if failure is not None:
-                status = "PARTIAL" if count > 0 else "FAILED"
-                return _feature_result(status, count, failure.reason_code, bool(failure.retryable))
-            return _feature_result("SUCCESS", count, None, None)
+                status = "PARTIAL" if (count > 0 or checked > 0) else "FAILED"
+                return _feature_result(status, count, failure.reason_code, bool(failure.retryable), **extra)
+            return _feature_result("SUCCESS", count, None, None, **extra)
         except MarketplaceCredentialMissingError:
             savepoint.rollback()
             return _feature_result("FAILED", 0, "CREDENTIAL_MISSING", False)
@@ -241,12 +358,30 @@ class ClaimSyncService:
             return _feature_result("FAILED", 0, "INTERNAL_ERROR", False)
 
     def _sync_feature(
-        self, supported: bool, fetch: Callable[[], list], persist: Callable[[dict], bool], feature: str
+        self,
+        supported: bool,
+        fetch: Callable[[], list],
+        persist: Callable[[dict], bool],
+        feature: str,
+        worst_case: Optional[Callable[[], Optional[int]]] = None,
+        budget: Optional[RequestBudget] = None,
     ) -> dict[str, Any]:
-        """한 클레임 기능을 SAVEPOINT 안에서 격리 처리한다. 실패는 그 기능만 롤백한다."""
+        """한 클레임 기능을 SAVEPOINT 안에서 격리 처리한다. 실패는 그 기능만 롤백한다.
+
+        worst_case/budget이 주어지면 시작 전에 "이 기능의 최악 요청 수"가 예산에 들어가는지 확인한다 - 안 들어가면
+        네트워크 요청 없이 이 기능만 실패시킨다(BUDGET_TOO_SMALL: 실행당 예산 자체가 모자란 설정 오류,
+        REQUEST_BUDGET_EXCEEDED: 이번 실행에서 앞선 사용량 때문에 남은 예산이 모자람)."""
         if not supported:
             # capability False - fetch 호출 자체를 하지 않는다(미지원과 0건 구분).
             return _feature_result("UNSUPPORTED", 0, "CAPABILITY_UNSUPPORTED", False)
+
+        if worst_case is not None and budget is not None:
+            worst = worst_case()
+            if worst is not None:
+                if worst > budget.max_requests:
+                    return _feature_result("FAILED", 0, "BUDGET_TOO_SMALL", False)
+                if budget.max_requests - budget.used < worst:
+                    return _feature_result("FAILED", 0, "REQUEST_BUDGET_EXCEEDED", True)
 
         savepoint = self.session.begin_nested()
         try:
@@ -463,8 +598,10 @@ class ClaimSyncService:
         return "FAILED"  # SUCCESS 없음 + FAILED 존재(UNSUPPORTED 동반 가능)
 
 
-def _feature_result(status: str, count: int, reason_code: Optional[str], retryable: Optional[bool]) -> dict[str, Any]:
-    return {"status": status, "count": count, "reason_code": reason_code, "retryable": retryable}
+def _feature_result(
+    status: str, count: int, reason_code: Optional[str], retryable: Optional[bool], **extra: int
+) -> dict[str, Any]:
+    return {"status": status, "count": count, "reason_code": reason_code, "retryable": retryable, **extra}
 
 
 def _as_dt(value: Any) -> datetime:

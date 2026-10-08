@@ -251,12 +251,12 @@ class _StubClaimConnector:
             raise self._errors["cancellations"]
         return self._data.get("cancellations", [])
 
-    def fetch_returns(self, s, e):
+    def fetch_returns(self, s, e, **limits):
         if "returns" in self._errors:
             raise self._errors["returns"]
         return self._data.get("returns", [])
 
-    def fetch_exchanges(self, s, e):
+    def fetch_exchanges(self, s, e, **limits):
         if "exchanges" in self._errors:
             raise self._errors["exchanges"]
         return self._data.get("exchanges", [])

@@ -55,7 +55,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
-from integrations.malls.errors import MarketplaceCapabilityUnsupportedError
+from integrations.malls.errors import MarketplaceCapabilityUnsupportedError, RequestBudget
 
 ORDER_STATUSES = ["NEW", "PREPARING", "SHIPPING", "DELIVERED", "CANCELED"]
 DUMMY_CUSTOMER_NAMES = ["김민준", "이서연", "박도윤", "최지우", "정하은", "강시우", "조수아"]
@@ -310,7 +310,15 @@ class BaseMallConnector(ABC):
         """
         raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "cancellation_sync")
 
-    def fetch_returns(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+    def fetch_returns(
+        self,
+        start_date: date,
+        end_date: date,
+        *,
+        max_pages: Optional[int] = None,
+        max_retries: Optional[int] = None,
+        request_budget: Optional[RequestBudget] = None,
+    ) -> list[dict[str, Any]]:
         """기간 내 반품 내역을 정규화된 형식으로 조회한다(기본: 미지원 오류).
 
         반환 형식(정규화, *는 fetch_cancellations 참고와 동일한 2단계 선택 필드):
@@ -323,7 +331,15 @@ class BaseMallConnector(ABC):
         """
         raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "return_sync")
 
-    def fetch_exchanges(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+    def fetch_exchanges(
+        self,
+        start_date: date,
+        end_date: date,
+        *,
+        max_pages: Optional[int] = None,
+        max_retries: Optional[int] = None,
+        request_budget: Optional[RequestBudget] = None,
+    ) -> list[dict[str, Any]]:
         """기간 내 교환 내역을 정규화된 형식으로 조회한다(기본: 미지원 오류).
 
         반환 형식(정규화, *는 fetch_cancellations 참고와 동일한 2단계 선택 필드.
@@ -337,7 +353,22 @@ class BaseMallConnector(ABC):
         """
         raise MarketplaceCapabilityUnsupportedError(self._marketplace_code(), "exchange_sync")
 
-    def fetch_cancellation_status(self, platform_order_no: str, since: date) -> Optional[dict[str, Any]]:
+    def estimate_claim_requests(
+        self, feature: str, start_date: date, end_date: date, max_pages: int, max_retries: int
+    ) -> Optional[int]:
+        """feature("returns"/"exchanges"/"cancellation_lookup") 한 번 호출의 "최악" HTTP 요청 수(최초+retry+모든 페이지)를
+        돌려준다. None이면 이 커넥터는 추정하지 않는다(서비스가 사전 예산 검사를 건너뛴다). 요청 예산을 실제 쿼리
+        구조에서 계산하기 위한 훅이다."""
+        return None
+
+    def fetch_cancellation_status(
+        self,
+        platform_order_no: str,
+        since: date,
+        *,
+        max_retries: Optional[int] = None,
+        request_budget: Optional[RequestBudget] = None,
+    ) -> Optional[dict[str, Any]]:
         """특정 주문(platform_order_no) 하나의 취소 여부/상태를 단건 조회한다(기본:
         미지원 오류). supports_cancellation_lookup_by_order=True인 커넥터만
         오버라이드한다.
