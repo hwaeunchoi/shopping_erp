@@ -226,3 +226,87 @@ class TestNothingSensitiveLeaksIntoErrors:
         text = f"{exc.value} {exc.value.reason_code!r} {exc.value.args!r}"
         for forbidden in (ACCESS_KEY, "test-secret-key", VENDOR_ID, "ORDER-SENSITIVE-777", "secret-looking-token"):
             assert forbidden not in text
+
+
+class _LiveVerify:
+    """실계정 첫 검증 프리셋(1일, 1페이지, retry 0, 최대 5회)이 어떤 응답에서도 5회를 넘지 못함을 실제 커넥터로 확인."""
+
+    @staticmethod
+    def run(db_session, platform, respond):
+        from services.claim_sync_service import ClaimSyncLimits, ClaimSyncService
+
+        server = _Server(respond)
+        conn = _connector(db_session, platform, server)
+        limits = ClaimSyncLimits(max_pages=1, max_retries=0, budget=RequestBudget(max_requests=5))
+        result = ClaimSyncService(db_session).sync_claims(
+            conn, platform.id, TODAY - timedelta(days=1), TODAY, limits, frozenset({"returns", "exchanges"})
+        )
+        return server, limits, result
+
+
+class TestLiveVerifyNeverExceedsFiveRequests:
+    def test_all_empty_responses_use_exactly_four_returns_plus_one_exchange(self, db_session, platform):
+        server, limits, result = _LiveVerify.run(db_session, platform, lambda n, r: _ok([]))
+        assert len(server.requests) == limits.budget.used == 5
+        assert result["overall_status"] == "SUCCESS" and result["requests_used"] == 5
+        assert all("returnRequests" in r.url.path for r in server.requests[:4])
+        assert "exchangeRequests" in server.requests[4].url.path
+        assert not any("cancel" in str(r.url).lower() and "orderId" in str(r.url) for r in server.requests)
+
+    def test_rate_limited_server_costs_one_request_per_feature_because_retry_is_zero(self, db_session, platform):
+        server, limits, result = _LiveVerify.run(db_session, platform, lambda n, r: httpx.Response(429))
+        assert len(server.requests) == 2  # 반품 첫 쿼리 1 + 교환 1, 재시도 없음
+        assert (
+            result["returns"]["reason_code"] == "RATE_LIMITED" and result["exchanges"]["reason_code"] == "RATE_LIMITED"
+        )
+
+    def test_a_next_page_is_never_requested(self, db_session, platform):
+        server, limits, result = _LiveVerify.run(db_session, platform, lambda n, r: _ok([_item(n)], token=f"tok{n}"))
+        assert len(server.requests) == 2
+        assert result["returns"]["reason_code"] == "PAGE_LIMIT_EXCEEDED"
+        assert limits.budget.used <= 5
+
+
+class TestPagesBeforeThePageLimitAreNeverPartiallySaved:
+    def _return_item(self, i: int) -> dict:
+        return {
+            "receiptId": 9000 + i,
+            "orderId": 7000 + i,
+            "receiptType": "RETURN",
+            "receiptStatus": "RETURNS_UNCHECKED",
+            "createdAt": "2025-01-15T14:17:13.973885-08:00",
+            "cancelCountSum": 1,
+            "returnItems": [{"vendorItemId": 1, "cancelCount": 1}],
+            "reasonCodeText": "사유",
+        }
+
+    def test_valid_items_received_on_pages_one_to_three_are_not_saved_when_the_limit_is_hit(self, db_session, platform):
+        from datetime import datetime, timezone
+
+        from models.order import Order, Return
+        from services.claim_sync_service import ClaimSyncLimits, ClaimSyncService
+
+        for i in range(1, 4):  # 받은 3페이지의 항목이 전부 저장 가능한 상태(주문이 이미 있다)
+            db_session.add(
+                Order(
+                    platform_id=platform.id,
+                    platform_order_no=str(7000 + i),
+                    status="DELIVERED",
+                    order_date=datetime.now(timezone.utc),
+                    total_amount=1000,
+                    discount_amount=0,
+                )
+            )
+        db_session.flush()
+        server = _Server(lambda n, r: _ok([self._return_item(n)], token=f"tok{n}"))
+        conn = _connector(db_session, platform, server)
+        limits = ClaimSyncLimits(max_pages=3, max_retries=2, budget=RequestBudget(max_requests=105))
+
+        result = ClaimSyncService(db_session).sync_claims(
+            conn, platform.id, START, TODAY, limits, frozenset({"returns"})
+        )
+        db_session.flush()
+
+        assert len(server.requests) == 3  # 3페이지를 받았고 4번째는 요청하지 않았다
+        assert result["returns"]["reason_code"] == "PAGE_LIMIT_EXCEEDED"
+        assert db_session.query(Return).count() == 0  # 받은 페이지의 항목이 부분 저장되지 않았다

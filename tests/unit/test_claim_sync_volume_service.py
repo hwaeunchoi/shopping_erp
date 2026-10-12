@@ -288,3 +288,106 @@ class TestCancellationLookupVolume:
         conn = _LookupConnector()
         result = ClaimSyncService(db_session).sync_cancellations_by_candidate_orders(conn, platform.id, 0, _limits())
         assert conn.calls == [] and result["status"] == "SUCCESS"
+
+
+class TestFeatureSelection:
+    def test_unrequested_features_are_not_called_and_are_labelled(self, db_session, platform):
+        conn = _ListConnector()
+        conn.supports_cancellation_sync = True
+        conn.fetch_cancellations = lambda s, e: (_ for _ in ()).throw(AssertionError("취소는 요청되지 않았다"))  # type: ignore[attr-defined]
+        result = ClaimSyncService(db_session).sync_claims(
+            conn, platform.id, START, TODAY, _limits(), frozenset({"returns", "exchanges"})
+        )
+        assert result["cancellations"] == {
+            "status": "UNSUPPORTED",
+            "count": 0,
+            "reason_code": "NOT_REQUESTED",
+            "retryable": False,
+        }
+        assert conn.calls == ["returns", "exchanges"]
+
+    def test_only_one_feature_can_be_requested(self, db_session, platform):
+        conn = _ListConnector()
+        result = ClaimSyncService(db_session).sync_claims(
+            conn, platform.id, START, TODAY, _limits(), frozenset({"exchanges"})
+        )
+        assert conn.calls == ["exchanges"]
+        assert result["returns"]["reason_code"] == "NOT_REQUESTED"
+
+
+class TestUnmatchedPromotionIsolation:
+    def _hold(self, db_session, platform, claim_ids):
+        service = ClaimSyncService(db_session)
+        conn = _ListConnector(returns=[_claim(f"ORD-{c}", c) for c in claim_ids])
+        service.sync_claims(conn, platform.id, START, TODAY, _limits())
+        for c in claim_ids:
+            _order(db_session, platform, f"ORD-{c}")
+        db_session.flush()
+        return service
+
+    def test_one_failing_promotion_does_not_stop_the_others_or_the_sync(self, db_session, platform, monkeypatch):
+        from sqlalchemy.exc import IntegrityError
+
+        from models.order import ClaimUnmatched
+
+        service = self._hold(db_session, platform, ["P-1", "G-1"])
+        original = ClaimSyncService._promote_unmatched
+
+        def poisoned(self, pending, order_id):
+            if pending.platform_claim_id == "P-1":
+                raise IntegrityError("INSERT", {}, Exception("synthetic"))
+            return original(self, pending, order_id)
+
+        monkeypatch.setattr(ClaimSyncService, "_promote_unmatched", poisoned)
+        result = service.sync_claims(_ListConnector(), platform.id, START, TODAY, _limits())
+
+        assert result["resolved_unmatched"] == 1 and result["overall_status"] == "SUCCESS"
+        states = {u.platform_claim_id: u.resolved_at is not None for u in db_session.query(ClaimUnmatched).all()}
+        assert states == {"P-1": False, "G-1": True}
+
+    def test_a_promotion_that_fails_after_creating_the_claim_leaves_neither_claim_nor_marker(
+        self, db_session, platform, monkeypatch
+    ):
+        from sqlalchemy.exc import IntegrityError
+
+        from models.order import ClaimUnmatched
+
+        service = self._hold(db_session, platform, ["P-1"])
+        original = ClaimSyncService._promote_unmatched
+
+        def half_done(self, pending, order_id):
+            original(self, pending, order_id)  # 클레임 행이 만들어진 뒤
+            raise IntegrityError("UPDATE", {}, Exception("synthetic"))  # 해결 표시 전에 실패
+
+        monkeypatch.setattr(ClaimSyncService, "_promote_unmatched", half_done)
+        service.sync_claims(_ListConnector(), platform.id, START, TODAY, _limits())
+
+        assert db_session.query(Return).count() == 0  # 반쪽 승격 없음
+        assert all(u.resolved_at is None for u in db_session.query(ClaimUnmatched).all())
+
+    def test_recovery_after_the_cause_disappears_promotes_once_without_duplicates(
+        self, db_session, platform, monkeypatch
+    ):
+        service = self._hold(db_session, platform, ["P-1"])
+        original = ClaimSyncService._promote_unmatched
+        monkeypatch.setattr(
+            ClaimSyncService, "_promote_unmatched", lambda self, p, o: (_ for _ in ()).throw(RuntimeError("x"))
+        )
+        service.sync_claims(_ListConnector(), platform.id, START, TODAY, _limits())
+        monkeypatch.setattr(ClaimSyncService, "_promote_unmatched", original)
+        service.sync_claims(_ListConnector(), platform.id, START, TODAY, _limits())
+        service.sync_claims(_ListConnector(), platform.id, START, TODAY, _limits())
+        assert db_session.query(Return).count() == 1
+
+    def test_promotion_failure_logs_only_the_exception_class(self, db_session, platform, monkeypatch, caplog):
+        service = self._hold(db_session, platform, ["SECRET-CLAIM-ID"])
+        monkeypatch.setattr(
+            ClaimSyncService,
+            "_promote_unmatched",
+            lambda self, p, o: (_ for _ in ()).throw(RuntimeError("ORD-SECRET-CLAIM-ID")),
+        )
+        with caplog.at_level(logging.DEBUG):
+            service.sync_claims(_ListConnector(), platform.id, START, TODAY, _limits())
+        text_ = " ".join(r.getMessage() for r in caplog.records)
+        assert "type=RuntimeError" in text_
+        assert "SECRET-CLAIM-ID" not in text_

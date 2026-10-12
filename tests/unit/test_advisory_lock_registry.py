@@ -19,12 +19,14 @@ import pytest
 
 from core.advisory_locks import (
     BACKUP_CLASSID,
+    CLAIM_SYNC_CLASSID,
     CS_SYNC_CLASSID_BASE,
     CS_SYNC_CLASSID_COUNT,
     EXTERNAL_COMMAND_CLASSID,
     INT4_MAX,
     RESERVED_CLASSID_RANGES,
     backup_lock_key,
+    claim_sync_lock_key,
     cs_sync_lock_key,
     external_command_lock_key,
 )
@@ -227,3 +229,21 @@ class TestModulesUseTheRegistryValues:
 
         for source, index in _SOURCE_INDEX.items():
             assert lock_key(9, source) == cs_sync_lock_key(9, index)
+
+
+class TestClaimSyncDomain:
+    def test_claim_sync_has_its_own_reserved_fixed_classid_and_platform_objid(self):
+        assert RESERVED_CLASSID_RANGES["CLAIM_SYNC"] == (CLAIM_SYNC_CLASSID, CLAIM_SYNC_CLASSID)
+        for platform_id in (0, 1, 2**30, INT4_MAX):
+            assert claim_sync_lock_key(platform_id) == (CLAIM_SYNC_CLASSID, platform_id)  # 해시 없음, 단사
+        assert _domain_of(CLAIM_SYNC_CLASSID) == "CLAIM_SYNC"
+
+    def test_claim_sync_keys_never_equal_any_other_domain_key_for_the_same_objid(self):
+        claim = claim_sync_lock_key(7)
+        others = [backup_lock_key(), cs_sync_lock_key(7, 0), cs_sync_lock_key(7, 1), external_command_lock_key("X", 7)]
+        assert all(claim[0] != other[0] for other in others)
+
+    def test_out_of_range_platform_is_rejected(self):
+        for bad in (-1, 2**31):
+            with pytest.raises(ValueError):
+                claim_sync_lock_key(bad)

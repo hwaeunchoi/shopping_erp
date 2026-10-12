@@ -5,6 +5,9 @@ tests/integration/_claim_sync_pg_runner.py
 SAVEPOINT/commit 실패 롤백, 미매칭 승격, 취소 후보 cursor 순환을 다룬다. 스텁 커넥터만 쓰며 외부 API는 호출하지 않는다.
 
 시나리오:
+6) job_lock_exclusion   - claim_sync job 두 개와 수동 잠금이 겹치면 하나만 실행하고 외부 요청·cursor 처리는 1회분이다.
+7) cursor_commit_failure - 취소 후보 cursor는 데이터와 같은 트랜잭션이라 commit 실패 시 전진하지 않고 재실행이 같은 주문을 다시 본다.
+8) promotion_poison    - 승격에 실패하는 미매칭 한 건이 다른 승격과 수집 전체를 막지 않는다(주문+해결 표시는 함께 반영).
 1) concurrent_same_claim  - 두 세션이 같은 claim을 동시에 저장해도 행은 1개, 예외는 새지 않는다.
 2) commit_failure         - 최상위 commit이 실패하면 반품·교환·미매칭이 하나도 남지 않고, 재실행하면 1건으로 수렴한다.
 3) unmatched_then_promoted - 주문 없는 claim은 보존되고, 주문이 생긴 뒤 재수집하면 중복 없이 승격된다.
@@ -35,14 +38,18 @@ scenario = os.environ["CSLOCK_SCENARIO"]
 
 os.environ["DATABASE_URL"] = f"postgresql+psycopg://{db_user}:{db_password}@{db_host}:5432/{db_name}"
 
-from sqlalchemy import event, func, select  # noqa: E402
+from sqlalchemy import event, func, select, text  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
+from config.settings import settings  # noqa: E402
 from core.database import SessionLocal, engine  # noqa: E402
 from integrations.malls.errors import MarketplaceExternalAPIError, RequestBudget  # noqa: E402
 from models import Base  # noqa: E402
 from models.order import ClaimCollectionCursor, ClaimUnmatched, Exchange, Order, Return  # noqa: E402
 from models.platform import Platform  # noqa: E402
+from repositories.platform_repository import PlatformRepository  # noqa: E402
+from scheduler.jobs import claim_sync_job  # noqa: E402
+from services.claim_sync_lock import claim_sync_platform_lock  # noqa: E402
 from services.claim_sync_service import ClaimSyncLimits, ClaimSyncService  # noqa: E402
 
 Base.metadata.create_all(engine)
@@ -315,12 +322,189 @@ def scenario_cancellation_rotation() -> dict:
     }
 
 
+def scenario_job_lock_exclusion() -> dict:
+    pid = _platform()
+    setup = SessionLocal()
+    for i in range(1, 6):
+        _order(setup, pid, f"LK-{i:03d}")
+    setup.commit()
+    setup.close()
+
+    settings.claim_sync_enabled = True
+    settings.claim_cancel_detail_max_orders_per_run = 20
+    entered = threading.Event()
+    release = threading.Event()
+    calls = {"returns": 0, "exchanges": 0}
+    lookups: list[str] = []
+
+    class _JobConn(_Conn):
+        def fetch_returns(self, s, e, **kw):
+            calls["returns"] += 1
+            kw["request_budget"].consume("coupang")
+            entered.set()
+            release.wait(timeout=30)
+            return []
+
+        def fetch_exchanges(self, s, e, **kw):
+            calls["exchanges"] += 1
+            kw["request_budget"].consume("coupang")
+            return []
+
+        def fetch_cancellation_status(self, order_no, since, **kw):
+            lookups.append(order_no)
+            kw["request_budget"].consume("coupang")
+            return None
+
+    conn = _JobConn()
+    claim_sync_job.get_mall_connector = lambda *a, **k: conn  # type: ignore[assignment]
+    PlatformRepository.list_active = lambda self: list(  # type: ignore[method-assign]
+        self.session.execute(select(Platform).where(Platform.id == pid)).scalars()
+    )
+    out: dict[str, Any] = {}
+
+    def run_job(key: str) -> None:
+        try:
+            out[key] = claim_sync_job.run()
+        except Exception as exc:  # noqa: BLE001 - 결과 JSON으로 보고한다
+            out[key] = {"exception": type(exc).__name__}
+
+    first = threading.Thread(target=run_job, args=("first",))
+    first.start()
+    assert entered.wait(timeout=30)
+    run_job("second")  # 첫 job이 잠금을 쥔 채 fetch 중일 때 두 번째 job
+    with claim_sync_platform_lock(pid, engine) as manual_while_running:
+        manual_acquired_while_job_runs = manual_while_running  # 수동 sync-claims와 같은 잠금
+    release.set()
+    first.join(timeout=60)
+    with claim_sync_platform_lock(pid, engine) as after:
+        manual_acquired_after = after
+    check = SessionLocal()
+    cursor = check.execute(
+        select(ClaimCollectionCursor.last_order_id).where(ClaimCollectionCursor.platform_id == pid)
+    ).scalar_one_or_none()
+    max_order = check.execute(select(func.max(Order.id)).where(Order.platform_id == pid)).scalar_one()
+    advisory = int(check.execute(text("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'")).scalar_one())
+    check.close()
+    code_keys = {k: (list(v.values())[0] if v else None) for k, v in out.items()}
+    return {
+        "scenario": "job_lock_exclusion",
+        "second_status": [v.get("status") for v in out["second"].values() if isinstance(v, dict)],
+        "first_has_requests_used": [v.get("requests_used") for v in out["first"].values() if isinstance(v, dict)],
+        "return_fetches": calls["returns"],
+        "exchange_fetches": calls["exchanges"],
+        "lookups": len(lookups),
+        "distinct_lookups": len(set(lookups)),
+        "manual_acquired_while_job_runs": manual_acquired_while_job_runs,
+        "manual_acquired_after": manual_acquired_after,
+        "cursor_is_last_order": cursor == max_order,
+        "advisory_locks_left": advisory,
+        "raw_keys": sorted(code_keys),
+    }
+
+
+def scenario_cursor_commit_failure() -> dict:
+    pid = _platform()
+    setup = SessionLocal()
+    for i in range(1, 7):
+        _order(setup, pid, f"CUR-{i:03d}")
+    setup.commit()
+    setup.close()
+    session = SessionLocal()
+    state = {"fail": True}
+
+    @event.listens_for(session, "before_commit")
+    def _boom(_s: Session) -> None:
+        if state["fail"] and not _s.in_nested_transaction():
+            state["fail"] = False
+            raise RuntimeError("synthetic commit failure")
+
+    first = _Conn()
+    ClaimSyncService(session).sync_cancellations_by_candidate_orders(first, pid, 3, _limits())
+    failed = False
+    try:
+        session.commit()
+    except RuntimeError:
+        failed = True
+        session.rollback()
+    check = SessionLocal()
+    after_failure = check.execute(
+        select(ClaimCollectionCursor.last_order_id).where(ClaimCollectionCursor.platform_id == pid)
+    ).scalar_one_or_none()
+    check.close()
+    second = _Conn()
+    ClaimSyncService(session).sync_cancellations_by_candidate_orders(second, pid, 3, _limits())
+    session.commit()
+    session.close()
+    check = SessionLocal()
+    after_rerun = check.execute(
+        select(ClaimCollectionCursor.last_order_id).where(ClaimCollectionCursor.platform_id == pid)
+    ).scalar_one_or_none()
+    third_id = check.execute(
+        select(Order.id).where(Order.platform_id == pid).order_by(Order.id).offset(2).limit(1)
+    ).scalar_one()
+    check.close()
+    return {
+        "scenario": "cursor_commit_failure",
+        "commit_failed": failed,
+        "cursor_after_failure": after_failure,
+        "same_orders_rechecked": first.lookups == second.lookups,
+        "lookups": second.lookups,
+        "cursor_after_rerun_is_third_order": after_rerun == third_id,
+    }
+
+
+def scenario_promotion_poison() -> dict:
+    from sqlalchemy.exc import IntegrityError
+
+    pid = _platform()
+    session = SessionLocal()
+    unmatched_conn = _Conn(returns=[_claim("POISON-ORDER", "P-1"), _claim("GOOD-ORDER", "G-1")])
+    ClaimSyncService(session).sync_claims(unmatched_conn, pid, START, TODAY, _limits())
+    session.commit()
+    _order(session, pid, "POISON-ORDER")
+    _order(session, pid, "GOOD-ORDER")
+    session.commit()
+
+    original = ClaimSyncService._promote_unmatched
+
+    def poisoned(self, pending, order_id):
+        if pending.platform_claim_id == "P-1":
+            self.return_repo.add(
+                Return(order_id=order_id, status="REVIEW", requested_at=datetime.now(), platform_claim_id="P-1")
+            )
+            raise IntegrityError("INSERT", {}, Exception("synthetic"))
+        return original(self, pending, order_id)
+
+    ClaimSyncService._promote_unmatched = poisoned  # type: ignore[method-assign]
+    try:
+        quiet = _Conn()  # 이번 실행은 새 claim이 없다 - 승격만 일어난다
+        res = ClaimSyncService(session).sync_claims(quiet, pid, START, TODAY, _limits())
+        session.commit()
+        after_poison = _counts(pid)
+    finally:
+        ClaimSyncService._promote_unmatched = original  # type: ignore[method-assign]
+    res2 = ClaimSyncService(session).sync_claims(_Conn(), pid, START, TODAY, _limits())
+    session.commit()
+    session.close()
+    return {
+        "scenario": "promotion_poison",
+        "run_status": res["overall_status"],
+        "resolved_in_poison_run": res["resolved_unmatched"],
+        "after_poison_run": after_poison,
+        "resolved_after_recovery": res2["resolved_unmatched"],
+        "after_recovery": _counts(pid),
+    }
+
+
 SCENARIOS = {
     "concurrent_same_claim": scenario_concurrent_same_claim,
     "commit_failure": scenario_commit_failure,
     "unmatched_then_promoted": scenario_unmatched_then_promoted,
     "partial_failure": scenario_partial_failure,
     "cancellation_rotation": scenario_cancellation_rotation,
+    "job_lock_exclusion": scenario_job_lock_exclusion,
+    "cursor_commit_failure": scenario_cursor_commit_failure,
+    "promotion_poison": scenario_promotion_poison,
 }
 
 if __name__ == "__main__":

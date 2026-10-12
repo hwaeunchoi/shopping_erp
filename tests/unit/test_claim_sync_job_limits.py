@@ -8,15 +8,18 @@ claim_sync job의 호출량 계약: 플래그 OFF면 후보 조회 DB 쿼리·�
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 
-from config.settings import settings
+from config.settings import Settings, settings
 from integrations.malls.errors import RequestBudget
 from models.order import Order
 from scheduler import scheduler as scheduler_module
 from scheduler.jobs import claim_sync_job
+from services.claim_sync_lock import claim_sync_platform_lock
 
 
 class TestSchedulerInterval:
-    def test_claim_sync_runs_every_twenty_minutes_by_default(self):
+    def test_claim_sync_runs_every_twenty_minutes_by_default(self, monkeypatch):
+        # 코드 기본값(20분)을 명시한다 - 운영 .env에 다른 값이 있어도 이 테스트는 영향받지 않는다.
+        monkeypatch.setattr(settings, "claim_sync_interval_minutes", Settings(_env_file=None).claim_sync_interval_minutes)  # type: ignore[call-arg]
         job = {j.id: j for j in scheduler_module.build_scheduler().get_jobs()}["claim_sync"]
         assert job.trigger.interval == timedelta(minutes=20)
         assert job.max_instances == 1
@@ -134,3 +137,54 @@ class TestEnabledJobUsesOneSharedBudget:
 
         assert results[platform.code]["requests_used"] <= 6
         assert conn.lookup_calls <= 6 - 2
+
+
+class TestJobSharesThePlatformLock:
+    """수동 sync-claims와 같은 (platform, CLAIM_SYNC) 잠금 - 겹치면 이 플랫폼은 외부 호출·DB 쓰기 없이 ALREADY_RUNNING."""
+
+    def _wire(self, monkeypatch, db_session, platform, connector_factory):
+        @contextmanager
+        def _scope():
+            yield db_session
+
+        monkeypatch.setattr(settings, "claim_sync_enabled", True)
+        monkeypatch.setattr(claim_sync_job, "session_scope", _scope)
+        monkeypatch.setattr(claim_sync_job, "get_mall_connector", connector_factory)
+        monkeypatch.setattr("repositories.platform_repository.PlatformRepository.list_active", lambda self: [platform])
+
+    def test_a_held_lock_makes_the_job_skip_without_connector_requests_or_cursor_writes(
+        self, monkeypatch, db_session, platform
+    ):
+        def _forbidden(*args, **kwargs):
+            raise AssertionError("잠금이 잡혀 있는데 커넥터가 만들어졌습니다.")
+
+        self._wire(monkeypatch, db_session, platform, _forbidden)
+        with claim_sync_platform_lock(platform.id, db_session.get_bind()) as held:
+            assert held is True  # 수동 sync-claims(또는 다른 scheduler)가 쥔 잠금을 흉내낸다
+            results = claim_sync_job.run()
+
+        assert results[platform.code] == {"status": "ALREADY_RUNNING", "reason_code": "ALREADY_RUNNING"}
+        from models.order import ClaimCollectionCursor
+
+        assert db_session.query(ClaimCollectionCursor).count() == 0
+
+    def test_the_lock_is_released_after_the_run_and_another_platform_is_never_blocked(
+        self, monkeypatch, db_session, platform
+    ):
+        conn = _Connector()
+        self._wire(monkeypatch, db_session, platform, lambda *a, **k: conn)
+        with claim_sync_platform_lock(platform.id + 1000, db_session.get_bind()):  # 다른 플랫폼의 잠금
+            results = claim_sync_job.run()
+        assert results[platform.code].get("overall_status") is not None  # 정상 실행
+        with claim_sync_platform_lock(platform.id, db_session.get_bind()) as again:
+            assert again is True  # 실행이 끝나면 풀린다
+
+    def test_the_lock_is_released_even_when_the_run_fails(self, monkeypatch, db_session, platform):
+        def _broken(*args, **kwargs):
+            raise RuntimeError("synthetic")
+
+        self._wire(monkeypatch, db_session, platform, _broken)
+        results = claim_sync_job.run()
+        assert "error" in results[platform.code]
+        with claim_sync_platform_lock(platform.id, db_session.get_bind()) as again:
+            assert again is True
