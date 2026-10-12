@@ -170,23 +170,31 @@ class TestEveryConnectorPathLeavesNoIdentifier:
         assert _leaks([str(info.value), repr(info.value)]) == []
 
     def test_connection_error_whose_own_message_contains_the_url(self, wired, db_session, platform):
+        calls = {"n": 0}
+
         def handler(request):
+            calls["n"] += 1
             raise httpx.ConnectError(f"cannot reach {request.url}", request=request)
 
         conn = _connector(db_session, platform, handler)
         with pytest.raises(Exception) as info:  # noqa: B017 - 어떤 예외 종류든 문자열에 URL이 없어야 한다
             conn.fetch_returns(START, TODAY, max_pages=1, max_retries=1, request_budget=RequestBudget(max_requests=50))
+        assert calls["n"] >= 1 and not isinstance(info.value, TypeError)  # 실제로 전송을 시도한 경로여야 한다
         assert _leaks(wired.lines) == [], wired.lines
         assert _leaks([str(info.value), repr(info.value)]) == [], (type(info.value).__name__,)
 
     def test_timeout_and_cancellation_lookup_by_order(self, wired, db_session, platform):
+        calls = {"n": 0}
+
         def handler(request):
+            calls["n"] += 1
             raise httpx.ReadTimeout(f"timeout {request.url}", request=request)
 
         conn = _connector(db_session, platform, handler)
         with pytest.raises(Exception) as info:  # noqa: B017
             conn.fetch_cancellation_status(
-                ORDER_MARK, START, max_pages=1, max_retries=0, request_budget=RequestBudget(max_requests=5)
+                ORDER_MARK, START, max_retries=0, request_budget=RequestBudget(max_requests=5)
             )
+        assert calls["n"] >= 1 and not isinstance(info.value, TypeError)  # 호출 형태 오류로 우연히 통과하지 않는다
         assert _leaks(wired.lines) == [], wired.lines
         assert _leaks([str(info.value), repr(info.value)]) == [], (type(info.value).__name__,)
