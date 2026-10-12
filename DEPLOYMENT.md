@@ -670,3 +670,14 @@ Docker Compose의 우선순위는 **프로세스(셸) 환경변수 > `.env`**입
   `.env`보다 우선), 그리고 실계정 읽기 검증 승인.
 - 복구: 이상이 보이면 한 줄을 `false`로 되돌리고 api·scheduler를 재생성한다. 실패한 claim 수집은 다음 실행이 같은 기간을 다시
   조회하므로 별도 보정이 필요 없고, 이미 저장된 claim은 지우지 않는다.
+
+#### 클레임 수집 실계정 첫 검증 절차 (활성화 전)
+
+`CLAIM_SYNC_ENABLED`는 scheduler job과 수동 API를 함께 켠다. 첫 검증을 수동 호출만으로 하려면 **api 컨테이너만** 재생성한다(환경은
+컨테이너 생성 시점에 고정되므로 재생성하지 않은 scheduler는 계속 `false`를 본다). 검증이 끝나면 `.env`를 `false`로 되돌리고 api를 다시
+재생성한다.
+
+- 요청: `POST /api/orders/sync-claims` 본문에 `"live_verify": true`와 정확히 1일 구간(`end_date = start_date + 1일`)을 준다.
+  서버가 반품·교환만, 쿼리당 1페이지, retry 0, 요청 최대 5회로 강제하고 취소(후보 단건 조회 포함)는 호출하지 않는다.
+- 같은 플랫폼의 scheduler `claim_sync`가 실행 중이면 `ALREADY_RUNNING`으로 끝난다(잠금 공유).
+- 이 호출은 수집 결과를 `returns`/`exchanges`에 저장한다(DB write 있음). 고객정보·주문번호·송장번호·응답 본문은 출력하지 않는다.
