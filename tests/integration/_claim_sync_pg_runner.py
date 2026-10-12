@@ -533,7 +533,7 @@ def scenario_claim_lock_domain() -> dict:
     out["after_base_exception"] = can_take(pid_a)
 
     killer = engine.connect()
-    kill_ok = None
+    kill_ok: bool | str = False
     try:
         with claim_sync_platform_lock(pid_a, engine) as g:
             assert g
