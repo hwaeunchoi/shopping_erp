@@ -51,10 +51,10 @@ def lock_key(platform_id: int, source: str) -> tuple[int, int]:
 
 
 @contextmanager
-def cs_sync_source_lock(platform_id: int, source: str, engine: Union[Engine, Connection]) -> Iterator[bool]:
-    """(platform_id, source) 잠금을 논블로킹으로 시도한다. `with ... as acquired:`에서
-    acquired가 True일 때만 외부 호출/DB 쓰기를 해야 한다."""
-    classid, objid = lock_key(platform_id, source)
+def session_advisory_lock(classid: int, objid: int, engine: Union[Engine, Connection]) -> Iterator[bool]:
+    """(classid, objid) 세션 advisory 잠금을 논블로킹으로 시도한다. `with ... as acquired:`에서 acquired가 True일
+    때만 외부 호출/DB 쓰기를 해야 한다. 키는 반드시 core.advisory_locks registry의 함수로 만든다(이 함수는 CS 문의
+    동기화와 클레임 수집이 공유한다)."""
     # Session.get_bind()는 Engine 또는 Connection일 수 있다 - 항상 Engine으로 정규화한다.
     eng = engine.engine
 
@@ -86,9 +86,18 @@ def cs_sync_source_lock(platform_id: int, source: str, engine: Union[Engine, Con
             except Exception:  # noqa: BLE001
                 # unlock 실패 시 이 커넥션을 풀에 돌려보내면 세션 잠금이 살아 있는 채로 재사용돼 잠금이
                 # 샌다 - 물리 연결을 폐기(invalidate)해 DB가 세션 잠금을 해제하게 한다.
-                logger.warning("CS 동기화 advisory unlock에 실패했습니다 - 커넥션을 폐기해 잠금을 해제합니다.")
+                logger.warning("advisory unlock에 실패했습니다 - 커넥션을 폐기해 잠금을 해제합니다.")
                 conn.invalidate()
         conn.close()
+
+
+@contextmanager
+def cs_sync_source_lock(platform_id: int, source: str, engine: Union[Engine, Connection]) -> Iterator[bool]:
+    """(platform_id, source) 잠금을 논블로킹으로 시도한다. `with ... as acquired:`에서
+    acquired가 True일 때만 외부 호출/DB 쓰기를 해야 한다."""
+    classid, objid = lock_key(platform_id, source)
+    with session_advisory_lock(classid, objid, engine) as acquired:
+        yield acquired
 
 
 def is_cs_sync_lock_held(platform_id: int, source: str, engine: Union[Engine, Connection]) -> bool:

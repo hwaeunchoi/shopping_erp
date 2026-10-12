@@ -43,6 +43,7 @@ from integrations.malls.errors import (
 )
 from repositories.extra_repository import IntegrationStatusRepository
 from repositories.platform_repository import PlatformRepository
+from services.claim_sync_lock import claim_sync_platform_lock
 from services.claim_sync_service import ClaimSyncService, build_claim_sync_limits
 
 INTEGRATION_TYPE = "CLAIM"
@@ -74,40 +75,46 @@ def run() -> dict[str, dict]:
         integration_status_repo = IntegrationStatusRepository(db)
 
         for platform in PlatformRepository(db).list_active():
-            try:
-                connector = get_mall_connector(platform.connector_class, session=db, platform_id=platform.id)
-                # 플랫폼 1개당 요청 예산 1개를 목록 조회(반품·교환)와 취소 단건 조회가 공유한다 -
-                # 실행 전체의 실제 HTTP 요청 수가 settings.claim_sync_max_requests_per_run을 넘지 못한다.
-                limits = build_claim_sync_limits()
-                result = sync_service.sync_claims(connector, platform.id, start_date, end_date, limits)
-                # "후보 주문 단건 조회" 방식 취소 수집(기간 대량조회가 안 되는 채널 전용,
-                # 예: 쿠팡) - sync_claims()와 별개 capability라 결과도 별도 키로 담는다.
-                result["cancellations_by_order_lookup"] = sync_service.sync_cancellations_by_candidate_orders(
-                    connector, platform.id, settings.claim_cancel_detail_max_orders_per_run, limits
-                )
-                result["requests_used"] = limits.budget.used
-                logger.info(
-                    "클레임 수집 요청 사용량: platform=%s, used=%s/%s",
-                    platform.code,
-                    limits.budget.used,
-                    limits.budget.max_requests,
-                )
-                results[platform.code] = result
-                _record_integration_status(integration_status_repo, platform.code, result.get("overall_status"))
-                db.commit()
-            except MarketplaceCapabilityUnsupportedError:
-                db.rollback()
-                results[platform.code] = {"skipped": "unsupported"}
-                logger.debug("클레임 수집 스킵(미지원 채널): platform=%s", platform.code)
-                continue
-            except Exception as e:  # noqa: BLE001 - 채널별 격리(예상 밖 예외도 다음 채널 진행)
-                db.rollback()
-                summary = _safe_error_summary(e)
-                results[platform.code] = {"error": summary}
-                integration_status_repo.upsert_error(INTEGRATION_TYPE, platform.code, summary)
-                db.commit()
-                logger.warning("클레임 수집 실패: platform=%s, reason=%s", platform.code, summary)
-                continue
+            # 같은 플랫폼의 수동 sync-claims와 같은 잠금 - 겹치면 이 플랫폼은 외부 호출·DB 쓰기 없이 건너뛴다(대기·재시도 없음).
+            with claim_sync_platform_lock(platform.id, db.get_bind()) as acquired:
+                if not acquired:
+                    results[platform.code] = {"status": "ALREADY_RUNNING", "reason_code": "ALREADY_RUNNING"}
+                    logger.info("클레임 수집 건너뜀(다른 실행 중): platform=%s", platform.code)
+                    continue
+                try:
+                    connector = get_mall_connector(platform.connector_class, session=db, platform_id=platform.id)
+                    # 플랫폼 1개당 요청 예산 1개를 목록 조회(반품·교환)와 취소 단건 조회가 공유한다 -
+                    # 실행 전체의 실제 HTTP 요청 수가 settings.claim_sync_max_requests_per_run을 넘지 못한다.
+                    limits = build_claim_sync_limits()
+                    result = sync_service.sync_claims(connector, platform.id, start_date, end_date, limits)
+                    # "후보 주문 단건 조회" 방식 취소 수집(기간 대량조회가 안 되는 채널 전용,
+                    # 예: 쿠팡) - sync_claims()와 별개 capability라 결과도 별도 키로 담는다.
+                    result["cancellations_by_order_lookup"] = sync_service.sync_cancellations_by_candidate_orders(
+                        connector, platform.id, settings.claim_cancel_detail_max_orders_per_run, limits
+                    )
+                    result["requests_used"] = limits.budget.used
+                    logger.info(
+                        "클레임 수집 요청 사용량: platform=%s, used=%s/%s",
+                        platform.code,
+                        limits.budget.used,
+                        limits.budget.max_requests,
+                    )
+                    results[platform.code] = result
+                    _record_integration_status(integration_status_repo, platform.code, result.get("overall_status"))
+                    db.commit()
+                except MarketplaceCapabilityUnsupportedError:
+                    db.rollback()
+                    results[platform.code] = {"skipped": "unsupported"}
+                    logger.debug("클레임 수집 스킵(미지원 채널): platform=%s", platform.code)
+                    continue
+                except Exception as e:  # noqa: BLE001 - 채널별 격리(예상 밖 예외도 다음 채널 진행)
+                    db.rollback()
+                    summary = _safe_error_summary(e)
+                    results[platform.code] = {"error": summary}
+                    integration_status_repo.upsert_error(INTEGRATION_TYPE, platform.code, summary)
+                    db.commit()
+                    logger.warning("클레임 수집 실패: platform=%s, reason=%s", platform.code, summary)
+                    continue
     return results
 
 

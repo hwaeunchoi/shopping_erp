@@ -12,6 +12,7 @@ classid를 이 모듈에 "예약"하고, 영역 안의 개별 자원은 objid로
 - 백업(BACKUP):                  0x424B5550 ("BKUP"), objid=0 하나 - 세션 수준
 - CS 문의 동기화(CS_SYNC):        0x43530000 ~ 0x4353FFFF ("CS" + source 번호), objid=platform_id - 세션 수준
 - 외부 명령 대상(EXTERNAL_COMMAND): 0x4558434D ("EXCM") 하나 고정, objid=hash(target_type, 자원 id) - 트랜잭션 수준
+- 클레임 수집(CLAIM_SYNC):         0x434C4D53 ("CLMS") 하나 고정, objid=platform_id - 세션 수준
 
 외부 명령 영역의 classid는 target_type 문자열에서 만들지 않는다(예전에는 crc32(target_type)을 classid로 써서
 미래의 target_type이 다른 영역의 classid와 같아질 수 있었다). target_type과 자원 id는 objid 하나의 해시로
@@ -32,11 +33,14 @@ CS_SYNC_CLASSID_COUNT = 0x10000  # source 번호 0 ~ 65535
 
 EXTERNAL_COMMAND_CLASSID = 0x4558434D
 
+CLAIM_SYNC_CLASSID = 0x434C4D53
+
 # 이름 -> (classid 범위 시작, 끝; 양끝 포함). 새 기능 영역은 여기에 추가한다(서로소·int4 여부는 테스트가 검증).
 RESERVED_CLASSID_RANGES: dict[str, tuple[int, int]] = {
     "BACKUP": (BACKUP_CLASSID, BACKUP_CLASSID),
     "CS_SYNC": (CS_SYNC_CLASSID_BASE, CS_SYNC_CLASSID_BASE + CS_SYNC_CLASSID_COUNT - 1),
     "EXTERNAL_COMMAND": (EXTERNAL_COMMAND_CLASSID, EXTERNAL_COMMAND_CLASSID),
+    "CLAIM_SYNC": (CLAIM_SYNC_CLASSID, CLAIM_SYNC_CLASSID),
 }
 
 
@@ -51,6 +55,13 @@ def cs_sync_lock_key(platform_id: int, source_index: int) -> tuple[int, int]:
     if not 0 <= platform_id <= INT4_MAX:
         raise ValueError("platform_id가 잠금 키 범위(int4)를 벗어났습니다.")
     return CS_SYNC_CLASSID_BASE + source_index, platform_id
+
+
+def claim_sync_lock_key(platform_id: int) -> tuple[int, int]:
+    """클레임(취소·반품·교환) 수집의 플랫폼별 잠금 - classid는 고정, objid는 platform_id(해시 없음, 단사)."""
+    if not 0 <= platform_id <= INT4_MAX:
+        raise ValueError("platform_id가 잠금 키 범위(int4)를 벗어났습니다.")
+    return CLAIM_SYNC_CLASSID, platform_id
 
 
 def external_command_lock_key(target_type: str, resource_id: int) -> tuple[int, int]:

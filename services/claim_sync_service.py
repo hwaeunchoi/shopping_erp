@@ -139,6 +139,7 @@ class ClaimSyncService:
         start_date: date,
         end_date: date,
         limits: Optional[ClaimSyncLimits] = None,
+        features: Optional[frozenset[str]] = None,
     ) -> dict[str, Any]:
         """취소/반품/교환을 capability 기준으로 미러링하고 구조화된 기능별 결과를 반환한다.
 
@@ -156,13 +157,17 @@ class ClaimSyncService:
              "cancellations": {...}, "returns": {...}, "exchanges": {...},
              "skipped_no_order": int, "resolved_unmatched": int}
         각 기능 결과: {"status", "count", "reason_code", "retryable"}.
+
+        features("cancellations"/"returns"/"exchanges"의 부분집합, 생략하면 전부): 지정하면 그 밖의 기능은 호출하지 않고
+        UNSUPPORTED/NOT_REQUESTED로 표시한다(실계정 검증처럼 범위를 코드로 좁혀야 할 때 쓴다).
         """
         limits = limits or build_claim_sync_limits()
         resolved_unmatched = self._resolve_pending_unmatched(platform_id)
         skipped = {"count": 0}
+        wanted = features if features is not None else frozenset({"cancellations", "returns", "exchanges"})
 
         cancellations = self._sync_feature(
-            supported=getattr(connector, "supports_cancellation_sync", False),
+            supported=getattr(connector, "supports_cancellation_sync", False) and "cancellations" in wanted,
             fetch=lambda: connector.fetch_cancellations(start_date, end_date),
             persist=lambda raw: self._persist_claim(
                 "CANCELLATION", platform_id, raw, skipped, self.cancellation_repo, CANCELLATION_TRANSITIONS
@@ -170,7 +175,7 @@ class ClaimSyncService:
             feature="cancellations",
         )
         returns = self._sync_feature(
-            supported=getattr(connector, "supports_return_sync", False),
+            supported=getattr(connector, "supports_return_sync", False) and "returns" in wanted,
             fetch=lambda: connector.fetch_returns(
                 start_date,
                 end_date,
@@ -186,7 +191,7 @@ class ClaimSyncService:
             budget=limits.budget,
         )
         exchanges = self._sync_feature(
-            supported=getattr(connector, "supports_exchange_sync", False),
+            supported=getattr(connector, "supports_exchange_sync", False) and "exchanges" in wanted,
             fetch=lambda: connector.fetch_exchanges(
                 start_date,
                 end_date,
@@ -202,11 +207,14 @@ class ClaimSyncService:
             budget=limits.budget,
         )
 
-        features = {"cancellations": cancellations, "returns": returns, "exchanges": exchanges}
+        results = {"cancellations": cancellations, "returns": returns, "exchanges": exchanges}
+        for name in results:
+            if name not in wanted:
+                results[name] = _feature_result("UNSUPPORTED", 0, "NOT_REQUESTED", False)
         return {
-            "overall_status": self._overall_status(features),
+            "overall_status": self._overall_status(results),
             "requests_used": limits.budget.used,
-            **features,
+            **results,
             "skipped_no_order": skipped["count"],
             "resolved_unmatched": resolved_unmatched,
         }
@@ -516,20 +524,28 @@ class ClaimSyncService:
 
     def _resolve_pending_unmatched(self, platform_id: int) -> int:
         """이전에 보존해 둔 미매칭 클레임 중 이제 주문이 수집된 것을 실제 클레임
-        행으로 승격한다. 각 항목은 독립적으로 처리한다(하나가 실패해도 나머지는 계속)."""
+        행으로 승격한다. 각 항목은 자기 SAVEPOINT 안에서 독립적으로 처리한다 - 클레임 행 생성과 "해결됨" 표시가
+        한 단위로 반영되거나 함께 취소되고(반쪽 승격 없음), 한 항목의 DB 오류가 나머지 항목과 이어지는
+        반품·교환 수집 전체를 막지 않는다(실패한 항목은 로그에 클래스만 남기고 다음 실행에서 다시 시도)."""
         resolved = 0
         for pending in self.unmatched_repo.list_unresolved(platform_id):
             order = self.order_repo.get_by_platform_order_no(platform_id, pending.platform_order_no)
             if order is None:
                 continue
-            entity_id = self._promote_unmatched(pending, order.id)
-            if entity_id is None:
-                continue
-            pending.resolved_entity_id = entity_id
-            pending.resolved_at = datetime.now(timezone.utc)
-            resolved += 1
-        if resolved:
-            self.session.flush()
+            savepoint = self.session.begin_nested()
+            try:
+                entity_id = self._promote_unmatched(pending, order.id)
+                if entity_id is None:
+                    savepoint.rollback()
+                    continue
+                pending.resolved_entity_id = entity_id
+                pending.resolved_at = datetime.now(timezone.utc)
+                self.session.flush()
+                savepoint.commit()
+                resolved += 1
+            except Exception as exc:  # noqa: BLE001 - 항목별 격리(내부 전문·식별자 미노출)
+                savepoint.rollback()
+                logger.warning("미매칭 클레임 승격 실패(다음 실행에서 재시도): type=%s", type(exc).__name__)
         return resolved
 
     def _promote_unmatched(self, pending: ClaimUnmatched, order_id: int) -> Optional[int]:

@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 from api.deps import get_current_user, get_db, require_permission
 from config.settings import settings
 from integrations.malls import get_mall_connector
+from integrations.malls.errors import RequestBudget
 from models.extra import Memo
 from models.user import User
 from repositories.customer_repository import CustomerRepository
@@ -29,7 +30,8 @@ from repositories.extra_repository import MemoRepository
 from repositories.order_repository import OrderRepository
 from repositories.platform_repository import PlatformRepository
 from repositories.product_repository import ProductOptionRepository, ProductRepository
-from services.claim_sync_service import ClaimSyncService
+from services.claim_sync_lock import claim_sync_platform_lock
+from services.claim_sync_service import ClaimSyncLimits, ClaimSyncService
 from services.exchange_return_service import CancellationService, ExchangeService, OrderRateService, ReturnService
 from services.export_service import orders_to_excel
 from services.order_sync_service import OrderSyncService
@@ -132,6 +134,18 @@ class OrderSyncRequest(BaseModel):
     warehouse_id: int
     start_date: date
     end_date: date
+
+
+# 실계정 첫 검증 프리셋(live_verify)의 코드 강제 범위 - 반품 상태 4종 x 1일 x 1페이지 x retry 0 + 교환 1 = 최대 5회.
+LIVE_VERIFY_FEATURES = frozenset({"returns", "exchanges"})
+LIVE_VERIFY_MAX_REQUESTS = 5
+
+
+class ClaimSyncRequest(OrderSyncRequest):
+    """교환·반품(클레임) 수동 수집 요청. live_verify=True는 실계정 첫 검증용 프리셋이다 - 서버가 범위를 코드로 강제한다:
+    반품·교환만(취소 제외), 조회기간 정확히 1일, 쿼리당 1페이지, retry 0, 요청 최대 5회. 다른 값을 줘도 더 느슨해지지 않는다."""
+
+    live_verify: bool = False
 
 
 class OrderSyncResult(BaseModel):
@@ -623,7 +637,7 @@ def _claim_http_status(result: dict) -> int:
     "필요 권한: ORDER_EDIT",
     responses={404: {"description": "플랫폼을 찾을 수 없습니다."}},
 )
-def sync_claims(payload: OrderSyncRequest, db: Session = Depends(get_db)) -> JSONResponse:
+def sync_claims(payload: ClaimSyncRequest, db: Session = Depends(get_db)) -> JSONResponse:
     if not settings.claim_sync_enabled:
         # 실계정 검증 승인 전 기본 차단 - 커넥터를 만들지도, 플랫폼을 조회하지도 않고
         # 즉시 반환한다(외부 호출 0건). 기존 응답 계약(구조화 body + _claim_http_status)
@@ -642,26 +656,58 @@ def sync_claims(payload: OrderSyncRequest, db: Session = Depends(get_db)) -> JSO
     if platform is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="플랫폼을 찾을 수 없습니다.")
 
-    # 미검증 채널은 팩토리가 MarketplaceCapabilityUnsupportedError -> 전역 핸들러 501.
-    connector = get_mall_connector(platform.connector_class, session=db, platform_id=platform.id)
-    # 자동 수집과 같은 호출량 제한(페이지 상한·retry·요청 예산)을 쓴다 - 수동 호출도 무제한 경로가 없다.
-    result = ClaimSyncService(db).sync_claims(connector, platform.id, payload.start_date, payload.end_date)
-    try:
-        db.commit()
-    except SQLAlchemyError:
-        db.rollback()
-        logger.warning("클레임 수집 커밋 실패: trace=%s", uuid.uuid4().hex[:8])
-        failed = {"status": "FAILED", "count": 0, "reason_code": "DB_WRITE_FAILED", "retryable": False}
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "overall_status": "FAILED",
-                "cancellations": failed,
-                "returns": failed,
-                "exchanges": failed,
-                "skipped_no_order": result.get("skipped_no_order", 0),
-            },
+    limits = None
+    features = None
+    if payload.live_verify:
+        # 실계정 첫 검증 프리셋 - 코드로 범위를 강제한다(반품 4 + 교환 1 = 최대 5회, 취소 제외).
+        if (payload.end_date - payload.start_date).days != 1:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="live_verify는 조회기간이 정확히 1일이어야 합니다.",
+            )
+        features = LIVE_VERIFY_FEATURES
+        limits = ClaimSyncLimits(
+            max_pages=1,
+            max_retries=0,
+            budget=RequestBudget(max_requests=min(LIVE_VERIFY_MAX_REQUESTS, settings.claim_sync_max_requests_per_run)),
         )
 
-    # 200/409/501/502/503/500 어떤 경우에도 동일한 구조화 body를 유지한다.
-    return JSONResponse(status_code=_claim_http_status(result), content=result)
+    # 같은 플랫폼의 scheduler claim_sync와 같은 잠금 - 겹치면 외부 호출·DB 쓰기 없이 ALREADY_RUNNING으로 끝난다.
+    with claim_sync_platform_lock(platform.id, db.get_bind()) as acquired:
+        if not acquired:
+            running = {"status": "ALREADY_RUNNING", "count": 0, "reason_code": "ALREADY_RUNNING", "retryable": True}
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={
+                    "overall_status": "ALREADY_RUNNING",
+                    "cancellations": running,
+                    "returns": running,
+                    "exchanges": running,
+                    "skipped_no_order": 0,
+                },
+            )
+        # 미검증 채널은 팩토리가 MarketplaceCapabilityUnsupportedError -> 전역 핸들러 501.
+        connector = get_mall_connector(platform.connector_class, session=db, platform_id=platform.id)
+        # 자동 수집과 같은 호출량 제한(페이지 상한·retry·요청 예산)을 쓴다 - 수동 호출도 무제한 경로가 없다.
+        result = ClaimSyncService(db).sync_claims(
+            connector, platform.id, payload.start_date, payload.end_date, limits, features
+        )
+        try:
+            db.commit()
+        except SQLAlchemyError:
+            db.rollback()
+            logger.warning("클레임 수집 커밋 실패: trace=%s", uuid.uuid4().hex[:8])
+            failed = {"status": "FAILED", "count": 0, "reason_code": "DB_WRITE_FAILED", "retryable": False}
+            return JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content={
+                    "overall_status": "FAILED",
+                    "cancellations": failed,
+                    "returns": failed,
+                    "exchanges": failed,
+                    "skipped_no_order": result.get("skipped_no_order", 0),
+                },
+            )
+
+        # 200/409/501/502/503/500 어떤 경우에도 동일한 구조화 body를 유지한다.
+        return JSONResponse(status_code=_claim_http_status(result), content=result)
