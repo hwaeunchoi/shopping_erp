@@ -496,6 +496,70 @@ def scenario_promotion_poison() -> dict:
     }
 
 
+def scenario_claim_lock_domain() -> dict:
+    from core.advisory_locks import CLAIM_SYNC_CLASSID, claim_sync_lock_key
+
+    pid_a, pid_b = _platform(), _platform()
+    out: dict[str, Any] = {"classid_is_claim": claim_sync_lock_key(pid_a)[0] == CLAIM_SYNC_CLASSID}
+
+    def can_take(pid: int) -> bool:
+        with claim_sync_platform_lock(pid, engine) as got:
+            return bool(got)
+
+    # 같은 플랫폼은 직렬화, 다른 플랫폼은 동시 진행.
+    with claim_sync_platform_lock(pid_a, engine) as holder:
+        out["holder_acquired"] = holder
+        out["same_platform_blocked"] = not can_take(pid_a)
+        out["other_platform_not_blocked"] = can_take(pid_b)
+        with claim_sync_platform_lock(pid_b, engine) as both:
+            out["two_platforms_held_together"] = both
+    out["free_after_with"] = can_take(pid_a) and can_take(pid_b)
+
+    # 해제: Exception / BaseException / 연결 종료.
+    try:
+        with claim_sync_platform_lock(pid_a, engine) as g:
+            assert g
+            raise RuntimeError("synthetic")
+    except RuntimeError:
+        pass
+    out["after_exception"] = can_take(pid_a)
+
+    try:
+        with claim_sync_platform_lock(pid_a, engine) as g:
+            assert g
+            raise KeyboardInterrupt()
+    except BaseException as exc:  # noqa: BLE001 - BaseException 경로 확인
+        out["base_exception_type"] = type(exc).__name__ == "KeyboardInterrupt"
+    out["after_base_exception"] = can_take(pid_a)
+
+    killer = engine.connect()
+    kill_ok = None
+    try:
+        with claim_sync_platform_lock(pid_a, engine) as g:
+            assert g
+            key = claim_sync_lock_key(pid_a)
+            backend = killer.execute(
+                text(
+                    "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND classid = :c AND objid = :o AND granted"
+                ),
+                {"c": key[0], "o": key[1]},
+            ).scalar_one()
+            killer.execute(text("SELECT pg_terminate_backend(:p)"), {"p": backend})
+            killer.commit()
+        kill_ok = True  # 끊긴 연결에서도 컨텍스트 종료가 예외를 내지 않는다
+    except Exception as exc:  # noqa: BLE001
+        kill_ok = type(exc).__name__
+    killer.close()
+    out["kill_exit_clean"] = kill_ok
+    out["after_connection_killed"] = can_take(pid_a)
+    check = SessionLocal()
+    out["advisory_locks_left"] = int(
+        check.execute(text("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'")).scalar_one()
+    )
+    check.close()
+    return {"scenario": "claim_lock_domain", **out}
+
+
 SCENARIOS = {
     "concurrent_same_claim": scenario_concurrent_same_claim,
     "commit_failure": scenario_commit_failure,
@@ -505,6 +569,7 @@ SCENARIOS = {
     "job_lock_exclusion": scenario_job_lock_exclusion,
     "cursor_commit_failure": scenario_cursor_commit_failure,
     "promotion_poison": scenario_promotion_poison,
+    "claim_lock_domain": scenario_claim_lock_domain,
 }
 
 if __name__ == "__main__":

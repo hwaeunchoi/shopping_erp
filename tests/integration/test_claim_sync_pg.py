@@ -89,3 +89,16 @@ class TestUnmatchedPromotionIsolation:
         assert p["after_poison_run"]["returns"] == 1 and p["after_poison_run"]["unmatched_resolved"] == 1, p
         assert p["resolved_after_recovery"] == 1, p  # 원인이 사라지면 다음 실행에서 승격
         assert p["after_recovery"]["returns"] == 2 and p["after_recovery"]["unmatched_resolved"] == 2, p
+
+
+class TestClaimLockDomainOnPostgres:
+    def test_platforms_are_independent_and_the_lock_is_freed_on_every_exit_path(self, request):
+        p = _scenario(request.getfixturevalue("pg_sandbox"), "claim_lock_domain")
+        assert p["classid_is_claim"] is True and p["holder_acquired"] is True, p
+        assert p["same_platform_blocked"] is True, p  # 같은 플랫폼의 패자는 대기 없이 거절
+        assert p["other_platform_not_blocked"] is True and p["two_platforms_held_together"] is True, p
+        assert p["free_after_with"] is True, p
+        assert p["after_exception"] is True, p
+        assert p["base_exception_type"] is True and p["after_base_exception"] is True, p
+        assert p["kill_exit_clean"] is True and p["after_connection_killed"] is True, p
+        assert p["advisory_locks_left"] == 0, p
