@@ -14,6 +14,16 @@ from logging.handlers import TimedRotatingFileHandler
 
 from config.settings import settings
 
+# 외부 HTTP 클라이언트 라이브러리는 INFO에 요청 전체 URL(쇼핑몰 vendorId, 경로의 식별자, 조회 조건)을, DEBUG에 요청 헤더까지
+# 남긴다. 어느 환경(debug 포함)에서도 WARNING 미만은 막는다. 오류는 앱의 안전한 reason-code 로그로만 남긴다.
+OUTBOUND_HTTP_LOGGERS = ("httpx", "httpcore", "urllib3")
+OUTBOUND_HTTP_LOG_LEVEL = logging.WARNING
+
+
+def quiet_outbound_http_loggers() -> None:
+    for name in OUTBOUND_HTTP_LOGGERS:
+        logging.getLogger(name).setLevel(OUTBOUND_HTTP_LOG_LEVEL)
+
 
 def setup_logging() -> None:
     """애플리케이션 시작 시 1회 호출하여 로깅을 초기화한다."""
@@ -37,3 +47,4 @@ def setup_logging() -> None:
     root_logger.setLevel(logging.DEBUG if settings.debug else logging.INFO)
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
+    quiet_outbound_http_loggers()
