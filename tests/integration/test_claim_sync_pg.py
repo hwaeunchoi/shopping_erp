@@ -102,3 +102,16 @@ class TestClaimLockDomainOnPostgres:
         assert p["base_exception_type"] is True and p["after_base_exception"] is True, p
         assert p["kill_exit_clean"] is True and p["after_connection_killed"] is True, p
         assert p["advisory_locks_left"] == 0, p
+
+
+class TestCancellationPresetOnPostgres:
+    def test_commit_failure_rolls_back_the_cursor_and_the_lock_is_shared(self, request):
+        p = _scenario(request.getfixturevalue("pg_sandbox"), "cancel_preset")
+        assert p["commit_failure_status"] == [500, "DB_WRITE_FAILED"], p
+        assert p["cursor_after_failure"] in (None, 0), p  # 데이터와 함께 롤백 - 전진하지 않았다
+        assert p["lookups_in_failed_run"] == 2, p
+        assert p["rerun_status"] == 200 and p["rerun_requests_used"] == 2 and p["rerun_checked"] == 2, p
+        assert p["rerun_same_orders_as_failed_run"] is True, p  # 실패한 실행과 같은 주문부터 다시
+        assert p["cursor_after_rerun_is_second_candidate"] is True, p
+        assert p["lock_held"] is True and p["locked_run"] == [200, "ALREADY_RUNNING"], p
+        assert p["lookups_while_locked"] == 0, p  # 패자는 외부 조회가 없다

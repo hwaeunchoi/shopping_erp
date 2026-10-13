@@ -560,6 +560,98 @@ def scenario_claim_lock_domain() -> dict:
     return {"scenario": "claim_lock_domain", **out}
 
 
+def scenario_cancel_preset() -> dict:
+    """취소 단건 조회 프리셋(live_verify_cancellations)의 실제 함수를 PostgreSQL 에서 실행한다: commit 실패 시 cursor 와 데이터가
+    함께 롤백되고 재실행이 같은 주문부터 다시 시작하며, 같은 플랫폼 잠금이 잡혀 있으면 외부 조회 없이 ALREADY_RUNNING 으로 끝난다."""
+    from sqlalchemy.exc import OperationalError
+
+    import api.routers.orders as orders_mod
+
+    pid = _platform()
+    setup = SessionLocal()
+    for i in range(1, 6):
+        _order(setup, pid, f"CP-{i:03d}")
+    setup.commit()
+    setup.close()
+    settings.claim_sync_enabled = True
+
+    class _Budgeted(_Conn):
+        def fetch_cancellation_status(self, order_no, since, **kw):
+            kw["request_budget"].consume("coupang")
+            return super().fetch_cancellation_status(order_no, since, **kw)
+
+    conn = _Budgeted()
+    orders_mod.get_mall_connector = lambda *a, **k: conn  # type: ignore[assignment]
+
+    def run_preset(session: Session) -> tuple[int, dict]:
+        platform = session.get(Platform, pid)
+        assert platform is not None
+        resp = orders_mod._live_verify_cancellations(session, platform)
+        return resp.status_code, json.loads(bytes(resp.body))
+
+    def cursor() -> Any:
+        c = SessionLocal()
+        try:
+            return c.execute(
+                select(ClaimCollectionCursor.last_order_id).where(ClaimCollectionCursor.platform_id == pid)
+            ).scalar_one_or_none()
+        finally:
+            c.close()
+
+    # 1) commit failure -> 500, cursor and data rolled back, nothing advanced
+    s1 = SessionLocal()
+    state = {"fail": True}
+
+    @event.listens_for(s1, "before_commit")
+    def _boom(sess: Session) -> None:
+        if state["fail"] and not sess.in_nested_transaction():
+            state["fail"] = False
+            raise OperationalError("COMMIT", {}, Exception("synthetic commit failure"))
+
+    code1, body1 = run_preset(s1)
+    s1.close()
+    cursor_after_failure = cursor()
+    lookups_first = list(conn.lookups)
+
+    # 2) rerun: starts from the same orders, moves the cursor to the 2nd candidate
+    s2 = SessionLocal()
+    code2, body2 = run_preset(s2)
+    s2.close()
+    ids = _all_order_ids(pid)
+    cursor_after_rerun = cursor()
+    lookups_all = list(conn.lookups)
+
+    # 3) same platform lock held elsewhere -> ALREADY_RUNNING, zero lookups
+    before = len(conn.lookups)
+    with claim_sync_platform_lock(pid, engine) as held:
+        s3 = SessionLocal()
+        code3, body3 = run_preset(s3)
+        s3.close()
+    lookups_during_lock = len(conn.lookups) - before
+    return {
+        "scenario": "cancel_preset",
+        "commit_failure_status": [code1, body1.get("cancellations", {}).get("reason_code")],
+        "cursor_after_failure": cursor_after_failure,
+        "lookups_in_failed_run": len(lookups_first),
+        "rerun_status": code2,
+        "rerun_requests_used": body2.get("requests_used"),
+        "rerun_checked": body2.get("cancellations", {}).get("checked"),
+        "rerun_same_orders_as_failed_run": lookups_all[len(lookups_first) :] == lookups_first,
+        "cursor_after_rerun_is_second_candidate": cursor_after_rerun == ids[1],
+        "lock_held": held,
+        "locked_run": [code3, body3.get("overall_status")],
+        "lookups_while_locked": lookups_during_lock,
+    }
+
+
+def _all_order_ids(pid: int) -> list[int]:
+    c = SessionLocal()
+    try:
+        return list(c.execute(select(Order.id).where(Order.platform_id == pid).order_by(Order.id)).scalars())
+    finally:
+        c.close()
+
+
 SCENARIOS = {
     "concurrent_same_claim": scenario_concurrent_same_claim,
     "commit_failure": scenario_commit_failure,
@@ -570,6 +662,7 @@ SCENARIOS = {
     "cursor_commit_failure": scenario_cursor_commit_failure,
     "promotion_poison": scenario_promotion_poison,
     "claim_lock_domain": scenario_claim_lock_domain,
+    "cancel_preset": scenario_cancel_preset,
 }
 
 if __name__ == "__main__":
