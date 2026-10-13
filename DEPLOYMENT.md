@@ -681,3 +681,27 @@ Docker Compose의 우선순위는 **프로세스(셸) 환경변수 > `.env`**입
   서버가 반품·교환만, 쿼리당 1페이지, retry 0, 요청 최대 5회로 강제하고 취소(후보 단건 조회 포함)는 호출하지 않는다.
 - 같은 플랫폼의 scheduler `claim_sync`가 실행 중이면 `ALREADY_RUNNING`으로 끝난다(잠금 공유).
 - 이 호출은 수집 결과를 `returns`/`exchanges`에 저장한다(DB write 있음). 고객정보·주문번호·송장번호·응답 본문은 출력하지 않는다.
+
+#### 취소 단건 조회 실계정 검증 (`live_verify_cancellations`)
+
+반품·교환 `live_verify`와 별개로, 쿠팡 취소 "후보 주문 단건 조회" 경로만 검증하는 프리셋이다. `POST /api/orders/sync-claims`
+요청 본문에 `"live_verify_cancellations": true`를 준다(`live_verify`와 동시에 true면 422, 외부 호출 없음).
+
+- **서버가 강제하는 값(요청 본문으로 바꿀 수 없음)**: 반품·교환·정산 호출 없음(응답은 `NOT_REQUESTED`), 후보 주문 최대 2건, 페이지 1,
+  retry 0, 요청 최대 2회(설정 예산이 더 작으면 그 값). 요청 본문의 기간 값은 이 프리셋에서 쓰지 않는다.
+- scheduler `claim_sync`와 같은 `(platform_id, CLAIM_SYNC)` 잠금 안에서 **실제 운영 서비스 경로**(회전 cursor 포함)를 쓴다.
+  겹치면 외부 호출 없이 `ALREADY_RUNNING`. cursor 는 후보 처리와 같은 트랜잭션이라 commit 이 실패하면 함께 롤백된다.
+  이 프리셋을 실행하면 cursor 가 실제로 전진한다(운영 `claim_collection_cursors` 행이 생긴다) - 이후 자동수집은 다음 후보부터 이어진다.
+- 후보가 0건이면 외부 요청 0회로 `SUCCESS`(`verification_level=NOT_VALIDATED`).
+- **판정을 둘로 구분한다**(응답의 `verification_level`):
+  - `LIVE_CANCEL_AUTH_AND_ENVELOPE_VALIDATED`: 요청 성공 + schema 정상 + 취소 데이터 0건. 인증·응답 형식만 증명한다.
+  - `LIVE_CANCEL_PERSISTENCE_VALIDATED`: 실제 취소 1건 이상을 저장 - 저장·dedup·주문 연결까지 증명한다.
+  - 그 밖(실패, 후보 없음)은 `NOT_VALIDATED`. 취소 0건을 저장 경로 검증으로 보고하지 않는다.
+
+##### 공식 계약 확인 (developers.coupang.com, 반품/취소 요청 목록 조회, 2026-10 재조회)
+- 확인됨: `GET .../v6/vendors/{vendorId}/returnRequests`, 조회 기준은 **접수일**("접수 일자를 기준으로 반품 / 취소 접수 내역을 조회"),
+  한 번에 최대 31일 범위, `cancelType=CANCEL`은 `status`를 쓸 수 없고 `orderId`가 필요, 오류는 400(입력 오류·31일 초과)/412(timeout).
+- **"31일"은 조회 범위(접수일 기준)이지 주문의 나이 제한이 아니다.** 문서에는 주문이 오래되면 조회할 수 없다는 문장이 없다.
+  오래된 주문도 조회할 수 있고, 다만 조회한 31일 범위 밖에 접수된 취소는 보이지 않는다.
+- 문서에 명시되지 않음(추정으로 취급): 끝 날짜 포함 여부, 날짜의 시간대, 결과 없음 응답의 예시(코드는 빈 `data`를 정상으로 처리),
+  `nextToken` 의 정확한 위치(필드 설명과 응답 예시가 서로 다르다).
