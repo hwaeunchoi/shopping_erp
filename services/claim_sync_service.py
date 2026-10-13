@@ -297,6 +297,7 @@ class ClaimSyncService:
             count = 0
             checked = 0
             skipped_failed = 0
+            last_http_status: Optional[int] = None
             consecutive_skips = 0
             last_safe_id = cursor.last_order_id
             failure: Optional[MarketplaceExternalAPIError] = None
@@ -311,10 +312,14 @@ class ClaimSyncService:
                         request_budget=limits.budget,
                     )
                 except MarketplaceExternalAPIError as e:
+                    http_status = _safe_http_status(e)
+                    if http_status is not None:
+                        last_http_status = http_status
                     logger.warning(
-                        "취소 후보 주문 조회 실패: platform_id=%s, reason=%s, batch_stop=%s",
+                        "취소 후보 주문 조회 실패: platform_id=%s, reason=%s, http_status=%s, batch_stop=%s",
                         platform_id,
                         e.reason_code,
+                        http_status if http_status is not None else "none",
                         e.reason_code in _BATCH_STOP_REASONS,
                     )
                     if e.reason_code in _BATCH_STOP_REASONS:
@@ -346,6 +351,8 @@ class ClaimSyncService:
             self.session.flush()
             savepoint.commit()
             extra = {"checked": checked, "skipped_failed": skipped_failed}
+            if last_http_status is not None:
+                extra["last_http_status"] = last_http_status
             if failure is not None:
                 status = "PARTIAL" if (count > 0 or checked > 0) else "FAILED"
                 return _feature_result(status, count, failure.reason_code, bool(failure.retryable), **extra)
@@ -612,6 +619,14 @@ class ClaimSyncService:
         if has_success:  # SUCCESS (+ UNSUPPORTED) 만 존재
             return "SUCCESS"
         return "FAILED"  # SUCCESS 없음 + FAILED 존재(UNSUPPORTED 동반 가능)
+
+
+def _safe_http_status(error: MarketplaceExternalAPIError) -> Optional[int]:
+    """외부 오류에서 "숫자 HTTP 상태코드"만 꺼낸다. URL·본문·메시지는 다루지 않는다 - 상태가 없으면(timeout·연결 실패 등) None."""
+    value = getattr(error, "http_status", None)
+    if isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599:
+        return value
+    return None
 
 
 def _feature_result(
