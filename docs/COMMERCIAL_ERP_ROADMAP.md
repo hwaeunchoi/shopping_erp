@@ -248,6 +248,12 @@
 `live_verify`와 동시 사용 불가, 같은 CLAIM_SYNC 잠금, 운영 서비스 경로와 회전 cursor 사용). 취소 0건은 `LIVE_CANCEL_AUTH_AND_ENVELOPE_VALIDATED`
 (인증·응답 형식만), 취소 1건 이상 저장은 `LIVE_CANCEL_PERSISTENCE_VALIDATED`로 구분한다. 자세한 절차와 공식 계약 확인 결과는 DEPLOYMENT.md 참고.
 
+#### 5-B3) 취소 단건 조회 `BAD_RESPONSE` 조사
+
+2026-10-13 실계정 첫 취소 검증에서 후보 2건이 모두 `BAD_RESPONSE`(`checked=0`, `NOT_VALIDATED`)였다. 상태코드를 알 수 없어 원인을 확정하지 못했고, 가장 유력한
+가설은 레거시 더미 주문(비숫자 주문번호)이 후보에 남아 있는 것이다. 안전한 숫자 HTTP 상태코드 진단(`last_http_status`, 로그 `http_status=`)을 추가했다. 공식 계약 비교표와
+cursor 정책 감사는 DEPLOYMENT.md 의 "취소 단건 조회 `BAD_RESPONSE` 조사 기록" 참고. 원인 확정 전에는 canary 를 켜지 않는다.
+
 #### 5-C) 실행량 표 (기본 설정, 플랫폼 1개 - 현재 쿠팡만 수집 대상)
 
 | 구분 | 실행당 | 시간당(3회) | 9시간(PC 업무시간, 27회) | 24시간(72회) |

@@ -709,3 +709,63 @@ Docker Compose의 우선순위는 **프로세스(셸) 환경변수 > `.env`**입
   `date.today()`를 쓴다. 쿠팡 문서는 날짜를 해석하는 시간대를 명시하지 않는다. 현재 PC 업무시간(09~18시 KST = 00~09시 UTC)에는 UTC와 KST의
   날짜가 같아 실질 영향이 없다. 24시간 운영으로 가기 전에 Asia/Seoul 기준 날짜 정책을 별도로 확정해야 한다(KST 00~09시에는 UTC 날짜가
   하루 전이다).
+
+#### 취소 단건 조회 `BAD_RESPONSE` 조사 기록 (2026-10-13 실계정 첫 검증)
+
+##### 운영 실측 (사실)
+- `live_verify_cancellations` 1회: HTTP 200 응답, 후보 2건 모두 `reason=BAD_RESPONSE`, `checked=0`, `skipped_failed=2`, 취소 0건,
+  `verification_level=NOT_VALIDATED`. 외부 요청 2회, 반품·교환·정산 호출 없음, 로그 비노출 확인.
+- cursor 가 생성되어 두 후보를 건너뛴 위치(2번째 후보)로 전진했다. 건너뛴 후보는 cursor 가 한 바퀴 돌면 다시 확인된다.
+- 당시 로그에 숫자 HTTP 상태코드가 없어 **상태코드와 정확한 원인은 미확정**이다. 이 브랜치가 숫자 상태코드 계측을 추가했다(아래).
+
+##### `BAD_RESPONSE` 가 만들어지는 경로 (코드)
+`integrations/malls/errors.raise_for_status`: HTTP 200이 아니고 401/403/429/5xx 도 아니면 `BAD_RESPONSE`(retryable=False, `http_status` 보관).
+취소 단건 조회는 `_collect_token_pages`가 이 함수를 부른다. 따라서 사실로 말할 수 있는 것은 "두 요청의 응답이 200이 아니면서 401/403/429/5xx 가
+아닌 상태(예: 400, 412, 404)"까지다. 연결·timeout 은 `TIMEOUT`/`CONNECT_FAILED`, 본문 파싱 실패는 `PARSE_FAILED` 로 별도 분류되므로 이번 건과 다르다.
+서비스는 `BAD_RESPONSE`를 "주문 단위 영구 오류"로 보고 그 주문을 건너뛰며 cursor 를 전진시킨다(공통 원인 목록 `_BATCH_STOP_REASONS` 에 없다).
+
+##### 추가한 안전 진단 (이 브랜치)
+- 숫자 HTTP 상태코드만 기록·반환한다: 로그 `reason=BAD_RESPONSE, http_status=400` 형태(상태가 없으면 `http_status=none`), 결과 객체와 작업 이력·검증 응답의
+  `cancellations.last_http_status`(정수, 실패 시에만). URL·query·주문번호·vendor ID·credential·Authorization·서명·JWT·응답 본문·예외 메시지 전체는 남기지 않는다.
+- 기존 reason code 로그와 `httpx/httpcore/urllib3` WARNING 억제는 그대로다. 오류 본문의 플랫폼 오류 코드는 읽지 않는다 - 공식 문서에 안정된 오류 코드
+  필드가 정의돼 있지 않아 허용 목록 방식이 불가능하다(구현하지 않음).
+
+##### 공식 문서와 현재 요청의 비교 (확인일 2026-10-13, developers.coupang.com 반품/취소 요청 목록 조회, 한국어·영문 페이지)
+| 항목 | 공식 문서 | 현재 코드 | 분류 |
+|---|---|---|---|
+| endpoint | `GET /v2/providers/openapi/apis/api/v6/vendors/{vendorId}/returnRequests` | 동일 | CONFIRMED_MATCH |
+| vendorId 위치 | 경로에만 있음(query 표에 없음) | 경로에만 사용 | CONFIRMED_MATCH |
+| `cancelType=CANCEL` | 허용. 이때 `status`는 지원하지 않음(제거) | `cancelType=CANCEL`, `status` 없음 | CONFIRMED_MATCH |
+| `orderId` 필요 여부 | `status`를 생략하면 필수 | 사용함 | CONFIRMED_MATCH (같은 페이지의 "결제완료 단계 취소는 status·orderId를 모두 제외" 설명과는 모순 - 문서 내 모순 기록) |
+| `orderId` 형식 | 타입 `number`, 예시는 14자리 정수 | 주문번호 문자열을 그대로 전송 | **CONFIRMED_MISMATCH (일부 데이터)** - 후보 352건 중 60건이 비숫자(영문 1자+숫자 12자리). 첫 후보 2건이 모두 해당 |
+| `searchType` | 표에 필수(`*`)로 표시, 허용값은 `timeFrame`만 명시, 생략 시 동작 문서 미명시. 본문은 "분 단위 조회는 timeFrame"이라고만 설명 | 보내지 않음(같은 endpoint 의 반품 조회도 보내지 않고 200 정상) | DOCUMENTATION_AMBIGUOUS (반품 조회는 실계정 200 확인, 취소 조회 자체는 RUNTIME_STATUS_REQUIRED) |
+| `createdAtFrom/To` 형식 | `yyyy-MM-dd`(timeFrame이면 `yyyy-MM-ddTHH:mm`) | `yyyy-MM-dd` | CONFIRMED_MATCH |
+| 날짜 기준 | **접수일** 기준(`createdAt`은 접수 시각) | 취소 접수 조회기간으로 사용 | CONFIRMED_MATCH |
+| 최대 조회 범위 | 한국어 "최대 31일", 영문 본문 "up to 31 days", 영문 오류표 "less than 31 days" | 시작 = `max(주문일, 오늘-31일)`, 종료 = 오늘(날짜 차이가 최대 31일) | DOCUMENTATION_AMBIGUOUS (문서 내부 모순, 계산 방식 미명시) + RUNTIME_STATUS_REQUIRED |
+| 시작·종료일 포함 여부 | 문서 미명시 | - | DOCUMENTATION_AMBIGUOUS |
+| 날짜 시간대 | 문서 미명시(예시 응답의 `-08:00` 오프셋에 대한 설명 없음) | 컨테이너 UTC `date.today()` | DOCUMENTATION_AMBIGUOUS |
+| 400 / 412 | 400: vendorId 오류, status 없는데 orderId 없음, 31일 초과, 종료일<시작일. 412: "Read timed out"(범위를 줄여 재시도) | 400·412 모두 `BAD_RESPONSE`(영구 오류)로 분류 | 분류 정책은 별도 검토 대상 |
+| `nextToken` 위치 | 필드 표는 `data[].nextToken`, 응답 예시는 최상위 | 최상위에서 읽음 | DOCUMENTATION_AMBIGUOUS |
+| 결과 없음 응답 예시 | 문서 미명시 | 빈 `data`를 정상으로 처리 | DOCUMENTATION_AMBIGUOUS |
+| 과거 조회 한계 | 주문·접수가 오래되면 조회할 수 없다는 문장 없음 | 주문 나이로 후보를 제외하지 않음 | CONFIRMED_MATCH |
+
+##### 가장 유력한 가설 (추정 - 상태코드로 확정 전까지 결론 아님)
+- 첫 후보 2건은 더미 차단 커밋(`a20fd80`) 이전에 만들어진 **레거시 더미 주문**일 가능성이 높다. 당시 생성기가 주문번호를 `"C" + 날짜(8자리) + 순번(4자리)`
+  (영문 1자 + 숫자 12자리)로 만들었고, 이 형태가 운영 DB 의 비숫자 주문번호(쿠팡 주문 922건 중 89건, 주문일 2026-07-03~08-27, 취소 후보 60건)와 일치한다.
+  이 주문은 쿠팡에 존재하지 않고 문서상 `orderId`는 숫자이므로 400 으로 거절됐을 가능성이 크다.
+- 보조 가설: 두 후보가 가장 오래된 주문이라 조회 범위가 정확히 31일 차이가 되어 경계에서 거절됐을 수 있다(문서 미확정).
+- 따라서 **상태코드 계측 후에만** 날짜 범위·후보 선택·parameter 수정 여부를 판단한다. 근거 없이 조회 기간을 30일로 바꾸거나 parameter 를 추가·삭제하지 않는다.
+
+##### cursor 정책 감사 결과 (변경하지 않음 - 제안만)
+- 400 은 문서상 요청 구성 전체의 오류일 수도, 주문 단위 오류(비숫자 주문번호)일 수도 있다. 현재 정책은 둘을 구분하지 못한다.
+- 같은 요청 구성이 모든 후보에서 실패하면 연속 건너뜀 상한(3회)에서 배치가 멈추지만, 그 3건만큼 cursor 는 전진한다. 후보가 많으면(예: 352건) 한 바퀴가
+  끝나도록 실행당 최대 3회의 무의미한 요청이 반복될 수 있다. 건너뛴 주문은 cursor 가 한 바퀴 돈 뒤 다시 시도된다.
+- canary 처럼 배치가 2건이면 연속 건너뜀 상한(3)에 도달하지 못해 두 후보를 모두 건너뛰고 `overall_status=SUCCESS`로 보이며 `checked=0`일 때만 검증 단계가 `NOT_VALIDATED`로 드러난다.
+- 후보 조회 실패는 `claim_sync` 연동 상태(integration_status)에 반영되지 않는다(반품·교환 결과만 반영). 운영자는 작업 이력 결과의 `cancellations_by_order_lookup`과
+  로그의 reason code·http_status 로만 볼 수 있다.
+- 안전한 최소 수정 후보(미구현): ① 후보 선택 시 쿠팡 주문번호 형식(숫자) 검증으로 비숫자 레거시 주문 제외 또는 별도 격리, ② 412(timeout)를 재시도 가능한 공통 오류로 분류,
+  ③ `checked=0`인 배치를 SUCCESS 가 아닌 경고로 표시. 모두 정책 결정이 필요하다.
+
+##### 현재 운영 상태와 결정 대기
+- 운영은 api `cb253c0`, scheduler `c5d816f`이고 claim·settlement 는 False 다. **원인 확정 전에는 canary(`MAX_ORDERS=2`, `MAX_REQUESTS=51`)를 활성화하지 않는다.**
+- 다음 실계정 1회 재검증 전에 필요한 결정: 이 진단 브랜치의 검토·배포, 그리고 후보 선택 정책(비숫자 레거시 주문 처리 방식).
