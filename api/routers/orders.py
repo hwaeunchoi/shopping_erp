@@ -15,7 +15,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -24,6 +24,7 @@ from config.settings import settings
 from integrations.malls import get_mall_connector
 from integrations.malls.errors import RequestBudget
 from models.extra import Memo
+from models.platform import Platform
 from models.user import User
 from repositories.customer_repository import CustomerRepository
 from repositories.extra_repository import MemoRepository
@@ -140,12 +141,26 @@ class OrderSyncRequest(BaseModel):
 LIVE_VERIFY_FEATURES = frozenset({"returns", "exchanges"})
 LIVE_VERIFY_MAX_REQUESTS = 5
 
+# 취소 단건 조회 전용 실계정 검증 프리셋(live_verify_cancellations) - 후보 주문 최대 2건 x 1회(retry 0, 페이지 1) = 최대 2회.
+# 요청 본문으로는 이 값을 바꿀 수 없다.
+LIVE_VERIFY_CANCELLATION_MAX_ORDERS = 2
+LIVE_VERIFY_CANCELLATION_MAX_REQUESTS = 2
+
 
 class ClaimSyncRequest(OrderSyncRequest):
     """교환·반품(클레임) 수동 수집 요청. live_verify=True는 실계정 첫 검증용 프리셋이다 - 서버가 범위를 코드로 강제한다:
     반품·교환만(취소 제외), 조회기간 정확히 1일, 쿼리당 1페이지, retry 0, 요청 최대 5회. 다른 값을 줘도 더 느슨해지지 않는다."""
 
     live_verify: bool = False
+    live_verify_cancellations: bool = False
+    """취소 "후보 주문 단건 조회"만 검증하는 프리셋 - 서버가 후보 최대 2건·페이지 1·retry 0·요청 최대 2회로 고정하고 반품·교환·
+    정산은 호출하지 않는다(요청 본문의 기간 값은 이 프리셋에서 사용하지 않는다). live_verify와 함께 켤 수 없다."""
+
+    @model_validator(mode="after")
+    def _presets_are_mutually_exclusive(self) -> "ClaimSyncRequest":
+        if self.live_verify and self.live_verify_cancellations:
+            raise ValueError("live_verify와 live_verify_cancellations는 동시에 사용할 수 없습니다.")
+        return self
 
 
 class OrderSyncResult(BaseModel):
@@ -590,6 +605,8 @@ class ClaimSyncResult(BaseModel):
     returns: ClaimFeatureResult
     exchanges: ClaimFeatureResult
     skipped_no_order: int
+    requests_used: Optional[int] = None
+    verification_level: Optional[str] = None
 
 
 # 외부 API 실패로 분류되는 안전 reason_code(HTTP 502/503 판정용). CREDENTIAL_MISSING/
@@ -626,6 +643,76 @@ def _claim_http_status(result: dict) -> int:
     return status.HTTP_500_INTERNAL_SERVER_ERROR
 
 
+def _cancellation_verification_level(lookup: dict) -> str:
+    """취소 후보 단건 조회 검증이 어디까지 증명했는지 구분한다 - 취소 0건을 저장 경로 검증으로 과장하지 않는다."""
+    if lookup.get("status") != "SUCCESS":
+        return "NOT_VALIDATED"
+    if lookup.get("count", 0) >= 1:
+        return "LIVE_CANCEL_PERSISTENCE_VALIDATED"
+    if lookup.get("checked", 0) >= 1:
+        return "LIVE_CANCEL_AUTH_AND_ENVELOPE_VALIDATED"
+    return "NOT_VALIDATED"  # 유효 후보가 없어 외부 요청이 없었다
+
+
+def _live_verify_cancellations(db: Session, platform: Platform) -> JSONResponse:
+    """취소 단건 조회 전용 프리셋: 후보 최대 2건, 페이지 1, retry 0, 요청 최대 2회. 반품·교환·정산은 호출하지 않는다.
+    scheduler와 같은 (platform_id, CLAIM_SYNC) 잠금 안에서 실제 운영 서비스 경로(회전 cursor 포함)를 그대로 쓴다."""
+    with claim_sync_platform_lock(platform.id, db.get_bind()) as acquired:
+        if not acquired:
+            running = {"status": "ALREADY_RUNNING", "count": 0, "reason_code": "ALREADY_RUNNING", "retryable": True}
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={
+                    "overall_status": "ALREADY_RUNNING",
+                    "cancellations": running,
+                    "returns": running,
+                    "exchanges": running,
+                    "skipped_no_order": 0,
+                },
+            )
+        connector = get_mall_connector(platform.connector_class, session=db, platform_id=platform.id)
+        limits = ClaimSyncLimits(
+            max_pages=1,
+            max_retries=0,
+            budget=RequestBudget(
+                max_requests=min(LIVE_VERIFY_CANCELLATION_MAX_REQUESTS, settings.claim_sync_max_requests_per_run)
+            ),
+        )
+        lookup = ClaimSyncService(db).sync_cancellations_by_candidate_orders(
+            connector, platform.id, LIVE_VERIFY_CANCELLATION_MAX_ORDERS, limits
+        )
+        not_requested = {"status": "UNSUPPORTED", "count": 0, "reason_code": "NOT_REQUESTED", "retryable": False}
+        result = {
+            "overall_status": lookup["status"],
+            "requests_used": limits.budget.used,
+            "cancellations": lookup,
+            "returns": not_requested,
+            "exchanges": not_requested,
+            "skipped_no_order": 0,
+            "resolved_unmatched": 0,
+            "candidate_limit": LIVE_VERIFY_CANCELLATION_MAX_ORDERS,
+            "verification_level": _cancellation_verification_level(lookup),
+        }
+        try:
+            db.commit()
+        except SQLAlchemyError:
+            db.rollback()
+            logger.warning("취소 검증 커밋 실패: trace=%s", uuid.uuid4().hex[:8])
+            failed = {"status": "FAILED", "count": 0, "reason_code": "DB_WRITE_FAILED", "retryable": False}
+            return JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content={
+                    "overall_status": "FAILED",
+                    "cancellations": failed,
+                    "returns": not_requested,
+                    "exchanges": not_requested,
+                    "skipped_no_order": 0,
+                    "verification_level": "NOT_VALIDATED",
+                },
+            )
+        return JSONResponse(status_code=_claim_http_status(result), content=result)
+
+
 @router.post(
     "/sync-claims",
     response_model=ClaimSyncResult,
@@ -655,6 +742,9 @@ def sync_claims(payload: ClaimSyncRequest, db: Session = Depends(get_db)) -> JSO
     platform = PlatformRepository(db).get_by_id(payload.platform_id)
     if platform is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="플랫폼을 찾을 수 없습니다.")
+
+    if payload.live_verify_cancellations:
+        return _live_verify_cancellations(db, platform)
 
     limits = None
     features = None
