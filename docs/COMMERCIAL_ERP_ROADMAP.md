@@ -106,9 +106,9 @@
     기록). 이를 근거로 "후보 주문(배송 전 상태) 단건 조회 + 회전식 체크포인트
     + 요청 수 예산 제한"을 구현했다(`ClaimSyncService.
     sync_cancellations_by_candidate_orders`, `ClaimCollectionCursor`).
-  - **한계(명시)**: ERP에 아직 수집되지 않은 주문의 취소, 그리고 후보 주문이
-    CANCEL_LOOKUP_WINDOW_DAYS(31일)보다 오래전에 발생한 취소는 이 방식으로
-    감지되지 않는다(services/claim_sync_service.py의 메서드 docstring 참고).
+  - **한계(명시)**: ERP에 아직 수집되지 않은 주문의 취소, 그리고 점검 시점 기준
+    최근 CANCEL_LOOKUP_WINDOW_DAYS(31일 - 쿠팡이 접수일 기준으로 허용하는 최대 조회 범위) 밖에 접수된 취소는
+    이 방식으로 감지되지 않는다(주문의 나이로 후보를 제외하지는 않는다 - 오래된 주문도 최근 접수된 취소는 조회된다)(services/claim_sync_service.py의 메서드 docstring 참고).
 - **여전히 미구현/차단(2-A단계 잔여)**:
   - 네이버 취소/반품/교환: 상품주문 상세 조회(`POST /external/v1/pay-order/
     seller/product-orders/query`) 응답에 `currentClaim`/`beforeClaim`/
@@ -204,6 +204,10 @@
   남은 예산에 드는지 확인한다(아니면 요청 없이 멈추고 다음 실행이 이어간다).
 - 회전식 cursor(`claim_collection_cursors`, platform+유형당 1행): 후보(배송 전 상태 주문) N개를 N/20 x 20분에 한 바퀴 돈다
   (쿠팡 후보 약 300건이면 약 5시간).
+- 후보는 주문의 나이로 제외하지 않는다(쿠팡의 "31일"은 접수일 기준 조회 범위이며 주문 나이 제한이 아니다 - 오래된 주문도 최근 취소가
+  접수될 수 있다). 대신 순환 대기가 생긴다: 후보 356건에 canary 2건/20분이면 한 바퀴가 약 59시간(178회 x 20분)이고, 새 후보는 자기 순번이
+  올 때까지 최악 약 59시간 기다릴 수 있다 - "최근 후보가 먼저 확인된다"는 보장은 없다. 31일을 넘겨 배송 전 상태로 남은 후보(진단 시점
+  171건)는 원격 상태 동기화 문제일 수 있으며 이 기능과 별개의 이슈로 남긴다(상태 보정은 하지 않는다).
 - 개별 주문 오류(`PAGE_LIMIT_EXCEEDED`/`PAGINATION_*`/`BAD_RESPONSE`/`PARSE_FAILED` 등)는 그 주문만 건너뛰고 cursor를 전진시킨다 -
   한 주문의 영구 오류가 같은 자리에서 매번 배치를 멈춰 뒤 후보를 굶기지 않는다(건너뛴 주문은 다음 회전에서 다시 확인). 건너뜀이
   연속 3회면 공통 문제로 보고 멈춘다. 공통 원인(인증 거부/429/5xx/timeout/연결 실패/예산 소진)은 즉시 멈추고 cursor는 실패한 주문
