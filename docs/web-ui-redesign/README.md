@@ -97,3 +97,31 @@
 - 단위: `npm test` (Node 내장 러너, 신규 의존성 없음) - 메뉴 구조·권한·route 호환·한국어 라벨·디자인 규칙·접근성 속성·원문 enum 비노출·빌드 산출물 비밀값 검사. 소스 변이 15개를 모두 검출.
 - 화면: `docs/web-ui-redesign/screenshots/` 의 합성 데이터 전·후 스크린샷(고객·주문·인증 정보 없음). 합성 서버는 저장소에 포함하지 않았다.
 - 알려진 한계는 최종 보고서와 PR 설명에 적는다.
+
+## 5. 보완 라운드(검토 후 수정) 요약
+
+### 모의 API와 검증 도구 (`frontend/tests/visual/`, 번들에 포함되지 않음)
+- `gen_openapi.py`: 백엔드 앱 객체에서 `app.openapi()`만 호출해 응답 스키마를 내보낸다(DB·네트워크·외부 API 호출 없음).
+- `mock-api.mjs`: OpenAPI 응답 모델에서 합성 데이터를 만든다. 응답 모델이 없는 dict 엔드포인트 3개(주문 상세 패널, 문의 요약, 운영 요약)와 운영 요약의 하위 목록 3개(시계열·연동 상태·작업 상태)는 서비스 코드가 실제로 만드는 키 구조에 맞춰 직접 작성했다. 개인정보로 오인될 값(이메일·전화·주소·실제 주문번호)은 만들지 않는다. 정상·빈·오류·로딩(느린 응답) 상태를 전환할 수 있다.
+- `capture.mjs`: Chrome DevTools Protocol로 viewport를 정확히 지정하고, 캡처 직전 `innerWidth/innerHeight/devicePixelRatio/scrollWidth`를 읽어 요청값과 일치하고 가로 넘침이 없을 때만 통과로 기록한다.
+- `a11y.mjs`: axe-core(devDependency)로 WCAG 2.1 A/AA를 라이트·다크·빈·오류 상태에서 검사한다.
+- `interaction.mjs`: 행 작업 메뉴·서랍·키보드 이동·새로고침·직접 URL·뒤로가기·권한별 메뉴를 실제 입력으로 검증한다.
+
+### 계약 결정
+- **보고서 종류**: 서버는 `report_type`을 자유 문자열(`str`)로 받고 생성 로직(`report_generate_job`)은 이 값을 쓰지 않는다(`frequency`만 사용). 그래서 select로 제한하지 않고, 기본 전송 값 `PROFIT_REPORT`와 payload는 그대로 두고 라벨·도움말만 "구분 이름"으로 고쳤다.
+- **채널 상태**: 채널에서 수집한 주문 상태는 백엔드가 내부 주문 상태 어휘로 정규화해 저장한다(`String(20)`). 알려진 값은 공통 주문 상태 문구로, 모르는 값은 "알 수 없는 채널 상태"로 표시하고 원본은 "채널 원본 상태"라는 보조 줄로만 보여 준다. 표시만 바꾸며 원본 값을 저장·변경하거나 로직에 쓰지 않는다.
+- **행 작업**: 공통 `RowActionMenu`(더보기). 상품·알림 규칙·예약 보고서·상품 옵션·플랫폼 매핑 행에 적용했다. 위험 작업(삭제)은 메뉴 맨 아래에 두고 확인창을 거친다(자체 확인창이 있던 상품·옵션 삭제는 중복 확인 없이 기존 확인창 유지). 행마다 버튼이 2개뿐인 표(교환·반품·취소·배송의 상태 변경, 사용자 활성화 등)는 이미 단순해 바꾸지 않았다.
+- **다크 모드**: 기존 기능(`theme_preference`)이라 유지한다. 사용자 메뉴 안에만 있고, 시스템 설정 자동 감지는 기존에 없던 기능이라 추가하지 않았다. 라이트·다크 토큰은 모두 회색 계열이며 명암비를 테스트가 검사한다.
+- **번들**: route 단위 `React.lazy`로 초기 JS를 505 kB에서 267 kB로 줄였다(전체 chunk 합계 약 516 kB, 37개 파일). 경고 기준(500 kB)은 바꾸지 않았다.
+
+### 검증 증거
+- 전체 캡처 172장(변경 전 52 + 변경 후 120)은 저장소가 아니라 외부 감사 폴더 `C:\erp_deploy\ui_audit\20261014_redesign\`에 있고(`viewport-evidence.json`에 장면별 실제 viewport 값), 저장소에는 대표 15장만 둔다(`docs/web-ui-redesign/screenshots/`, 약 0.6 MB).
+- 변경 후 120장은 모두 요청 viewport와 정확히 일치하고 가로 넘침이 0건이다. 변경 전 빌드는 52장 중 18장에서 가로 넘침이 확인됐다(예: 390px 주문 화면 548px, 운영 현황 1600px).
+
+| 화면 | 변경 전 | 변경 후 |
+|---|---|---|
+| 주문 1440×900 | ![](screenshots/before-orders-1440x900.png) | ![](screenshots/after-orders-1440x900.png) |
+| 주문 390×844 | ![](screenshots/before-orders-390x844.png) | ![](screenshots/after-orders-390x844.png) |
+| 운영 현황 1440×900 | ![](screenshots/before-operations-1440x900.png) | ![](screenshots/after-operations-1440x900.png) |
+
+변경 후 대표 화면: [주문 상세](screenshots/after-order-detail-1440x900.png), [상품 상세](screenshots/after-product-detail-1440x900.png), [고객 문의(모바일)](screenshots/after-cs-cases-390x844.png), [보고서](screenshots/after-reports-1280x720.png), [모바일 서랍](screenshots/after-drawer-390x844.png), [행 작업 메뉴](screenshots/after-row-menu-390x844.png), [다크 운영 현황](screenshots/after-dark-operations-1440x900.png), [오류 상태](screenshots/after-error-cs-cases-390x844.png), [404](screenshots/after-not-found-1280x720.png).
