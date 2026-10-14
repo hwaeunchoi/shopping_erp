@@ -133,7 +133,7 @@ textarea::placeholder {
 }
 
 /* 표 안에서 바로 편집하는 입력칸(옵션명/색상/사이즈/바코드/단가) */
-.cell-input { width: 130px; padding: 4px 6px; font-size: 12.5px; border: 1px solid var(--border); border-radius: 5px; background: var(--panel-bg); color: var(--text); }
+.cell-input { width: 130px; padding: 4px 6px; font-size: 12.5px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--panel-bg); color: var(--text); }
 .cell-input.sm { width: 70px; }
 .cell-input:focus { border-color: var(--primary); }
 /* 옵션 인라인 편집 저장 버튼 - 이 영역 전용(전역 버튼 스타일에는 영향을 주지 않는다),
@@ -885,7 +885,7 @@ textarea::placeholder {
 .order-panel-head .sub { font-size: 12px; color: var(--text-muted); }
 .order-panel-close { border: none; background: none; color: var(--text-muted); cursor: pointer; font-size: 18px; }
 .order-tabs { display: flex; gap: 2px; padding: 8px 12px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
-.order-tab { padding: 6px 10px; font-size: 12px; color: var(--text-muted); border-radius: 6px 6px 0 0; cursor: pointer; border: 1px solid transparent; border-bottom: none; }
+.order-tab { padding: 6px 10px; font-size: 12px; color: var(--text-muted); border-radius: var(--radius-sm) var(--radius-sm) 0 0; cursor: pointer; border: 1px solid transparent; border-bottom: none; }
 .order-tab.active { color: var(--text); background: var(--selected); border-color: var(--border); font-weight: 600; }
 .order-tab-body { padding: 14px 16px; }
 .sec-title { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); margin: 16px 0 8px; font-weight: 600; }

@@ -181,7 +181,7 @@ function MonthlyReportTab() {
                 <tbody>
                   {data.kpi_comparisons.map((k) => (
                     <tr key={k.metric}>
-                      <td>{k.metric}</td>
+                      <td>{label('kpiMetric', k.metric)}</td>
                       <td>{k.target_value.toLocaleString()}</td>
                       <td>{k.actual_value.toLocaleString()}</td>
                       <td>{k.achievement_rate.toFixed(1)}%</td>

@@ -483,7 +483,7 @@ function SystemSettingsTab() {
           <thead><tr><th>카테고리</th><th>키</th><th>값</th><th>수정일시</th></tr></thead>
           <tbody>
             {data.map((s) => (
-              <tr key={s.id}><td>{s.category}</td><td>{s.key}</td><td>{s.value ?? '-'}</td><td>{new Date(s.updated_at).toLocaleString()}</td></tr>
+              <tr key={s.id}><td>{label('settingCategory', s.category)}</td><td>{s.key}</td><td>{s.value ?? '-'}</td><td>{new Date(s.updated_at).toLocaleString()}</td></tr>
             ))}
             {data.length === 0 && <tr><td colSpan={4}>등록된 설정이 없습니다.</td></tr>}
           </tbody>

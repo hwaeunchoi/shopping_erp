@@ -551,7 +551,7 @@ function ProgressPanel({ initialCommandIds }: { initialCommandIds: number[] }) {
       {retryResult && (
         <p className="hint-text">
           재처리 결과:{' '}
-          {retryResult.items.map((r) => `#${r.command_id}=${r.outcome}`).join(', ')}
+          {retryResult.items.map((r) => `#${r.command_id}=${label('requestOutcome', r.outcome)}`).join(', ')}
           {retryResult.aborted && ' (DB 오류로 중단됨)'}
         </p>
       )}

@@ -444,7 +444,7 @@ export function OperationsDashboardPage() {
         <div className="filter-bar">
           {bulkResults.map((r) => (
             <span key={r.command_id} className={r.outcome === 'RETRIED' ? 'status-badge' : 'badge-negative'}>
-              #{r.command_id}: {r.outcome}
+              #{r.command_id}: {label('requestOutcome', r.outcome)}
               {r.error_code ? `(${r.error_code})` : ''}
             </span>
           ))}

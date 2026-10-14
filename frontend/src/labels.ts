@@ -235,7 +235,7 @@ export const LABELS = {
   }),
   costType: entries({ FIXED: '고정비', VARIABLE: '변동비' }),
   reportFrequency: entries({ DAILY: '매일', WEEKLY: '매주', MONTHLY: '매월' }),
-  reportFormat: entries({ XLSX: '엑셀(XLSX)', PDF: 'PDF' }),
+  reportFormat: entries({ XLSX: '엑셀(XLSX)', PDF: 'PDF 문서' }),
   alertMetric: entries({
     ORDER_COUNT_TODAY: '오늘 주문 수',
     AD_COST: '광고비',
@@ -244,6 +244,14 @@ export const LABELS = {
     UNSHIPPED_DAYS: '미발송 경과일',
     API_FAILURE: '채널 연동 실패',
     BACKUP_FAILURE: '백업 실패',
+  }),
+  kpiMetric: entries({
+    REVENUE: '매출',
+    NET_PROFIT: '순이익',
+    AD_COST: '광고비',
+    ORDER_COUNT: '주문 수',
+    AOV: '평균 주문 금액',
+    ROAS: '광고 수익률(ROAS)',
   }),
   alertOperator: entries({ LT: '미만', LTE: '이하', GT: '초과', GTE: '이상', EQ: '같음' }),
   alertCheckFrequency: entries({ REALTIME: '실시간', HOURLY: '매시간', DAILY: '매일' }),
