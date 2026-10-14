@@ -38,7 +38,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional
 
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -50,7 +50,7 @@ from integrations.malls.errors import (
     MarketplaceExternalAPIError,
     RequestBudget,
 )
-from models.order import Cancellation, ClaimUnmatched, Exchange, Return
+from models.order import Cancellation, ClaimUnmatched, Exchange, Order, Return
 from repositories.order_repository import (
     CancellationRepository,
     ClaimCollectionCursorRepository,
@@ -90,10 +90,30 @@ _BATCH_STOP_REASONS = frozenset(
         "CONNECT_FAILED",
         "TRANSPORT_ERROR",
         "REQUEST_BUDGET_EXCEEDED",
+        # 원인 불명의 비-200(400·404 등): 공식 문서에 안전하게 읽을 수 있는 오류 코드가 없어 주문 단위 영구 오류라고 단정하지 않는다 -
+        # 배치를 멈추고 cursor 를 실패한 주문 앞에 둔다(fail-closed).
+        "BAD_RESPONSE",
     }
 )
+# 회전 한 바퀴에서 한 번의 실행이 훑어보는 후보의 상한(무효 후보를 건너뛰는 동안의 안전 장치).
+_MAX_ROTATION_SCAN = 2000
 # 건너뛴 주문이 연속으로 이 횟수에 이르면 개별 주문 문제가 아니라 공통 문제로 보고 배치를 멈춘다.
 _MAX_CONSECUTIVE_ORDER_SKIPS = 3
+
+
+@dataclass
+class _LookupOutcome:
+    """취소 후보 단건 조회 한 번의 집계(값·식별자 없음)."""
+
+    last_safe_id: Optional[int]
+    count: int = 0
+    checked: int = 0
+    skipped_failed: int = 0
+    skipped_invalid: int = 0
+    valid_processed: int = 0
+    last_http_status: Optional[int] = None
+    last_skip_reason: Optional[str] = None
+    failure: Optional[MarketplaceExternalAPIError] = None
 
 
 @dataclass
@@ -262,7 +282,7 @@ class ClaimSyncService:
         한 후보 주문의 외부 API 호출 실패 중 공통 원인일 가능성이 높은 것(인증 거부/429/5xx/timeout/연결 실패/
         예산 소진 - _BATCH_STOP_REASONS)을 만나면 그 지점에서 이번 배치를 멈춘다(이후 후보는 이번 실행에서
         시도하지 않음 - 레이트리밋 등 채널 쪽 문제일 가능성이 높은데 계속 밀어붙이지 않기 위함). 그 밖의
-        개별 주문 오류(PAGE_LIMIT_EXCEEDED/PAGINATION_*/BAD_RESPONSE/PARSE_FAILED 등)는 그 주문만 건너뛰고
+        개별 주문 오류(PAGE_LIMIT_EXCEEDED/PAGINATION_*/PARSE_FAILED 등)는 그 주문만 건너뛰고
         cursor를 그 주문 뒤로 전진시킨다 - 한 주문의 영구 오류가 같은 자리에서 매번 배치를 멈춰 뒤 후보를 굶기지
         않는다(건너뛴 주문은 다음 회전에서 다시 확인한다). 건너뜀이 연속 _MAX_CONSECUTIVE_ORDER_SKIPS회에
         이르면 공통 문제로 보고 멈춘다. 커서는 실패한 주문 **이전까지** 성공적으로 확인된 위치에만
@@ -279,84 +299,72 @@ class ClaimSyncService:
         batch = max_orders if max_orders is not None else settings.claim_cancel_detail_max_orders_per_run
         batch = max(0, min(batch, DEFAULT_CANCELLATION_LOOKUP_BATCH * 5))
         if batch == 0:
-            return _feature_result("SUCCESS", 0, None, None, checked=0, skipped_failed=0)
-        per_order_worst = _estimate(connector, "cancellation_lookup", date.today(), date.today(), limits)
-        if per_order_worst is None:
-            per_order_worst = 1 + limits.max_retries
+            return _feature_result("SUCCESS", 0, None, None, checked=0, skipped_failed=0, skipped_invalid_order_no=0)
 
+        def body() -> dict[str, Any]:
+            cursor = self.cursor_repo.get_or_create(platform_id, CANCELLATION_ORDER_LOOKUP_CURSOR_TYPE)
+            outcome = self._lookup_orders(
+                connector,
+                platform_id,
+                self._rotation_candidates(platform_id, cursor.last_order_id, batch),
+                batch,
+                limits,
+                start_safe_id=cursor.last_order_id,
+            )
+            # cursor 는 후보 처리 결과와 같은 SAVEPOINT/트랜잭션에서만 움직인다(commit 이 실패하면 함께 롤백).
+            cursor.last_order_id = outcome.last_safe_id if outcome.last_safe_id is not None else cursor.last_order_id
+            cursor.updated_at = datetime.now(timezone.utc)
+            return self._lookup_result(outcome)
+
+        return self._guarded_lookup(body)
+
+    def verify_cancellations_recent_valid(
+        self, connector: Any, platform_id: int, max_orders: int, limits: ClaimSyncLimits
+    ) -> dict[str, Any]:
+        """실계정 검증 전용(live_verify_cancellations) 취소 단건 조회 - 운영 회전 cursor 와 독립이다.
+
+        후보는 "최근 채널 주문 시각(Order.order_date) 내림차순, 동률이면 Order.id 내림차순"으로 최대 max_orders건을 고르고
+        커넥터가 유효하다고 보는 주문번호만 포함한다(결정적). 회전 cursor 는 읽지도, 만들지도, 바꾸지도 않으므로 검증을 반복해도 운영 순회가
+        오염되지 않는다. 오류 정책(400 fail-closed, 412 재시도, 인증·429·5xx 중단)과 요청 예산은 회전 경로와 같다."""
+        if not getattr(connector, "supports_cancellation_lookup_by_order", False):
+            return _feature_result("UNSUPPORTED", 0, "CAPABILITY_UNSUPPORTED", False)
+        batch = max(0, min(max_orders, DEFAULT_CANCELLATION_LOOKUP_BATCH * 5))
+        if batch == 0:
+            return _feature_result(
+                "SUCCESS",
+                0,
+                None,
+                None,
+                checked=0,
+                skipped_failed=0,
+                skipped_invalid_order_no=0,
+                candidate_selection="RECENT_VALID",
+                candidate_count=0,
+                cursor_affected=False,
+            )
+
+        def body() -> dict[str, Any]:
+            is_valid = getattr(connector, "is_valid_cancellation_lookup_order_no", None)
+            orders, invalid_seen = self.order_repo.list_recent_valid_cancellation_candidates(
+                platform_id, batch, is_valid
+            )
+            outcome = self._lookup_orders(connector, platform_id, iter(orders), batch, limits, start_safe_id=None)
+            outcome.skipped_invalid += invalid_seen  # 선택 단계에서 제외된 무효 후보(HTTP 0회)
+            return self._lookup_result(
+                outcome,
+                {"candidate_selection": "RECENT_VALID", "candidate_count": len(orders), "cursor_affected": False},
+            )
+
+        return self._guarded_lookup(body)
+
+    def _guarded_lookup(self, body: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        """취소 후보 조회 본문을 SAVEPOINT 안에서 실행한다. 어떤 실패든 이 기능만 롤백하고 안전한 결과로 돌려준다."""
         savepoint = self.session.begin_nested()
         try:
-            cursor = self.cursor_repo.get_or_create(platform_id, CANCELLATION_ORDER_LOOKUP_CURSOR_TYPE)
-            candidates = self.order_repo.list_cancellation_lookup_candidates(platform_id, cursor.last_order_id, batch)
-            if len(candidates) < batch:
-                seen_ids = {o.id for o in candidates}
-                wrapped = self.order_repo.list_cancellation_lookup_candidates(platform_id, 0, batch - len(candidates))
-                candidates += [o for o in wrapped if o.id not in seen_ids]
-
-            skipped = {"count": 0}
-            count = 0
-            checked = 0
-            skipped_failed = 0
-            last_http_status: Optional[int] = None
-            consecutive_skips = 0
-            last_safe_id = cursor.last_order_id
-            failure: Optional[MarketplaceExternalAPIError] = None
-            for order in candidates:
-                if limits.budget.max_requests - limits.budget.used < per_order_worst:
-                    break  # 남은 예산이 이 주문의 최악치보다 작다 - 네트워크 요청 없이 멈춘다(다음 실행이 이어간다).
-                try:
-                    raw = connector.fetch_cancellation_status(
-                        order.platform_order_no,
-                        order.order_date.date(),
-                        max_retries=limits.max_retries,
-                        request_budget=limits.budget,
-                    )
-                except MarketplaceExternalAPIError as e:
-                    http_status = _safe_http_status(e)
-                    if http_status is not None:
-                        last_http_status = http_status
-                    logger.warning(
-                        "취소 후보 주문 조회 실패: platform_id=%s, reason=%s, http_status=%s, batch_stop=%s",
-                        platform_id,
-                        e.reason_code,
-                        http_status if http_status is not None else "none",
-                        e.reason_code in _BATCH_STOP_REASONS,
-                    )
-                    if e.reason_code in _BATCH_STOP_REASONS:
-                        failure = e
-                        break
-                    # 개별 주문 오류 - 이 주문만 건너뛰고 cursor를 전진시켜 뒤 후보를 계속 확인한다.
-                    skipped_failed += 1
-                    consecutive_skips += 1
-                    last_safe_id = order.id
-                    if consecutive_skips >= _MAX_CONSECUTIVE_ORDER_SKIPS:
-                        failure = e
-                        break
-                    continue
-                consecutive_skips = 0
-                checked += 1
-                # 조회 자체는 성공했다(취소 없음/있음 둘 다 "확인 완료") - 여기까지 온
-                # 주문만 커서 전진 대상이다.
-                last_safe_id = order.id
-                if raw is None:
-                    continue
-                if self._persist_claim(
-                    "CANCELLATION", platform_id, raw, skipped, self.cancellation_repo, CANCELLATION_TRANSITIONS
-                ):
-                    count += 1
-
-            if candidates:
-                cursor.last_order_id = last_safe_id
-            cursor.updated_at = datetime.now(timezone.utc)
+            result = body()
             self.session.flush()
             savepoint.commit()
-            extra = {"checked": checked, "skipped_failed": skipped_failed}
-            if last_http_status is not None:
-                extra["last_http_status"] = last_http_status
-            if failure is not None:
-                status = "PARTIAL" if (count > 0 or checked > 0) else "FAILED"
-                return _feature_result(status, count, failure.reason_code, bool(failure.retryable), **extra)
-            return _feature_result("SUCCESS", count, None, None, **extra)
+            return result
         except MarketplaceCredentialMissingError:
             savepoint.rollback()
             return _feature_result("FAILED", 0, "CREDENTIAL_MISSING", False)
@@ -371,6 +379,145 @@ class ClaimSyncService:
             savepoint.rollback()
             logger.warning("취소 후보조회 예상 밖 오류: trace=%s", uuid.uuid4().hex[:8])
             return _feature_result("FAILED", 0, "INTERNAL_ERROR", False)
+
+    def _rotation_candidates(self, platform_id: int, start_after: int, chunk: int) -> Iterator[Order]:
+        """회전 순서로 후보를 하나씩 내놓는다: cursor 뒤(Order.id 오름차순) -> 처음부터 cursor 까지. 최대 한 바퀴이며 같은 주문을
+        두 번 내놓지 않는다. 호출부가 필요한 만큼만 소비하므로 무효 후보가 많아도 한 번에 불필요한 조회를 하지 않는다."""
+        chunk = max(chunk, 20)
+        scanned = 0
+        after = start_after
+        while scanned < _MAX_ROTATION_SCAN:
+            rows = self.order_repo.list_cancellation_lookup_candidates(platform_id, after, chunk)
+            if not rows:
+                break
+            for row in rows:
+                scanned += 1
+                yield row
+            after = rows[-1].id
+            if len(rows) < chunk:
+                break
+        if start_after <= 0:
+            return
+        after = 0
+        while scanned < _MAX_ROTATION_SCAN:
+            rows = self.order_repo.list_cancellation_lookup_candidates(platform_id, after, chunk)
+            if not rows:
+                return
+            for row in rows:
+                if row.id > start_after:
+                    return  # 한 바퀴를 마쳤다 - cursor 뒤의 주문은 이미 내놓았다.
+                scanned += 1
+                yield row
+            after = rows[-1].id
+            if len(rows) < chunk:
+                return
+
+    def _lookup_orders(
+        self,
+        connector: Any,
+        platform_id: int,
+        orders: Iterable[Order],
+        batch: int,
+        limits: ClaimSyncLimits,
+        *,
+        start_safe_id: Optional[int],
+    ) -> "_LookupOutcome":
+        """후보 주문을 순서대로 단건 조회한다(회전·검증 경로 공통). start_safe_id 가 None 이면 cursor 를 쓰지 않는 경로다.
+
+        - 커넥터가 형식을 규정한 주문번호(쿠팡: ASCII 숫자)가 아니면 HTTP 이전에 INVALID_PLATFORM_ORDER_NO 로 제외하고 cursor 는 그 후보를 지나간다.
+        - 공통 원인 또는 원인 불명 오류(_BATCH_STOP_REASONS: 인증·429·5xx·timeout(412 포함)·연결·예산·BAD_RESPONSE)는 배치를 멈추고 cursor 가
+          실패한 주문 앞에 남아 다음 실행이 그 주문부터 다시 시도한다(fail-closed). 그 밖의 개별 주문 오류는 그 주문만 건너뛴다."""
+        is_valid = getattr(connector, "is_valid_cancellation_lookup_order_no", None)
+        per_order_worst = _estimate(connector, "cancellation_lookup", date.today(), date.today(), limits)
+        if per_order_worst is None:
+            per_order_worst = 1 + limits.max_retries
+        out = _LookupOutcome(last_safe_id=start_safe_id)
+        skipped = {"count": 0}
+        consecutive_skips = 0
+        for order in orders:
+            if out.valid_processed >= batch:
+                break
+            if is_valid is not None and not is_valid(order.platform_order_no):
+                out.skipped_invalid += 1  # HTTP 0회 - 값·패턴은 기록하지 않는다.
+                if start_safe_id is not None:
+                    out.last_safe_id = order.id
+                continue
+            if limits.budget.max_requests - limits.budget.used < per_order_worst:
+                break  # 남은 예산이 이 주문의 최악치보다 작다 - 네트워크 요청 없이 멈춘다(다음 실행이 이어간다).
+            out.valid_processed += 1
+            try:
+                raw = connector.fetch_cancellation_status(
+                    order.platform_order_no,
+                    order.order_date.date(),
+                    max_retries=limits.max_retries,
+                    request_budget=limits.budget,
+                )
+            except MarketplaceExternalAPIError as e:
+                http_status = _safe_http_status(e)
+                if http_status is not None:
+                    out.last_http_status = http_status
+                logger.warning(
+                    "취소 후보 주문 조회 실패: platform_id=%s, reason=%s, http_status=%s, batch_stop=%s",
+                    platform_id,
+                    e.reason_code,
+                    http_status if http_status is not None else "none",
+                    e.reason_code in _BATCH_STOP_REASONS,
+                )
+                if e.reason_code in _BATCH_STOP_REASONS:
+                    out.failure = e
+                    break
+                # 개별 주문 오류 - 이 주문만 건너뛰고 cursor 를 전진시켜 뒤 후보를 계속 확인한다.
+                out.skipped_failed += 1
+                out.last_skip_reason = e.reason_code
+                consecutive_skips += 1
+                if start_safe_id is not None:
+                    out.last_safe_id = order.id
+                if consecutive_skips >= _MAX_CONSECUTIVE_ORDER_SKIPS:
+                    out.failure = e
+                    break
+                continue
+            consecutive_skips = 0
+            out.checked += 1
+            # 조회 자체는 성공했다(취소 없음/있음 둘 다 "확인 완료") - 여기까지 온 주문만 cursor 전진 대상이다.
+            if start_safe_id is not None:
+                out.last_safe_id = order.id
+            if raw is None:
+                continue
+            if self._persist_claim(
+                "CANCELLATION", platform_id, raw, skipped, self.cancellation_repo, CANCELLATION_TRANSITIONS
+            ):
+                out.count += 1
+        if out.skipped_invalid:
+            logger.info(
+                "취소 후보 주문번호 형식 제외: platform_id=%s, reason=INVALID_PLATFORM_ORDER_NO, count=%s",
+                platform_id,
+                out.skipped_invalid,
+            )
+        return out
+
+    @staticmethod
+    def _lookup_result(outcome: "_LookupOutcome", meta: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        """조회 결과를 기존 상태 계약(SUCCESS/PARTIAL/FAILED)으로 요약한다. 한 건도 확인하지 못했는데 실패·무효 후보가 있으면 SUCCESS 가 아니다."""
+        extra: dict[str, Any] = {
+            "checked": outcome.checked,
+            "skipped_failed": outcome.skipped_failed,
+            "skipped_invalid_order_no": outcome.skipped_invalid,
+        }
+        if outcome.last_http_status is not None:
+            extra["last_http_status"] = outcome.last_http_status
+        if meta:
+            extra.update(meta)
+        if outcome.failure is not None:
+            status = "PARTIAL" if (outcome.count > 0 or outcome.checked > 0) else "FAILED"
+            return _feature_result(
+                status, outcome.count, outcome.failure.reason_code, bool(outcome.failure.retryable), **extra
+            )
+        if outcome.skipped_failed > 0:
+            status = "PARTIAL" if outcome.checked > 0 else "FAILED"
+            return _feature_result(status, outcome.count, outcome.last_skip_reason, False, **extra)
+        if outcome.checked == 0 and outcome.skipped_invalid > 0:
+            return _feature_result("FAILED", 0, "INVALID_PLATFORM_ORDER_NO", False, **extra)
+        return _feature_result("SUCCESS", outcome.count, None, None, **extra)
 
     def _sync_feature(
         self,
@@ -630,7 +777,7 @@ def _safe_http_status(error: MarketplaceExternalAPIError) -> Optional[int]:
 
 
 def _feature_result(
-    status: str, count: int, reason_code: Optional[str], retryable: Optional[bool], **extra: int
+    status: str, count: int, reason_code: Optional[str], retryable: Optional[bool], **extra: Any
 ) -> dict[str, Any]:
     return {"status": status, "count": count, "reason_code": reason_code, "retryable": retryable, **extra}
 

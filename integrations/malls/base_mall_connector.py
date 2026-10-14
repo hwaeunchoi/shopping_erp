@@ -361,6 +361,11 @@ class BaseMallConnector(ABC):
         구조에서 계산하기 위한 훅이다."""
         return None
 
+    def is_valid_cancellation_lookup_order_no(self, platform_order_no: str) -> bool:
+        """취소 단건 조회에 보낼 수 있는 주문번호 형식인지 외부 호출 전에 판정한다(기본: 제한 없음). 채널이 공식 계약으로 형식을
+        규정한 경우에만 그 커넥터가 재정의한다 - 형식 검증은 주문 나이 필터가 아니다."""
+        return True
+
     def fetch_cancellation_status(
         self,
         platform_order_no: str,

@@ -14,7 +14,7 @@ exchanges/returns/cancellations는 상태/주문/기간/사유검색 필터와 �
 """
 
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 from sqlalchemy import Select, and_, exists, func, or_, select
 from sqlalchemy.orm import Session
@@ -103,6 +103,49 @@ class OrderRepository(BaseRepository[Order]):
             .limit(limit)
         )
         return list(self.session.execute(stmt).scalars().all())
+
+    def list_recent_valid_cancellation_candidates(
+        self,
+        platform_id: int,
+        limit: int,
+        is_valid: Optional[Callable[[str], bool]] = None,
+        *,
+        scan_chunk: int = 100,
+        max_scan: int = 2000,
+    ) -> tuple[list[Order], int]:
+        """실계정 검증 전용 후보: 취소 후보 상태 중 "최근 채널 주문 시각(order_date) 내림차순, 동률이면 Order.id 내림차순"으로
+        is_valid(주문번호)를 통과하는 최대 limit건을 고른다. 회전 cursor 와 무관하며 읽기 전용이다(order_date 는 채널의 주문 시각이고
+        updated_at 처럼 로컬 갱신으로 바뀌지 않는다). 무효 후보를 건너뛰며 최대 max_scan 행까지만 훑는다.
+        반환: (선택한 후보, 훑는 동안 건너뛴 무효 후보 수) - 후보가 아예 없는 경우와 전부 무효인 경우를 구분하기 위한 값이다."""
+        picked: list[Order] = []
+        invalid_seen = 0
+        offset = 0
+        while len(picked) < limit and offset < max_scan:
+            stmt = (
+                select(Order)
+                .where(
+                    Order.platform_id == platform_id,
+                    Order.status.in_(CANCELLATION_LOOKUP_CANDIDATE_STATUSES),
+                    Order.is_deleted.is_(False),
+                )
+                .order_by(Order.order_date.desc(), Order.id.desc())
+                .offset(offset)
+                .limit(scan_chunk)
+            )
+            rows = list(self.session.execute(stmt).scalars().all())
+            if not rows:
+                break
+            for row in rows:
+                if is_valid is None or is_valid(row.platform_order_no):
+                    picked.append(row)
+                    if len(picked) >= limit:
+                        break
+                else:
+                    invalid_seen += 1
+            offset += len(rows)
+            if len(rows) < scan_chunk:
+                break
+        return picked, invalid_seen
 
     def list_filtered(
         self,

@@ -31,6 +31,7 @@ owner_id=<이 플랫폼의 id>로 "access_key"/"secret_key"/"vendor_id" 3개가
 import hashlib
 import hmac
 import logging
+import re
 import time as time_module
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
@@ -186,6 +187,11 @@ _RETURN_RAW_TO_STATUS = {
 # 서로 모순되는데, 이 모순은 "orderId 없이 날짜range만으로 대량 조회가 되는지"에만
 # 관련되고, 이 기능이 실제로 구현하는 "orderId를 포함해 조회"하는 경로 자체는 두
 # 문서 어디서도 부정하지 않는다 - 그래서 이 좁은 범위만 구현한다).
+# 공식 문서(반품/취소 요청 목록 조회)가 orderId 를 숫자(number)로 규정한다 - 취소 단건 조회에 보내는 주문번호는 ASCII 숫자로만 구성돼야 한다.
+# 길이는 검사하지 않는다(문서의 14자리는 예시). [0-9] 는 유니코드 숫자(예: 아라비아-인도 숫자)와 공백·부호·소수점을 허용하지 않는다.
+_CANCEL_LOOKUP_ORDER_NO = re.compile(r"[0-9]+")
+# 공식 문서: HTTP 412 는 "Read timed out" - 범위를 줄여 다시 시도하라는 일시 오류다. 취소 단건 조회에서만 재시도 대상으로 본다.
+_CANCEL_LOOKUP_RETRY_STATUSES = frozenset({412, 429})
 CANCEL_LOOKUP_WINDOW_DAYS = 31  # RETURN_MAX_RANGE_DAYS와 동일한 문서상 최대 조회기간.
 _CANCEL_RAW_TO_STATUS = {
     # Cancellation 모델은 REQUESTED->COMPLETED 두 상태만 허용한다(REVIEW 제외) -
@@ -557,6 +563,9 @@ class CoupangConnector(BaseMallConnector):
         )
         return self._normalize_return_requests(raw_items)
 
+    def is_valid_cancellation_lookup_order_no(self, platform_order_no: str) -> bool:
+        return isinstance(platform_order_no, str) and _CANCEL_LOOKUP_ORDER_NO.fullmatch(platform_order_no) is not None
+
     def fetch_cancellation_status(
         self,
         platform_order_no: str,
@@ -572,6 +581,8 @@ class CoupangConnector(BaseMallConnector):
         services.claim_sync_service의 후보 선정 자체가 배송 전 상태의 주문만 대상으로
         하므로 실무적으로는 이 범위 밖 사례가 드물 것으로 본다). 단건 조회라 페이지는 1로 고정한다
         (다음 페이지가 있으면 PAGE_LIMIT_EXCEEDED - 그 주문만 이번 회차에서 건너뛴다)."""
+        if not self.is_valid_cancellation_lookup_order_no(platform_order_no):
+            raise MarketplaceExternalAPIError("coupang", "INVALID_PLATFORM_ORDER_NO", False)  # HTTP 이전에 거절
         credentials = self._get_credentials()
         if credentials is None:
             raise MarketplaceCredentialMissingError("coupang")
@@ -1053,6 +1064,7 @@ class CoupangConnector(BaseMallConnector):
         json_body: Optional[dict[str, Any]] = None,
         max_retries: Optional[int] = None,
         request_budget: Optional[RequestBudget] = None,
+        retry_statuses: frozenset[int] = frozenset({429}),
     ) -> httpx.Response:
         """HTTP 429(Rate Limit)에 대해 지수 백오프(1s -> 2s -> 4s -> 8s -> 16s)로
         최대 max_retries회(생략 시 모듈 기본값 RATE_LIMIT_MAX_RETRIES) 재시도한다.
@@ -1076,11 +1088,20 @@ class CoupangConnector(BaseMallConnector):
                 request_budget.consume(self._marketplace_code())
             with external_call("coupang"):
                 response = self._http().request(method, url, headers=headers, json=json_body)
-            if response.status_code != 429:
+            if response.status_code not in retry_statuses:
                 return response
             attempt += 1
             if attempt > retry_limit:
-                raise MarketplaceExternalAPIError("coupang", "RATE_LIMITED", True, http_status=429)
+                if response.status_code == 429:
+                    raise MarketplaceExternalAPIError("coupang", "RATE_LIMITED", True, http_status=429)
+                # 429 가 아닌 재시도 대상(공식 문서의 412 read timeout)은 시간 초과로 분류한다.
+                raise MarketplaceExternalAPIError("coupang", "TIMEOUT", True, http_status=response.status_code)
+            if response.status_code != 429:
+                logger.warning(
+                    "쿠팡 API 일시 오류(HTTP %d) - 재시도 (%d/%d)", response.status_code, attempt, retry_limit
+                )
+                time_module.sleep(RATE_LIMIT_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)))
+                continue
             retry_after = response.headers.get("Retry-After")
             if retry_after is not None:
                 try:
@@ -1243,6 +1264,7 @@ class CoupangConnector(BaseMallConnector):
         max_pages: Optional[int],
         max_retries: Optional[int],
         request_budget: Optional[RequestBudget],
+        retry_statuses: frozenset[int] = frozenset({429}),
     ) -> list[dict[str, Any]]:
         """한 쿼리(상태 x 기간 창 1개)의 nextToken 페이지를 끝까지 모으되 무한 순회를 막는다.
 
@@ -1268,6 +1290,7 @@ class CoupangConnector(BaseMallConnector):
                 headers={"Authorization": authorization},
                 max_retries=max_retries,
                 request_budget=request_budget,
+                retry_statuses=retry_statuses,
             )
             raise_for_status("coupang", response.status_code)
             pages += 1
@@ -1544,6 +1567,7 @@ class CoupangConnector(BaseMallConnector):
             max_pages=1,
             max_retries=max_retries,
             request_budget=request_budget,
+            retry_statuses=_CANCEL_LOOKUP_RETRY_STATUSES,
         )
 
     @staticmethod
