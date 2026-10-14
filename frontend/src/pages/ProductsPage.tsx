@@ -2,6 +2,7 @@ import { useState, type FormEvent } from 'react'
 import { Link } from 'react-router-dom'
 import { api, ApiError } from '../api/client'
 import { useApiData } from '../api/useApiData'
+import { RowActionMenu } from '../components/RowActionMenu'
 import { FavoriteStar } from '../components/FavoriteStar'
 import type { Platform, Product, ProductCreate, ProductNaverSyncResult } from '../api/types'
 
@@ -208,16 +209,20 @@ export function ProductsPage() {
                 <td>
                   <span className="status-badge">{p.is_deleted ? '삭제됨' : p.status}</span>
                 </td>
-                <td>{p.is_deleted ? '-' : <Link to={`/products/${p.id}`}>상세</Link>}</td>
                 <td>{p.is_deleted ? '-' : <FavoriteStar targetType="PRODUCT" targetId={p.id} />}</td>
                 <td>
-                  {p.is_deleted ? (
-                    <button type="button" onClick={() => handleRestore(p)}>복원</button>
-                  ) : (
-                    <button type="button" onClick={() => handleDuplicate(p)}>복제</button>
-                  )}
+                  <span className="row-actions">
+                    {!p.is_deleted && <Link to={`/products/${p.id}`}>상세 보기</Link>}
+                    <RowActionMenu
+                      label={`상품 ${p.name}`}
+                      actions={[
+                        { key: 'restore', label: '복원', hidden: !p.is_deleted, onSelect: () => handleRestore(p) },
+                        { key: 'duplicate', label: '복제', hidden: p.is_deleted, onSelect: () => handleDuplicate(p) },
+                        { key: 'delete', label: '삭제', danger: true, hidden: p.is_deleted, skipConfirm: true, onSelect: () => handleDelete(p) },
+                      ]}
+                    />
+                  </span>
                 </td>
-                <td>{p.is_deleted ? '-' : <button type="button" onClick={() => handleDelete(p)}>삭제</button>}</td>
               </tr>
             ))}
             {data.length === 0 && <tr><td colSpan={11}>등록된 상품이 없습니다.</td></tr>}

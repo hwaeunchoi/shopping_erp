@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from 'react'
 import { api, ApiError } from '../api/client'
 import { useApiData } from '../api/useApiData'
+import { RowActionMenu } from '../components/RowActionMenu'
 import { label } from '../labels'
 import { StatusBadge } from '../components/StatusBadge'
 import type { AlertRule, AlertRuleCreate, AppNotification } from '../api/types'
@@ -122,10 +123,15 @@ function AlertRulesTab() {
                 <td>{label('alertMetric', rule.metric)}</td>
                 <td>{label('alertOperator', rule.operator)} {rule.threshold_value}</td>
                 <td>{label('alertCheckFrequency', rule.check_frequency)}</td>
-                <td><span className="status-badge">{rule.is_enabled ? 'ON' : 'OFF'}</span></td>
+                <td><span className="status-badge">{rule.is_enabled ? '사용 중' : '사용 안 함'}</span></td>
                 <td>
-                  <button type="button" onClick={() => handleToggle(rule)}>{rule.is_enabled ? '비활성화' : '활성화'}</button>{' '}
-                  <button type="button" onClick={() => handleDelete(rule.id)}>삭제</button>
+                  <span className="row-actions">
+                    <button type="button" onClick={() => handleToggle(rule)}>{rule.is_enabled ? '사용 안 함으로 변경' : '사용으로 변경'}</button>
+                    <RowActionMenu
+                      label={`알림 규칙 ${rule.name}`}
+                      actions={[{ key: 'delete', label: '삭제', danger: true, confirmMessage: `'${rule.name}' 알림 규칙을 삭제하시겠습니까?`, onSelect: () => handleDelete(rule.id) }]}
+                    />
+                  </span>
                 </td>
               </tr>
             ))}

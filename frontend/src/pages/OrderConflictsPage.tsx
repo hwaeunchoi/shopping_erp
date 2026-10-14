@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { api, ApiError } from '../api/client'
 import { useApiData } from '../api/useApiData'
-import { channelStatusText } from '../labels'
+import { channelStatusRaw, channelStatusText } from '../labels'
 import { StatusBadge } from '../components/StatusBadge'
 import type { OrderStatusConflict } from '../api/types'
 
@@ -58,7 +58,10 @@ export function OrderConflictsPage() {
                 <td>{c.id}</td>
                 <td>{c.order_id}</td>
                 <td><StatusBadge domain="orderStatus" value={c.internal_status} /></td>
-                <td><span className="status-badge">{channelStatusText(c.channel_status)}</span></td>
+                <td>
+                  <span className="status-badge">{channelStatusText(c.channel_status)}</span>
+                  {channelStatusRaw(c.channel_status) && <div className="hint-text">채널 원본 상태: {channelStatusRaw(c.channel_status)}</div>}
+                </td>
                 <td>{new Date(c.detected_at).toLocaleString()}</td>
                 <td>
                   <div className="inline-form" style={{ margin: 0 }}>

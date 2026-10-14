@@ -306,12 +306,21 @@ export function friendlyHttpError(status: number | undefined): string {
   return '요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.'
 }
 
+export const UNKNOWN_CHANNEL_STATUS_LABEL = '알 수 없는 채널 상태'
+
 /**
- * 채널(쇼핑몰)이 보낸 주문 상태 문자열. 내부 주문 상태와 같은 값이면 한국어로 바꾸고,
- * 채널 고유 값이면 원문을 그대로 보여 준다(운영자가 채널 화면과 대조해야 하므로 숨기지 않는다).
+ * 채널에서 수집한 주문 상태(백엔드가 이미 내부 주문 상태 어휘로 정규화해 저장한다, 최대 20자).
+ * 알려진 값은 공통 주문 상태 문구로, 그 밖의 값은 '알 수 없는 채널 상태'로 보여 준다.
+ * 화면 표시용일 뿐 원본 값을 바꾸거나 저장하지 않으며 로직에도 쓰지 않는다.
  */
 export function channelStatusText(value: string | null | undefined): string {
   if (!value) return '-'
   const known = (LABELS.orderStatus as Record<string, Entry>)[value]
-  return known ? known.label : value
+  return known ? known.label : UNKNOWN_CHANNEL_STATUS_LABEL
+}
+
+/** 알 수 없는 채널 상태일 때만, 운영 진단용으로 '채널 원본 상태'를 보조 정보로 돌려준다. */
+export function channelStatusRaw(value: string | null | undefined): string | null {
+  if (!value) return null
+  return (LABELS.orderStatus as Record<string, Entry>)[value] ? null : value
 }

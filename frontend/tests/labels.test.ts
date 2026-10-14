@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
-import { channelStatusText, friendlyHttpError, LABELS, label, optionsOf, toneOf, TONE_SYMBOL, UNKNOWN_LABEL, type LabelDomain } from '../src/labels.ts'
+import { channelStatusRaw, channelStatusText, friendlyHttpError, LABELS, label, optionsOf, toneOf, TONE_SYMBOL, UNKNOWN_LABEL, type LabelDomain } from '../src/labels.ts'
 
 const HANGUL = /[가-힣]/
 // 한글 없이 허용하는 약어 표기
@@ -91,7 +91,9 @@ test('상태 종류마다 기호가 달라 흑백에서도 구분된다', () => 
 
 test('채널 상태 원문은 내부 상태와 같은 값만 한국어로 바꾼다', () => {
   assert.equal(channelStatusText('SHIPPING'), '배송 중')
-  assert.equal(channelStatusText('CHANNEL_ONLY_VALUE'), 'CHANNEL_ONLY_VALUE')
+  assert.equal(channelStatusText('CHANNEL_ONLY_VALUE'), '알 수 없는 채널 상태')
+  assert.equal(channelStatusRaw('SHIPPING'), null)
+  assert.equal(channelStatusRaw('CHANNEL_ONLY_VALUE'), 'CHANNEL_ONLY_VALUE')
   assert.equal(channelStatusText(null), '-')
 })
 

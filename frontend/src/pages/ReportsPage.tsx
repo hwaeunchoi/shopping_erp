@@ -2,6 +2,7 @@ import { useState, type FormEvent } from 'react'
 import { api, ApiError } from '../api/client'
 import { downloadBlob } from '../api/download'
 import { useApiData } from '../api/useApiData'
+import { RowActionMenu } from '../components/RowActionMenu'
 import { label } from '../labels'
 import type { MonthlyReport, ReportSchedule, ReportScheduleCreate } from '../api/types'
 
@@ -211,7 +212,7 @@ function ReportSchedulesTab() {
   const handleCreate = async (e: FormEvent) => {
     e.preventDefault()
     if (!form.report_type) {
-      setCreateError('보고서 유형을 입력하세요.')
+      setCreateError('보고서 구분 이름을 입력하세요.')
       return
     }
     setCreateError(null)
@@ -243,8 +244,8 @@ function ReportSchedulesTab() {
         <input
           value={form.report_type}
           onChange={(e) => setForm({ ...form, report_type: e.target.value })}
-          placeholder="보고서 종류 코드(예: PROFIT_REPORT)"
-          aria-label="보고서 종류 코드"
+          placeholder="구분용 이름(기본값 PROFIT_REPORT = 손익 보고서)"
+          aria-label="보고서 구분 이름"
         />
         <select value={form.frequency} onChange={(e) => setForm({ ...form, frequency: e.target.value })}>
           {FREQUENCY_OPTIONS.map((f) => <option key={f} value={f}>{label('reportFrequency', f)}</option>)}
@@ -265,14 +266,14 @@ function ReportSchedulesTab() {
         <button type="submit">예약 등록</button>
       </form>
       {createError && <p className="form-error">{createError}</p>}
-      <p className="form-info">주기가 "매월"인 예약만 스케줄러가 자동 생성합니다(직전 달 보고서, reports/generated에 저장).</p>
+      <p className="form-info">구분 이름은 서버가 자유 문자열로 저장하며 생성 동작에는 쓰이지 않습니다. 주기가 "매월"인 예약만 스케줄러가 자동 생성합니다(직전 달 보고서, reports/generated에 저장).</p>
 
       {isLoading && <p>불러오는 중...</p>}
       {error && <p className="form-error">{error}</p>}
       {data && (
         <table className="data-table">
           <thead>
-            <tr><th>유형</th><th>주기</th><th>형식</th><th>다음실행</th><th>마지막실행</th><th>활성</th><th></th></tr>
+            <tr><th>구분 이름</th><th>주기</th><th>형식</th><th>다음실행</th><th>마지막실행</th><th>활성</th><th></th></tr>
           </thead>
           <tbody>
             {data.map((s) => (
@@ -284,8 +285,13 @@ function ReportSchedulesTab() {
                 <td>{s.last_run_at ? new Date(s.last_run_at).toLocaleString() : '-'}</td>
                 <td><span className="status-badge">{s.is_enabled ? '사용 중' : '사용 안 함'}</span></td>
                 <td>
-                  <button type="button" onClick={() => handleToggle(s)}>{s.is_enabled ? '비활성화' : '활성화'}</button>{' '}
-                  <button type="button" onClick={() => handleDelete(s.id)}>삭제</button>
+                  <span className="row-actions">
+                    <button type="button" onClick={() => handleToggle(s)}>{s.is_enabled ? '사용 안 함으로 변경' : '사용으로 변경'}</button>
+                    <RowActionMenu
+                      label={`예약 보고서 ${s.report_type}`}
+                      actions={[{ key: 'delete', label: '삭제', danger: true, confirmMessage: '이 예약 보고서를 삭제하시겠습니까?', onSelect: () => handleDelete(s.id) }]}
+                    />
+                  </span>
                 </td>
               </tr>
             ))}

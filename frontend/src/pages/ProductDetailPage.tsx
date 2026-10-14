@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, ApiError } from '../api/client'
 import { useApiData } from '../api/useApiData'
 import { StatusBadge } from '../components/StatusBadge'
+import { RowActionMenu } from '../components/RowActionMenu'
 import { useRecentView } from '../api/useRecentView'
 import { FavoriteStar } from '../components/FavoriteStar'
 import type {
@@ -303,10 +304,17 @@ function OptionRow({
           {isSaving ? '저장 중...' : savedAt ? '저장됨 ✓' : '저장'}
         </button>
       </td>
-      <td><button type="button" onClick={() => onToggleActive(option)}>{option.is_active ? '미판매로' : '판매중으로'}</button></td>
       <td>
-        <button type="button" onClick={() => onDelete(option)}>삭제</button>
-        <button type="button" onClick={() => onManage(option.id)}>{isManaging ? '닫기' : '관리'}</button>
+        <span className="row-actions">
+          <button type="button" onClick={() => onManage(option.id)}>{isManaging ? '닫기' : '관리'}</button>
+          <RowActionMenu
+            label={`옵션 ${option.sku_code}`}
+            actions={[
+              { key: 'toggle', label: option.is_active ? '미판매로 변경' : '판매중으로 변경', onSelect: () => onToggleActive(option) },
+              { key: 'delete', label: '삭제', danger: true, skipConfirm: true, onSelect: () => onDelete(option) },
+            ]}
+          />
+        </span>
         {error && <span className="form-error">{error}</span>}
       </td>
     </tr>
@@ -1017,7 +1025,7 @@ function OptionSubDetail({
           <table className="data-table nested">
             <thead>
               <tr>
-                <th>번호</th><th>플랫폼 번호</th><th>옵션번호</th><th>상품번호</th><th>노출상품명</th><th>판매자상품코드</th><th></th><th>관리</th>
+                <th>번호</th><th>플랫폼 번호</th><th>옵션번호</th><th>상품번호</th><th>노출상품명</th><th>판매자상품코드</th><th>작업</th>
               </tr>
             </thead>
             <tbody>
@@ -1031,15 +1039,18 @@ function OptionSubDetail({
                     <td>{m.display_name ?? '-'}</td>
                     <td>{m.seller_product_code ?? '-'}</td>
                     <td>
-                      <button type="button" onClick={() => setEditingMapId(editingMapId === m.id ? null : m.id)}>
-                        수정
-                      </button>
-                      <button type="button" onClick={() => handleDeleteMap(m.id)}>삭제</button>
-                    </td>
-                    <td>
-                      <button type="button" onClick={() => handleManageMapping(m.id)}>
-                        {selectedMappingId === m.id ? '닫기' : '관리'}
-                      </button>
+                      <span className="row-actions">
+                        <button type="button" onClick={() => handleManageMapping(m.id)}>
+                          {selectedMappingId === m.id ? '닫기' : '관리'}
+                        </button>
+                        <RowActionMenu
+                          label={`매핑 ${m.id}`}
+                          actions={[
+                            { key: 'edit', label: editingMapId === m.id ? '수정 닫기' : '수정', onSelect: () => setEditingMapId(editingMapId === m.id ? null : m.id) },
+                            { key: 'delete', label: '삭제', danger: true, confirmMessage: '이 플랫폼 매핑을 삭제하시겠습니까?', onSelect: () => handleDeleteMap(m.id) },
+                          ]}
+                        />
+                      </span>
                     </td>
                   </tr>
                   {editingMapId === m.id && (
@@ -1054,7 +1065,7 @@ function OptionSubDetail({
                   )}
                 </Fragment>
               ))}
-              {maps?.length === 0 && <tr><td colSpan={8}>등록된 매핑이 없습니다.</td></tr>}
+              {maps?.length === 0 && <tr><td colSpan={7}>등록된 매핑이 없습니다.</td></tr>}
             </tbody>
           </table>
         </div>
@@ -1849,7 +1860,7 @@ export function ProductDetailPage() {
         <table className="data-table">
           <thead>
             <tr>
-              <th>순서</th><th>SKU</th><th>옵션명</th><th>색상</th><th>사이즈</th><th>바코드</th><th>단가</th><th>상태</th><th>저장</th><th>판매설정</th><th>삭제/관리</th>
+              <th>순서</th><th>SKU</th><th>옵션명</th><th>색상</th><th>사이즈</th><th>바코드</th><th>단가</th><th>상태</th><th>저장</th><th>작업</th>
             </tr>
           </thead>
           <tbody>
