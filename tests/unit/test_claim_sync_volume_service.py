@@ -234,7 +234,9 @@ class TestCancellationLookupVolume:
         first = _LookupConnector(errors=bad)
         r1 = service.sync_cancellations_by_candidate_orders(first, platform.id, 3, _limits())
         assert first.calls == ["C-001", "C-002", "C-003"]
-        assert r1["status"] == "SUCCESS" and r1["skipped_failed"] == 1 and r1["checked"] == 2
+        # 일부 주문은 확인했고 일부는 건너뛰었다 -> SUCCESS 가 아니라 PARTIAL (한 건도 확인 못 했다면 FAILED)
+        assert r1["status"] == "PARTIAL" and r1["skipped_failed"] == 1 and r1["checked"] == 2
+        assert r1["reason_code"] == "PAGE_LIMIT_EXCEEDED"
 
         second = _LookupConnector(errors=bad)
         service.sync_cancellations_by_candidate_orders(second, platform.id, 3, _limits())
@@ -242,11 +244,11 @@ class TestCancellationLookupVolume:
 
     def test_three_consecutive_skips_are_treated_as_a_common_problem(self, db_session, platform):
         _orders(db_session, platform, 8)
-        bad = {f"C-00{i}": MarketplaceExternalAPIError("coupang", "BAD_RESPONSE", False) for i in range(1, 9)}
+        bad = {f"C-00{i}": MarketplaceExternalAPIError("coupang", "PARSE_FAILED", False) for i in range(1, 9)}
         conn = _LookupConnector(errors=bad)
         result = ClaimSyncService(db_session).sync_cancellations_by_candidate_orders(conn, platform.id, 8, _limits())
         assert len(conn.calls) == 3
-        assert result["status"] == "FAILED" and result["reason_code"] == "BAD_RESPONSE"
+        assert result["status"] == "FAILED" and result["reason_code"] == "PARSE_FAILED"
         # cursor는 건너뛴 주문 뒤로 전진했다 - 다음 실행은 4번부터 이어간다.
         nxt = _LookupConnector()
         ClaimSyncService(db_session).sync_cancellations_by_candidate_orders(nxt, platform.id, 2, _limits())

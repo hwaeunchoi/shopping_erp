@@ -161,7 +161,7 @@ class TestPageLimitAndTokenDefenses:
         server = _Server(lambda n, r: _ok([_item(n)], token="more"))
         conn = _connector(db_session, platform, server)
         with pytest.raises(MarketplaceExternalAPIError) as exc:
-            conn.fetch_cancellation_status("ORDER-X", START, max_retries=2, request_budget=RequestBudget(100))
+            conn.fetch_cancellation_status("7100000001", START, max_retries=2, request_budget=RequestBudget(100))
         assert exc.value.reason_code == "PAGE_LIMIT_EXCEEDED"
         assert len(server.requests) == 1
 
@@ -208,9 +208,9 @@ class TestRetriesAndBudgetAreChargedBeforeSending:
         conn.fetch_returns(START, TODAY, max_pages=3, max_retries=2, request_budget=budget)  # 4
         conn.fetch_exchanges(START, TODAY, max_pages=3, max_retries=2, request_budget=budget)  # 1
         assert budget.used == 5
-        conn.fetch_cancellation_status("ORDER-A", START, max_retries=2, request_budget=budget)  # 1
+        conn.fetch_cancellation_status("7100000002", START, max_retries=2, request_budget=budget)  # 1
         with pytest.raises(MarketplaceExternalAPIError) as exc:
-            conn.fetch_cancellation_status("ORDER-B", START, max_retries=2, request_budget=budget)
+            conn.fetch_cancellation_status("7100000003", START, max_retries=2, request_budget=budget)
         assert exc.value.reason_code == "REQUEST_BUDGET_EXCEEDED"
         assert len(server.requests) == 6
 
@@ -220,11 +220,9 @@ class TestNothingSensitiveLeaksIntoErrors:
         server = _Server(lambda n, r: _ok([_item(n)], token="secret-looking-token"))
         conn = _connector(db_session, platform, server)
         with pytest.raises(MarketplaceExternalAPIError) as exc:
-            conn.fetch_cancellation_status(
-                "ORDER-SENSITIVE-777", START, max_retries=2, request_budget=RequestBudget(10)
-            )
+            conn.fetch_cancellation_status("7100000777", START, max_retries=2, request_budget=RequestBudget(10))
         text = f"{exc.value} {exc.value.reason_code!r} {exc.value.args!r}"
-        for forbidden in (ACCESS_KEY, "test-secret-key", VENDOR_ID, "ORDER-SENSITIVE-777", "secret-looking-token"):
+        for forbidden in (ACCESS_KEY, "test-secret-key", VENDOR_ID, "7100000777", "secret-looking-token"):
             assert forbidden not in text
 
 

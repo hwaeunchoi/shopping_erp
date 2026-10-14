@@ -18,7 +18,7 @@ from config.settings import settings
 from integrations.malls import coupang_connector
 from integrations.malls.coupang_connector import COUPANG_API_BASE, CoupangConnector
 from integrations.malls.errors import RequestBudget
-from models.order import ClaimCollectionCursor, Order
+from models.order import Order
 from services.claim_sync_service import ClaimSyncLimits, ClaimSyncService
 from services.settings_service import ApiCredentialService
 
@@ -146,9 +146,9 @@ class TestNumericHttpStatusIsReported:
     @pytest.mark.parametrize(
         "code, reason, batch_stop",
         [
-            (400, "BAD_RESPONSE", False),
-            (404, "BAD_RESPONSE", False),
-            (412, "BAD_RESPONSE", False),
+            (400, "BAD_RESPONSE", True),  # 원인 불명 4xx: fail-closed(배치 중단)
+            (404, "BAD_RESPONSE", True),
+            (412, "TIMEOUT", True),  # 공식 문서상 read timeout -> 재시도 가능한 일시 오류
             (401, "AUTH_FAILED", True),
             (403, "AUTH_FAILED", True),
             (429, "RATE_LIMITED", True),
@@ -167,23 +167,16 @@ class TestNumericHttpStatusIsReported:
         assert line_ok and all(line_ok), "lookup warning must match the strict safe format"
         first = _lookup_lines(logs)[0]
         assert f"reason={reason}," in first and f"http_status={code}," in first and f"batch_stop={batch_stop}" in first
-        if batch_stop:
-            assert result["status"] == "FAILED" and result["reason_code"] == reason
-        else:
-            assert result["status"] == "SUCCESS" and result["skipped_failed"] == 2 and result["checked"] == 0
+        assert batch_stop is True
+        assert result["status"] == "FAILED" and result["reason_code"] == reason and result["checked"] == 0
 
     def test_400_and_412_are_recorded_as_different_values(self, db_session, platform, logs):
-        _orders(db_session, platform, _numeric(3))
-        seen = {"n": 0}
-
-        def handler(request):
-            seen["n"] += 1
-            return _status_response(400 if seen["n"] == 1 else 412)
-
-        result = _run(db_session, platform, handler)
+        _orders(db_session, platform, _numeric(2))
+        r400 = _run(db_session, platform, lambda request: _status_response(400))
+        r412 = _run(db_session, platform, lambda request: _status_response(412))
         lines = _lookup_lines(logs)
         assert "http_status=400," in lines[0] and "http_status=412," in lines[1]
-        assert result["last_http_status"] == 412
+        assert (r400["last_http_status"], r412["last_http_status"]) == (400, 412)
 
     @pytest.mark.parametrize("exc", [httpx.ReadTimeout("t"), httpx.ConnectError("c")])
     def test_timeout_and_connection_errors_have_no_http_status(self, db_session, platform, logs, exc):
@@ -301,53 +294,3 @@ class TestRequestContractOfTheLookup:
 
         _run(db_session, platform, handler)
         assert len(seen) == 1
-
-
-class TestCurrentCursorPolicyIsCharacterised:
-    """BAD_RESPONSE 의 cursor 정책은 별도 검토 대상이다 - 이 테스트들은 "현재 동작"을 고정해 정책을 바꿀 때 눈에 띄게 한다."""
-
-    def _cursor(self, db_session, platform):
-        return db_session.query(ClaimCollectionCursor.last_order_id).filter_by(platform_id=platform.id).scalar()
-
-    def test_three_consecutive_400s_stop_the_batch_and_the_cursor_passes_all_three(self, db_session, platform, logs):
-        _orders(db_session, platform, _numeric(6))
-        ids = [o.id for o in db_session.query(Order).filter_by(platform_id=platform.id).order_by(Order.id)]
-        seen: list[httpx.Request] = []
-
-        def handler(request):
-            seen.append(request)
-            return _status_response(400)
-
-        result = _run(db_session, platform, handler, n=6, batch=6)
-        assert len(seen) == 3 and result["status"] == "FAILED" and result["reason_code"] == "BAD_RESPONSE"
-        assert result["last_http_status"] == 400
-        assert self._cursor(db_session, platform) == ids[2]
-
-    def test_skipped_candidates_are_retried_on_the_next_rotation(self, db_session, platform, logs):
-        _orders(db_session, platform, _numeric(2))
-        seen: list[str] = []
-
-        def handler(request):
-            seen.append(request.url.params["orderId"])
-            return _status_response(400)
-
-        _run(db_session, platform, handler)
-        _run(db_session, platform, handler)  # 후보 2건뿐이라 cursor 가 되감겨 같은 주문을 다시 시도한다
-        assert seen == _numeric(2) + _numeric(2)
-
-    def test_known_gap_legacy_dummy_style_order_numbers_are_still_candidates_and_sent_as_orderId(
-        self, db_session, platform, logs
-    ):
-        """알려진 한계(수정 아님): 더미 차단(a20fd80) 이전에 만들어진 "C"+날짜+순번 형태의 비숫자 주문번호가 후보에 남아 있고, 공식 문서가
-        숫자(number)로 규정한 orderId 로 그대로 전송된다. 후보 선택 정책을 바꾸면 이 테스트를 함께 갱신한다."""
-        legacy = "C202607030001"
-        _orders(db_session, platform, [legacy] + _numeric(1))
-        seen: list[str] = []
-
-        def handler(request):
-            seen.append(request.url.params["orderId"])
-            return httpx.Response(200, json={"code": 200, "message": "OK", "data": []})
-
-        _run(db_session, platform, handler)
-        assert (legacy in seen) is True, "the non-numeric legacy order number is currently sent as orderId"
-        assert (not legacy.isdigit()) is True

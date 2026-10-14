@@ -8,7 +8,7 @@ POST /api/orders/sync-claims 의 취소 단건 조회 전용 실계정 검증 �
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -24,6 +24,7 @@ from services.claim_sync_lock import claim_sync_platform_lock
 from services.settings_service import ApiCredentialService
 
 VENDOR = "A00077001"
+BASE_TIME = datetime(2026, 10, 1, 9, 0, tzinfo=timezone.utc)
 ORDER_NO_PREFIX = "88"  # 합성 주문번호(로그에 나오면 안 된다)
 
 
@@ -71,7 +72,7 @@ def _seed_orders(session_factory, platform_id, n, start=1):
                     platform_id=platform_id,
                     platform_order_no=f"{ORDER_NO_PREFIX}{i:06d}",
                     status="NEW",
-                    order_date=datetime.now(timezone.utc),
+                    order_date=BASE_TIME + timedelta(minutes=i),  # 번호가 클수록 더 최근 주문
                     total_amount=10000,
                     discount_amount=0,
                 )
@@ -158,11 +159,17 @@ class TestPresetContract:
 
         assert resp.status_code == 200, resp.text
         body = resp.json()
-        assert stub.calls == [_no(1), _no(2)]  # 후보는 Order.id 오름차순 앞의 2건뿐
+        assert stub.calls == [_no(10), _no(9)]  # 최근 주문 시각 내림차순 2건
         assert all(kw["max_retries"] == 0 and kw["request_budget"].max_requests == 2 for kw in stub.kwargs)
         assert body["requests_used"] == 2 and body["candidate_limit"] == 2
         assert body["returns"]["reason_code"] == body["exchanges"]["reason_code"] == "NOT_REQUESTED"
         assert body["cancellations"]["checked"] == 2
+        meta = body["cancellations"]
+        assert (meta["candidate_selection"], meta["candidate_count"], meta["cursor_affected"]) == (
+            "RECENT_VALID",
+            2,
+            False,
+        )
 
     def test_request_body_cannot_loosen_the_preset(
         self, client, auth_headers, seed_data, api_session_factory, monkeypatch
@@ -226,25 +233,50 @@ class TestSharedLock:
         assert resp.json()["overall_status"] == "SUCCESS"
 
 
-class TestCursorSafety:
-    def test_cursor_moves_with_the_run_and_the_next_run_resumes_there(
+class TestVerificationNeverTouchesTheProductionCursor:
+    def test_no_cursor_is_created_and_repeated_runs_pick_the_same_recent_orders(
+        self, client, auth_headers, seed_data, api_session_factory, monkeypatch
+    ):
+        _seed_orders(api_session_factory, seed_data["platform_id"], 6)
+        stub = _Stub()
+        _use(monkeypatch, stub)
+        _post(client, auth_headers, seed_data)
+        _post(client, auth_headers, seed_data)
+        assert stub.calls == [_no(6), _no(5), _no(6), _no(5)]  # 반복해도 같은 최근 후보 - 순회 위치가 오염되지 않는다
+        assert _cursor(api_session_factory, seed_data["platform_id"]) is None  # cursor 행도 만들지 않는다
+
+    def test_an_existing_production_cursor_is_left_exactly_as_it_was(
         self, client, auth_headers, seed_data, api_session_factory, monkeypatch
     ):
         _seed_orders(api_session_factory, seed_data["platform_id"], 6)
         ids = _ids(api_session_factory, seed_data["platform_id"])
-        stub = _Stub()
-        _use(monkeypatch, stub)
+        db = api_session_factory()
+        stamp = datetime(2026, 9, 1, 0, 0, tzinfo=timezone.utc)
+        db.add(
+            ClaimCollectionCursor(
+                platform_id=seed_data["platform_id"],
+                claim_type="CANCELLATION_ORDER_LOOKUP",
+                last_order_id=ids[3],
+                updated_at=stamp,
+            )
+        )
+        db.commit()
+        db.close()
+        _use(monkeypatch, _Stub())
         _post(client, auth_headers, seed_data)
-        assert _cursor(api_session_factory, seed_data["platform_id"]) == ids[1]
-        _post(client, auth_headers, seed_data)
-        assert stub.calls == [_no(1), _no(2), _no(3), _no(4)]  # 두 번째 실행은 3번째 후보부터
-        assert _cursor(api_session_factory, seed_data["platform_id"]) == ids[3]
+        db = api_session_factory()
+        try:
+            row = db.execute(select(ClaimCollectionCursor)).scalar_one()
+            assert row.last_order_id == ids[3]
+            assert row.updated_at.replace(tzinfo=None) == stamp.replace(tzinfo=None)
+        finally:
+            db.close()
 
     def test_commit_failure_returns_500_and_rolls_the_request_transaction_back(
         self, client, auth_headers, seed_data, api_session_factory, monkeypatch
     ):
-        """API 계층의 동작만 확인한다(500 DB_WRITE_FAILED + rollback 호출). cursor 와 데이터가 실제로 함께 롤백되는지는
-        SQLite(pysqlite 의 SAVEPOINT 자동 commit 동작) 가 아니라 격리 PostgreSQL 에서 증명한다 - test_claim_sync_pg.py."""
+        """API 계층의 동작만 확인한다(500 DB_WRITE_FAILED + rollback 호출). 데이터가 실제로 롤백되는지는 SQLite(pysqlite 의 SAVEPOINT 자동 commit
+        동작) 가 아니라 격리 PostgreSQL 에서 증명한다 - test_claim_sync_pg.py."""
         _seed_orders(api_session_factory, seed_data["platform_id"], 4)
         _use(monkeypatch, _Stub())
         real_commit, real_rollback = Session.commit, Session.rollback
@@ -267,30 +299,43 @@ class TestCursorSafety:
         assert first.json()["verification_level"] == "NOT_VALIDATED"
         assert state["rollbacks"] >= 1
 
-    def test_a_transient_error_stops_the_batch_and_retries_that_order_first(
+    def test_a_transient_error_stops_the_batch_and_is_retried_on_the_next_verification(
         self, client, auth_headers, seed_data, api_session_factory, monkeypatch
     ):
         _seed_orders(api_session_factory, seed_data["platform_id"], 4)
         err = MarketplaceExternalAPIError("coupang", "RATE_LIMITED", True, 429)
-        stub = _Stub(script={_no(1): err})
+        stub = _Stub(script={_no(4): err})
         _use(monkeypatch, stub)
         resp = _post(client, auth_headers, seed_data)
-        assert stub.calls == [_no(1)]  # 공통 원인(429)이라 배치 중단
+        assert stub.calls == [_no(4)]  # 공통 원인(429)이라 배치 중단
         assert resp.json()["cancellations"]["reason_code"] == "RATE_LIMITED"
         assert resp.json()["verification_level"] == "NOT_VALIDATED"
         stub.script.clear()
         _post(client, auth_headers, seed_data)
-        assert stub.calls[1] == _no(1)  # 실패한 주문부터 다시
+        assert stub.calls[1:] == [_no(4), _no(3)]
 
-    def test_a_permanently_failing_candidate_does_not_starve_the_next_one(
+    def test_a_400_stops_the_batch_without_calling_the_next_candidate(
         self, client, auth_headers, seed_data, api_session_factory, monkeypatch
     ):
         _seed_orders(api_session_factory, seed_data["platform_id"], 4)
-        stub = _Stub(script={_no(1): MarketplaceExternalAPIError("coupang", "PAGE_LIMIT_EXCEEDED", False)})
+        stub = _Stub(script={_no(4): MarketplaceExternalAPIError("coupang", "BAD_RESPONSE", False, 400)})
+        _use(monkeypatch, stub)
+        resp = _post(client, auth_headers, seed_data)
+        body = resp.json()
+        assert stub.calls == [_no(4)]
+        assert body["overall_status"] == "FAILED" and body["cancellations"]["last_http_status"] == 400
+        assert body["verification_level"] == "NOT_VALIDATED"
+
+    def test_a_per_order_permanent_error_is_partial_never_validated(
+        self, client, auth_headers, seed_data, api_session_factory, monkeypatch
+    ):
+        _seed_orders(api_session_factory, seed_data["platform_id"], 4)
+        stub = _Stub(script={_no(4): MarketplaceExternalAPIError("coupang", "PAGE_LIMIT_EXCEEDED", False)})
         _use(monkeypatch, stub)
         body = _post(client, auth_headers, seed_data).json()
-        assert stub.calls == [_no(1), _no(2)]
-        assert body["cancellations"]["skipped_failed"] == 1 and body["cancellations"]["checked"] == 1
+        assert stub.calls == [_no(4), _no(3)]
+        assert body["overall_status"] == "PARTIAL" and body["verification_level"] == "NOT_VALIDATED"
+        assert body["cancellations"]["checked"] == 1 and body["cancellations"]["skipped_failed"] == 1
 
 
 def _connector(session_factory, platform_id, handler):

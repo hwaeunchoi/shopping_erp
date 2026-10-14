@@ -112,6 +112,35 @@ class TestCancellationPresetOnPostgres:
         assert p["lookups_in_failed_run"] == 2, p
         assert p["rerun_status"] == 200 and p["rerun_requests_used"] == 2 and p["rerun_checked"] == 2, p
         assert p["rerun_same_orders_as_failed_run"] is True, p  # 실패한 실행과 같은 주문부터 다시
-        assert p["cursor_after_rerun_is_second_candidate"] is True, p
+        assert p["cursor_untouched_after_rerun"] is True, p  # 검증 전용 선택은 운영 cursor 를 만들지도 바꾸지도 않는다
         assert p["lock_held"] is True and p["locked_run"] == [200, "ALREADY_RUNNING"], p
         assert p["lookups_while_locked"] == 0, p  # 패자는 외부 조회가 없다
+
+
+class TestCancellationPolicyOnPostgres:
+    def test_invalid_skip_cursor_rollback_fail_closed_isolation_and_dedup(self, request):
+        p = _scenario(request.getfixturevalue("pg_sandbox"), "cancel_policy")
+        a = p["a_invalid_skipped"]
+        assert a["lookups_are_n1_n2_n3"] and a["skipped_invalid"] == 3 and a["status"] == "SUCCESS", p
+        assert a["cursor_is_n3"] and a["commit_error"] is None, p
+        b = p["b_commit_failure"]
+        assert b["commit_failed"] and b["cursor_rolled_back_to_n3"], p  # 데이터와 함께 롤백
+        assert b["rerun_checks_the_same_orders"] and b["cursor_after_rerun_is_n5"], p
+        c = p["c_wraps_around"]
+        assert c["lookups_are_n1_n2_n3"] and c["skipped_invalid"] == 3 and c["cursor_is_n3_again"], p
+        d = p["d_400_fail_closed"]
+        assert d["only_one_request"] and d["status"] == "FAILED" and d["http_status"] == 400, p
+        assert d["cursor_unchanged"] and d["next_run_restarts_at_n4"], p
+        e = p["e_412_timeout"]
+        assert (e["status"], e["reason"], e["http_status"], e["cursor_unchanged"]) == (
+            "FAILED",
+            "TIMEOUT",
+            412,
+            True,
+        ), p
+        f = p["f_verification_isolated"]
+        assert f["lookups_are_n5_n4"] and f["cursor_value_unchanged"] and f["cursor_stamp_unchanged"], p
+        assert f["meta"] == ["RECENT_VALID", 2, False], p
+        g = p["g_persistence_and_dedup"]
+        assert (g["first_count"], g["rows_after_first"], g["rows_after_second"]) == (1, 1, 1), p
+        assert g["cursor_value_still_unchanged"], p

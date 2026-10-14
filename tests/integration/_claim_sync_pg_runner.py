@@ -45,7 +45,7 @@ from config.settings import settings  # noqa: E402
 from core.database import SessionLocal, engine  # noqa: E402
 from integrations.malls.errors import MarketplaceExternalAPIError, RequestBudget  # noqa: E402
 from models import Base  # noqa: E402
-from models.order import ClaimCollectionCursor, ClaimUnmatched, Exchange, Order, Return  # noqa: E402
+from models.order import Cancellation, ClaimCollectionCursor, ClaimUnmatched, Exchange, Order, Return  # noqa: E402
 from models.platform import Platform  # noqa: E402
 from repositories.platform_repository import PlatformRepository  # noqa: E402
 from scheduler.jobs import claim_sync_job  # noqa: E402
@@ -617,7 +617,6 @@ def scenario_cancel_preset() -> dict:
     s2 = SessionLocal()
     code2, body2 = run_preset(s2)
     s2.close()
-    ids = _all_order_ids(pid)
     cursor_after_rerun = cursor()
     lookups_all = list(conn.lookups)
 
@@ -637,7 +636,7 @@ def scenario_cancel_preset() -> dict:
         "rerun_requests_used": body2.get("requests_used"),
         "rerun_checked": body2.get("cancellations", {}).get("checked"),
         "rerun_same_orders_as_failed_run": lookups_all[len(lookups_first) :] == lookups_first,
-        "cursor_after_rerun_is_second_candidate": cursor_after_rerun == ids[1],
+        "cursor_untouched_after_rerun": cursor_after_rerun is None,
         "lock_held": held,
         "locked_run": [code3, body3.get("overall_status")],
         "lookups_while_locked": lookups_during_lock,
@@ -652,6 +651,193 @@ def _all_order_ids(pid: int) -> list[int]:
         c.close()
 
 
+def scenario_cancel_policy() -> dict:
+    """취소 후보 정책을 PostgreSQL 에서 실행한다: 무효(비숫자) 후보는 HTTP 0회로 건너뛰고 cursor 가 지나가며, commit 실패 시 cursor 가 함께 롤백되고,
+    400·412 는 cursor 를 실패한 주문 앞에 남기며, 검증 전용 선택은 운영 cursor 를 건드리지 않고, 취소 저장·dedup 이 동작한다."""
+    import re
+
+    from sqlalchemy.exc import OperationalError
+
+    pid = _platform()
+    setup = SessionLocal()
+    for no in ("C202607030001", "C202607030002", "C202607030003"):
+        _order(setup, pid, no)
+    for i in range(1, 6):
+        _order(setup, pid, str(28000000000000 + i))
+    setup.commit()
+    setup.close()
+    ids = _all_order_ids(pid)  # inv1 inv2 inv3 n1 n2 n3 n4 n5
+    num = lambda i: str(28000000000000 + i)  # noqa: E731
+
+    class _Cp(_Conn):
+        def __init__(self, errors=None, cancels=None):
+            super().__init__(errors=errors)
+            self.cancels = cancels or {}
+
+        def is_valid_cancellation_lookup_order_no(self, value: str) -> bool:
+            return re.fullmatch(r"[0-9]+", value) is not None
+
+        def fetch_cancellation_status(self, order_no, since, **kw):
+            kw["request_budget"].consume("coupang")
+            self.lookups.append(order_no)
+            if order_no in self.errors:
+                raise self.errors[order_no]
+            return self.cancels.get(order_no)
+
+    def limits(retries=0, budget=105):
+        return ClaimSyncLimits(max_pages=1, max_retries=retries, budget=RequestBudget(max_requests=budget))
+
+    def cursor():
+        c = SessionLocal()
+        try:
+            return c.execute(
+                select(ClaimCollectionCursor.last_order_id).where(ClaimCollectionCursor.platform_id == pid)
+            ).scalar_one_or_none()
+        finally:
+            c.close()
+
+    def cursor_stamp():
+        c = SessionLocal()
+        try:
+            return c.execute(
+                select(ClaimCollectionCursor.updated_at).where(ClaimCollectionCursor.platform_id == pid)
+            ).scalar_one_or_none()
+        finally:
+            c.close()
+
+    def cancel_rows():
+        c = SessionLocal()
+        try:
+            order_ids = select(Order.id).where(Order.platform_id == pid)
+            return int(
+                c.execute(
+                    select(func.count()).select_from(Cancellation).where(Cancellation.order_id.in_(order_ids))
+                ).scalar_one()
+            )
+        finally:
+            c.close()
+
+    def rotate(conn, batch=3, fail_commit=False):
+        s = SessionLocal()
+        state = {"fail": fail_commit}
+
+        @event.listens_for(s, "before_commit")
+        def _boom(sess: Session) -> None:
+            if state["fail"] and not sess.in_nested_transaction():
+                state["fail"] = False
+                raise OperationalError("COMMIT", {}, Exception("synthetic commit failure"))
+
+        result = ClaimSyncService(s).sync_cancellations_by_candidate_orders(conn, pid, batch, limits())
+        error = None
+        try:
+            s.commit()
+        except Exception as exc:  # noqa: BLE001 - 결과 JSON 으로 보고한다
+            error = type(exc).__name__
+            s.rollback()
+        s.close()
+        return result, error
+
+    def verify(conn):
+        s = SessionLocal()
+        result = ClaimSyncService(s).verify_cancellations_recent_valid(conn, pid, 2, limits(budget=2))
+        s.commit()
+        s.close()
+        return result
+
+    out: dict[str, Any] = {"scenario": "cancel_policy"}
+    # A) 무효 3건은 HTTP 0회로 건너뛰고 유효 3건을 확인한다 - cursor 는 3번째 유효 후보까지 전진해 commit 된다.
+    a = _Cp()
+    res_a, err_a = rotate(a, 3)
+    out["a_invalid_skipped"] = {
+        "lookups_are_n1_n2_n3": a.lookups == [num(1), num(2), num(3)],
+        "skipped_invalid": res_a["skipped_invalid_order_no"],
+        "status": res_a["status"],
+        "cursor_is_n3": cursor() == ids[5],
+        "commit_error": err_a,
+    }
+    # B) commit 실패: cursor 가 함께 롤백되어 n3 에 남고, 재실행이 같은 주문(n4, n5)부터 다시 확인한다.
+    b1 = _Cp()
+    _, err_b = rotate(b1, 2, fail_commit=True)
+    cursor_after_failed_commit = cursor()
+    b2 = _Cp()
+    rotate(b2, 2)
+    out["b_commit_failure"] = {
+        "commit_failed": err_b is not None,
+        "cursor_rolled_back_to_n3": cursor_after_failed_commit == ids[5],
+        "rerun_checks_the_same_orders": b1.lookups == b2.lookups == [num(4), num(5)],
+        "cursor_after_rerun_is_n5": cursor() == ids[7],
+    }
+    # C) 한 바퀴 후 처음으로 되감겨 무효 후보를 다시 건너뛰고 유효 후보를 다시 확인한다.
+    c = _Cp()
+    res_c, _ = rotate(c, 3)
+    out["c_wraps_around"] = {
+        "lookups_are_n1_n2_n3": c.lookups == [num(1), num(2), num(3)],
+        "skipped_invalid": res_c["skipped_invalid_order_no"],
+        "cursor_is_n3_again": cursor() == ids[5],
+    }
+    # D) 400: n4 에서 멈추고 다음 후보를 호출하지 않으며 cursor 는 n3 에 남는다. 이후 정상이면 n4 부터 다시 시작한다.
+    d = _Cp(errors={num(4): MarketplaceExternalAPIError("coupang", "BAD_RESPONSE", False, http_status=400)})
+    res_d, _ = rotate(d, 3)
+    d_after = cursor()
+    d2 = _Cp()
+    rotate(d2, 3)
+    out["d_400_fail_closed"] = {
+        "only_one_request": d.lookups == [num(4)],
+        "status": res_d["status"],
+        "http_status": res_d.get("last_http_status"),
+        "cursor_unchanged": d_after == ids[5],
+        "next_run_restarts_at_n4": d2.lookups[:1] == [num(4)],
+    }
+    # E) 412(timeout): 같은 방식으로 cursor 가 전진하지 않는다.
+    base = cursor()
+    e = _Cp(
+        errors={num(i): MarketplaceExternalAPIError("coupang", "TIMEOUT", True, http_status=412) for i in range(1, 6)}
+    )
+    s_e = SessionLocal()
+    res_e = ClaimSyncService(s_e).sync_cancellations_by_candidate_orders(e, pid, 3, limits())
+    s_e.commit()
+    s_e.close()
+    out["e_412_timeout"] = {
+        "status": res_e["status"],
+        "reason": res_e["reason_code"],
+        "http_status": res_e.get("last_http_status"),
+        "cursor_unchanged": cursor() == base,
+    }
+    # F) 검증 전용 선택: 최근 유효 2건(n5, n4)만 확인하고 운영 cursor(값과 갱신 시각)를 건드리지 않는다.
+    before_value, before_stamp = cursor(), cursor_stamp()
+    f = _Cp()
+    res_f = verify(f)
+    out["f_verification_isolated"] = {
+        "lookups_are_n5_n4": f.lookups == [num(5), num(4)],
+        "cursor_value_unchanged": cursor() == before_value,
+        "cursor_stamp_unchanged": cursor_stamp() == before_stamp,
+        "meta": [res_f["candidate_selection"], res_f["candidate_count"], res_f["cursor_affected"]],
+    }
+    # G) 취소 저장과 dedup: 같은 claim 을 두 번 받아도 행은 1개다.
+    g = _Cp(
+        cancels={
+            num(5): {
+                **_claim(num(5), "CX-1"),
+                "platform_order_item_no": None,
+                "refund_amount": None,
+                "quantity": None,
+                "shipping_fee": None,
+                "fault_type": None,
+            }
+        }
+    )
+    first = verify(g)
+    rows_after_first = cancel_rows()
+    verify(g)
+    out["g_persistence_and_dedup"] = {
+        "first_count": first["count"],
+        "rows_after_first": rows_after_first,
+        "rows_after_second": cancel_rows(),
+        "cursor_value_still_unchanged": cursor() == before_value,
+    }
+    return out
+
+
 SCENARIOS = {
     "concurrent_same_claim": scenario_concurrent_same_claim,
     "commit_failure": scenario_commit_failure,
@@ -663,6 +849,7 @@ SCENARIOS = {
     "promotion_poison": scenario_promotion_poison,
     "claim_lock_domain": scenario_claim_lock_domain,
     "cancel_preset": scenario_cancel_preset,
+    "cancel_policy": scenario_cancel_policy,
 }
 
 if __name__ == "__main__":
