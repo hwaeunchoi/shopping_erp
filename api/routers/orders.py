@@ -678,7 +678,7 @@ def _live_verify_cancellations(db: Session, platform: Platform) -> JSONResponse:
                 max_requests=min(LIVE_VERIFY_CANCELLATION_MAX_REQUESTS, settings.claim_sync_max_requests_per_run)
             ),
         )
-        lookup = ClaimSyncService(db).sync_cancellations_by_candidate_orders(
+        lookup = ClaimSyncService(db).verify_cancellations_recent_valid(
             connector, platform.id, LIVE_VERIFY_CANCELLATION_MAX_ORDERS, limits
         )
         not_requested = {"status": "UNSUPPORTED", "count": 0, "reason_code": "NOT_REQUESTED", "retryable": False}
