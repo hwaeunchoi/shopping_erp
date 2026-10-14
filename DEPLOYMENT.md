@@ -689,9 +689,9 @@ Docker Compose의 우선순위는 **프로세스(셸) 환경변수 > `.env`**입
 
 - **서버가 강제하는 값(요청 본문으로 바꿀 수 없음)**: 반품·교환·정산 호출 없음(응답은 `NOT_REQUESTED`), 후보 주문 최대 2건, 페이지 1,
   retry 0, 요청 최대 2회(설정 예산이 더 작으면 그 값). 요청 본문의 기간 값은 이 프리셋에서 쓰지 않는다.
-- scheduler `claim_sync`와 같은 `(platform_id, CLAIM_SYNC)` 잠금 안에서 **실제 운영 서비스 경로**(회전 cursor 포함)를 쓴다.
-  겹치면 외부 호출 없이 `ALREADY_RUNNING`. cursor 는 후보 처리와 같은 트랜잭션이라 commit 이 실패하면 함께 롤백된다.
-  이 프리셋을 실행하면 cursor 가 실제로 전진한다(운영 `claim_collection_cursors` 행이 생긴다) - 이후 자동수집은 다음 후보부터 이어진다.
+- scheduler `claim_sync`와 같은 `(platform_id, CLAIM_SYNC)` 잠금 안에서 실행한다. 겹치면 외부 호출 없이 `ALREADY_RUNNING`.
+  (`cb253c0` 배포본은 운영 회전 cursor 를 그대로 써서 실행하면 cursor 가 전진했다. 이후 `fix/cancellation-candidate-and-error-policy`에서 검증 전용
+  최근 후보 선택으로 바뀌어 운영 cursor 를 건드리지 않는다 - 아래 "취소 후보 검증·오류 정책" 참고.)
 - 후보가 0건이면 외부 요청 0회로 `SUCCESS`(`verification_level=NOT_VALIDATED`).
 - **판정을 둘로 구분한다**(응답의 `verification_level`):
   - `LIVE_CANCEL_AUTH_AND_ENVELOPE_VALIDATED`: 요청 성공 + schema 정상 + 취소 데이터 0건. 인증·응답 형식만 증명한다.
@@ -722,7 +722,8 @@ Docker Compose의 우선순위는 **프로세스(셸) 환경변수 > `.env`**입
 `integrations/malls/errors.raise_for_status`: HTTP 200이 아니고 401/403/429/5xx 도 아니면 `BAD_RESPONSE`(retryable=False, `http_status` 보관).
 취소 단건 조회는 `_collect_token_pages`가 이 함수를 부른다. 따라서 사실로 말할 수 있는 것은 "두 요청의 응답이 200이 아니면서 401/403/429/5xx 가
 아닌 상태(예: 400, 412, 404)"까지다. 연결·timeout 은 `TIMEOUT`/`CONNECT_FAILED`, 본문 파싱 실패는 `PARSE_FAILED` 로 별도 분류되므로 이번 건과 다르다.
-서비스는 `BAD_RESPONSE`를 "주문 단위 영구 오류"로 보고 그 주문을 건너뛰며 cursor 를 전진시킨다(공통 원인 목록 `_BATCH_STOP_REASONS` 에 없다).
+당시(`cb253c0`) 서비스는 `BAD_RESPONSE`를 "주문 단위 영구 오류"로 보고 그 주문을 건너뛰며 cursor 를 전진시켰다(공통 원인 목록 `_BATCH_STOP_REASONS` 에 없었다).
+이 정책은 `fix/cancellation-candidate-and-error-policy`에서 fail-closed 로 바뀐다(아래 "취소 후보 검증·오류 정책").
 
 ##### 추가한 안전 진단 (이 브랜치)
 - 숫자 HTTP 상태코드만 기록·반환한다: 로그 `reason=BAD_RESPONSE, http_status=400` 형태(상태가 없으면 `http_status=none`), 결과 객체와 작업 이력·검증 응답의
@@ -756,7 +757,7 @@ Docker Compose의 우선순위는 **프로세스(셸) 환경변수 > `.env`**입
 - 보조 가설: 두 후보가 가장 오래된 주문이라 조회 범위가 정확히 31일 차이가 되어 경계에서 거절됐을 수 있다(문서 미확정).
 - 따라서 **상태코드 계측 후에만** 날짜 범위·후보 선택·parameter 수정 여부를 판단한다. 근거 없이 조회 기간을 30일로 바꾸거나 parameter 를 추가·삭제하지 않는다.
 
-##### cursor 정책 감사 결과 (변경하지 않음 - 제안만)
+##### cursor 정책 감사 결과 (진단 브랜치 시점의 조사 기록 - 아래 정책 브랜치가 일부를 반영한다)
 - 400 은 문서상 요청 구성 전체의 오류일 수도, 주문 단위 오류(비숫자 주문번호)일 수도 있다. 현재 정책은 둘을 구분하지 못한다.
 - 같은 요청 구성이 모든 후보에서 실패하면 연속 건너뜀 상한(3회)에서 배치가 멈추지만, 그 3건만큼 cursor 는 전진한다. 후보가 많으면(예: 352건) 한 바퀴가
   끝나도록 실행당 최대 3회의 무의미한 요청이 반복될 수 있다. 건너뛴 주문은 cursor 가 한 바퀴 돈 뒤 다시 시도된다.
@@ -769,3 +770,44 @@ Docker Compose의 우선순위는 **프로세스(셸) 환경변수 > `.env`**입
 ##### 현재 운영 상태와 결정 대기
 - 운영은 api `cb253c0`, scheduler `c5d816f`이고 claim·settlement 는 False 다. **원인 확정 전에는 canary(`MAX_ORDERS=2`, `MAX_REQUESTS=51`)를 활성화하지 않는다.**
 - 다음 실계정 1회 재검증 전에 필요한 결정: 이 진단 브랜치의 검토·배포, 그리고 후보 선택 정책(비숫자 레거시 주문 처리 방식).
+
+#### 취소 후보 검증·오류 정책 (`fix/cancellation-candidate-and-error-policy`)
+
+2026-10-13 실계정 검증의 `BAD_RESPONSE` 조사 결과를 반영한 정책이다. 날짜 범위(31일)와 날짜 시간대 처리는 **이번 변경에서 건드리지 않았다**.
+
+##### 1) 주문번호 형식 검증 - 쿠팡 취소 단건 조회에 한정
+- 공식 문서가 `orderId`를 `number`로 규정하므로 취소 단건 조회로 보내는 주문번호는 **ASCII 숫자만**(`[0-9]+`, 전체 일치)이어야 한다. 빈 문자열, 공백,
+  부호, 소수점, 전각·아라비아-인도·위첨자 같은 유니코드 숫자(`str.isdigit()`은 이들을 허용한다), 개행이 붙은 값은 모두 무효다.
+- **길이는 검사하지 않는다.** 문서의 14자리는 예시일 뿐 규칙으로 명시되지 않았다. 고정 길이를 넣으면 유효한 주문을 놓칠 수 있다.
+- 이 규칙은 주문 나이 필터가 **아니다**("31일"은 취소 접수일 조회 범위이며 주문 나이 제한이 아니다). 공식 `orderId: number` 계약에 따른 **입력 검증**이다.
+- 규칙은 커넥터 훅(`is_valid_cancellation_lookup_order_no`, 기본 True)으로 쿠팡 커넥터만 재정의한다 - 다른 플랫폼에는 적용되지 않는다. 커넥터는 직접 호출돼도
+  무효 번호를 HTTP 로 보내지 않는다(`INVALID_PLATFORM_ORDER_NO`).
+- 무효 후보는 **HTTP 0회**로 건너뛴다. 고정 reason code `INVALID_PLATFORM_ORDER_NO`, 집계 `skipped_invalid_order_no`만 남기며 번호나 패턴은 로그·응답·작업 이력에
+  남기지 않는다. 회전 경로에서는 cursor 가 무효 후보를 지나가므로(데이터와 같은 트랜잭션, commit 실패 시 함께 롤백) 반복 기아가 없다. 후보가 아예 없는 경우(`SUCCESS`, 0건)와
+  후보가 전부 무효인 경우(`FAILED`, `INVALID_PLATFORM_ORDER_NO`)를 구분한다.
+- **레거시 더미 주문 행은 삭제·수정하지 않는다.** 별도 테이블로 옮기거나 상태를 보정하지 않으며, 취소 외부 API 대상에서만 제외된다.
+
+##### 2) HTTP 오류 분류
+| 응답 | 처리 |
+|---|---|
+| 400, 404 등 원인 불명의 비-200 | `reason=BAD_RESPONSE`(`http_status` 유지). 오류 본문에 안전하게 읽을 공식 코드가 없어 주문 단위 영구 오류라고 단정하지 않는다 -> **fail-closed**: retry 없음, 같은 실행에서 다음 후보를 호출하지 않음, cursor 는 실패한 주문 앞에 남음 |
+| 412 | 공식 문서가 "Read timed out"으로 설명 -> **일시 오류**. 설정된 retry 범위에서만 재시도하고(`live_verify_cancellations`는 retry 0이라 요청 1회) 소진되면 `reason=TIMEOUT`(`http_status=412`)로 배치를 멈추며 cursor 는 전진하지 않음. 이 분류는 취소 단건 조회 경로에만 적용 |
+| 401·403·429·5xx, 연결·timeout | 기존 정책 유지(배치 중단, cursor 비전진) |
+| 그 밖의 주문 단위 오류(`PAGE_LIMIT_EXCEEDED`, `PAGINATION_*`, `PARSE_FAILED`) | 그 주문만 건너뛰고 cursor 전진(기존) |
+
+**위험(알려진 한계)**: 400 을 fail-closed 로 두면 숫자 형식이지만 쿠팡이 400 으로 거절하는 주문 하나가 회전을 영구히 멈출 수 있다(매 실행 같은 주문에서 요청 1회 후 중단).
+이 경우 작업 이력의 결과(`FAILED`, `BAD_RESPONSE`, `last_http_status`)와 로그로만 드러난다. 상태코드와 원인이 확정되면 정책을 다시 검토한다.
+
+##### 3) 결과 상태 계약 (기존 enum 사용, 새 상태 문자열 없음)
+- 한 건도 확인하지 못했는데(`checked=0`) 조회 실패가 있으면 **SUCCESS 가 아니다**: `FAILED`. 일부 확인·일부 실패는 `PARTIAL`. 취소 0건의 정상 200 확인만 `SUCCESS`.
+- `verification_level`: `LIVE_CANCEL_AUTH_AND_ENVELOPE_VALIDATED`(SUCCESS, 확인 1건 이상, 취소 0건), `LIVE_CANCEL_PERSISTENCE_VALIDATED`(SUCCESS, 취소 1건 이상 저장),
+  그 밖은 항상 `NOT_VALIDATED`.
+
+##### 4) 검증 전용 후보 선택 (`live_verify_cancellations`에만 적용)
+- 선택 규칙(결정적): 쿠팡 플랫폼 -> 취소 후보 상태 -> ASCII 숫자 주문번호 -> **채널 주문 시각(`Order.order_date`) 내림차순** -> 동률이면 `Order.id` 내림차순 -> 최대 2건.
+  `order_date`는 채널의 주문 시각이고 `updated_at`처럼 로컬 갱신으로 바뀌지 않는다.
+- **운영 회전 cursor 를 읽지도, 만들지도, 바꾸지도 않는다.** 검증을 반복해도 운영 순회가 오염되지 않는다. 응답에는 값이 아닌 `candidate_selection=RECENT_VALID`,
+  `candidate_count`, `cursor_affected=false`만 포함한다. 같은 `CLAIM_SYNC` 락, 페이지 1·retry 0·요청 2회 제한은 그대로다.
+- scheduler 의 자동수집은 **기존 회전 cursor 를 그대로** 쓴다(최근 우선 정렬, 후보 고정, cursor 제거, 주문 나이 필터, 31일->30일 변경 없음). scheduler 에 반영된 것은
+  무효 후보 건너뜀과 위 오류 정책뿐이다.
+- 이 변경을 배포하기 전까지 운영(api `cb253c0`, scheduler `c5d816f`)은 이전 동작이다. **canary 는 재검증 성공 전까지 활성화하지 않는다.**

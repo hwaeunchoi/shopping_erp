@@ -245,7 +245,7 @@
 #### 5-B2) 취소 단건 조회 실계정 검증 프리셋
 
 `live_verify_cancellations=true`: 취소 후보 단건 조회만 후보 2건·페이지 1·retry 0·요청 2회로 서버가 고정해 실행한다(반품·교환·정산 제외,
-`live_verify`와 동시 사용 불가, 같은 CLAIM_SYNC 잠금, 운영 서비스 경로와 회전 cursor 사용). 취소 0건은 `LIVE_CANCEL_AUTH_AND_ENVELOPE_VALIDATED`
+`live_verify`와 동시 사용 불가, 같은 CLAIM_SYNC 잠금. 정책 브랜치부터는 검증 전용 최근 주문 선택으로 운영 회전 cursor 를 건드리지 않는다). 취소 0건은 `LIVE_CANCEL_AUTH_AND_ENVELOPE_VALIDATED`
 (인증·응답 형식만), 취소 1건 이상 저장은 `LIVE_CANCEL_PERSISTENCE_VALIDATED`로 구분한다. 자세한 절차와 공식 계약 확인 결과는 DEPLOYMENT.md 참고.
 
 #### 5-B3) 취소 단건 조회 `BAD_RESPONSE` 조사
