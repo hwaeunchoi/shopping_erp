@@ -1,6 +1,8 @@
 import { useState } from 'react'
 import { api, ApiError } from '../api/client'
 import { useApiData } from '../api/useApiData'
+import { channelStatusText } from '../labels'
+import { StatusBadge } from '../components/StatusBadge'
 import type { OrderStatusConflict } from '../api/types'
 
 // 상용 ERP 확장(1단계) - 채널/내부 주문상태가 허용된 전이로 설명되지 않을 때
@@ -42,8 +44,8 @@ export function OrderConflictsPage() {
         <table className="data-table">
           <thead>
             <tr>
-              <th>ID</th>
-              <th>주문ID</th>
+              <th>번호</th>
+              <th>주문 번호</th>
               <th>내부 상태</th>
               <th>채널 상태</th>
               <th>감지일시</th>
@@ -55,8 +57,8 @@ export function OrderConflictsPage() {
               <tr key={c.id}>
                 <td>{c.id}</td>
                 <td>{c.order_id}</td>
-                <td><span className="status-badge">{c.internal_status}</span></td>
-                <td><span className="status-badge">{c.channel_status}</span></td>
+                <td><StatusBadge domain="orderStatus" value={c.internal_status} /></td>
+                <td><span className="status-badge">{channelStatusText(c.channel_status)}</span></td>
                 <td>{new Date(c.detected_at).toLocaleString()}</td>
                 <td>
                   <div className="inline-form" style={{ margin: 0 }}>

@@ -33,13 +33,13 @@ export function LoginPage() {
         <h1>쇼핑몰 통합 ERP</h1>
         <label>
           아이디
-          <input value={username} onChange={(e) => setUsername(e.target.value)} autoFocus />
+          <input value={username} onChange={(e) => setUsername(e.target.value)} autoFocus autoComplete="username" />
         </label>
         <label>
           비밀번호
-          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
+          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" />
         </label>
-        {error && <p className="form-error">{error}</p>}
+        {error && <p className="form-error" role="alert">{error}</p>}
         <button type="submit" disabled={isSubmitting}>
           {isSubmitting ? '로그인 중...' : '로그인'}
         </button>

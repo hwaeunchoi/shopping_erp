@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useAuth } from '../auth/AuthContext'
 import { api, ApiError } from '../api/client'
+import { label } from '../labels'
 import type { TaskExecutionHistoryItem, TaskTriggerResult } from '../api/types'
 
 // UI 와이어프레임 v1.1 3장: 대시보드 빠른실행 버튼 5종.
@@ -16,7 +17,6 @@ const ACTIONS: Array<{ taskType: TaskType; label: string; confirmMessage: string
   { taskType: 'FULL_SYNC', label: '전체동기화', confirmMessage: '주문/광고/정산/고객통계를 전체 동기화할까요?', permission: 'ORDER_EDIT' },
 ]
 
-const STATUS_LABEL: Record<string, string> = { SUCCESS: '성공', FAILED: '실패', RUNNING: '진행중' }
 
 export function QuickActionButtons() {
   const { user } = useAuth()
@@ -91,7 +91,7 @@ export function QuickActionButtons() {
             <span key={action.taskType}>
               {i > 0 && ' | '}
               {action.label}{' '}
-              {last ? `${new Date(last.started_at).toLocaleTimeString()} ${STATUS_LABEL[last.status] ?? last.status}` : '-'}
+              {last ? `${new Date(last.started_at).toLocaleTimeString()} ${label('taskStatus', last.status)}` : '-'}
             </span>
           )
         })}

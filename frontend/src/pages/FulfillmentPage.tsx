@@ -1,6 +1,8 @@
 import { useMemo, useState } from 'react'
 import { api, ApiError } from '../api/client'
 import { useApiData } from '../api/useApiData'
+import { label } from '../labels'
+import { StatusBadge } from '../components/StatusBadge'
 import type {
   CarrierOption,
   FulfillableOrderItem,
@@ -20,36 +22,6 @@ import type {
 // 채널 전송 확정(SUCCESS 여부)은 여기서 판정하지 않는다 - 진행상태 표는 항상
 // command_status(ExternalCommand)를 그대로 보여주고, SUCCESS만 전송완료로 본다.
 
-const OUTCOME_LABELS: Record<string, string> = {
-  ACCEPTED: '접수됨',
-  ALREADY_PROCESSED: '이미 처리됨(중복 요청)',
-  BLOCKED: '막힘',
-  VALIDATION_FAILED: '검증 실패',
-  FAILED_TO_ENQUEUE: '접수 실패',
-}
-
-const STATUS_LABELS: Record<string, string> = {
-  READY: '출고대기',
-  PICKING: '피킹중',
-  PICKED: '피킹완료',
-  VERIFYING: '검수중',
-  VERIFIED: '검수완료',
-  PACKED: '포장완료',
-  SUBMIT_PENDING: '전송접수중',
-  SUBMITTED: '전송접수됨',
-  BLOCKED: '막힘',
-  CANCELLED: '취소됨',
-}
-
-const COMMAND_STATUS_LABELS: Record<string, string> = {
-  PENDING: '전송 대기',
-  RUNNING: '전송 중',
-  SUCCESS: '채널 전송 완료',
-  FAILED: '전송 실패',
-  RETRY_WAIT: '재시도 대기',
-  UNKNOWN: '확인 필요(운영자 확인 대상)',
-  CANCELLED: '취소됨(더 최신 요청으로 대체)',
-}
 
 const BATCH_STATUS_FILTERS = ['ALL', 'READY', 'PICKING', 'PICKED', 'VERIFYING', 'VERIFIED', 'PACKED', 'CLOSED']
 
@@ -164,7 +136,7 @@ export function FulfillmentPage() {
       <h2>출고</h2>
       <p className="hint-text">
         출고대기 주문라인을 배치로 묶어 피킹-검수-포장-송장등록-채널전송 접수까지 처리합니다. 실제 채널 HTTP
-        전송은 여기서 하지 않고 기존 outbox로 접수만 합니다.
+        전송은 여기서 하지 않고 전송 대기열에 접수만 합니다.
       </p>
 
       <h3>출고 배치 생성</h3>
@@ -314,7 +286,7 @@ export function FulfillmentPage() {
           <table className="data-table">
             <thead>
               <tr>
-                <th>배치 ID</th>
+                <th>배치 번호</th>
                 <th>창고</th>
                 <th>상태</th>
                 <th>생성시각</th>
@@ -327,7 +299,7 @@ export function FulfillmentPage() {
                   <td>{b.id}</td>
                   <td>{(warehouses ?? []).find((w) => w.id === b.warehouse_id)?.name ?? b.warehouse_id}</td>
                   <td>
-                    <span className="status-badge">{b.status}</span>
+                    <StatusBadge domain="fulfillmentStatus" value={b.status} />
                   </td>
                   <td>{new Date(b.created_at).toLocaleString()}</td>
                   <td>
@@ -573,7 +545,7 @@ function BatchDetailPanel({
                 </td>
                 <td>{item.requested_quantity}</td>
                 <td>
-                  <span className="status-badge">{STATUS_LABELS[item.status] ?? item.status}</span>
+                  <StatusBadge domain="fulfillmentStatus" value={item.status} />
                   {item.failure_reason_code && <div className="hint-text">사유: {item.failure_reason_code}</div>}
                 </td>
                 <td>
@@ -670,7 +642,7 @@ function BatchDetailPanel({
         <ul>
           {packResults.map((r) => (
             <li key={r.batch_item_id}>
-              항목 #{r.batch_item_id}: {OUTCOME_LABELS[r.outcome] ?? r.outcome}
+              항목 #{r.batch_item_id}: {label('requestOutcome', r.outcome)}
               {r.error_code ? ` (${r.error_code})` : ''}
             </li>
           ))}
@@ -688,7 +660,7 @@ function BatchDetailPanel({
         <ul>
           {submitResults.map((r) => (
             <li key={r.batch_item_id}>
-              항목 #{r.batch_item_id}: {OUTCOME_LABELS[r.outcome] ?? r.outcome}
+              항목 #{r.batch_item_id}: {label('requestOutcome', r.outcome)}
               {r.error_code ? ` (${r.error_code})` : ''}
             </li>
           ))}
@@ -712,7 +684,7 @@ function BatchDetailPanel({
         <thead>
           <tr>
             <th>재처리 선택</th>
-            <th>항목 ID</th>
+            <th>항목 번호</th>
             <th>배치항목 상태</th>
             <th>전송 상태</th>
             <th>사유</th>
@@ -730,11 +702,11 @@ function BatchDetailPanel({
               </td>
               <td>{p.batch_item.id}</td>
               <td>
-                <span className="status-badge">{STATUS_LABELS[p.batch_item.status] ?? p.batch_item.status}</span>
+                <StatusBadge domain="fulfillmentStatus" value={p.batch_item.status} />
               </td>
               <td>
                 {p.command_status ? (
-                  <span className="status-badge">{COMMAND_STATUS_LABELS[p.command_status] ?? p.command_status}</span>
+                  <StatusBadge domain="commandStatus" value={p.command_status} />
                 ) : (
                   '-'
                 )}
@@ -761,7 +733,7 @@ function BatchDetailPanel({
       <table className="data-table">
         <thead>
           <tr>
-            <th>항목 ID</th>
+            <th>항목 번호</th>
             <th>이전 상태</th>
             <th>다음 상태</th>
             <th>처리자</th>
@@ -773,8 +745,8 @@ function BatchDetailPanel({
           {(history ?? []).map((h) => (
             <tr key={h.id}>
               <td>{h.batch_item_id}</td>
-              <td>{h.from_status ? STATUS_LABELS[h.from_status] ?? h.from_status : '-'}</td>
-              <td>{STATUS_LABELS[h.to_status] ?? h.to_status}</td>
+              <td>{h.from_status ? label('fulfillmentStatus', h.from_status) : '-'}</td>
+              <td>{label('fulfillmentStatus', h.to_status)}</td>
               <td>{h.changed_by ?? '-'}</td>
               <td>{new Date(h.changed_at).toLocaleString()}</td>
               <td>{h.note ?? '-'}</td>

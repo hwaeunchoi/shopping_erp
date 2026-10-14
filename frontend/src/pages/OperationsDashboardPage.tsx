@@ -2,6 +2,8 @@ import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import { api, ApiError } from '../api/client'
 import { useApiData } from '../api/useApiData'
+import { label } from '../labels'
+import { StatusBadge } from '../components/StatusBadge'
 import { useAutoRefreshData } from '../api/useAutoRefreshData'
 import { useAuth } from '../auth/AuthContext'
 import { DrillLink } from '../components/DrillLink'
@@ -36,21 +38,6 @@ const COMMAND_TYPE_OPTIONS = [
   'SALE_STATUS_UPDATE',
   'PRODUCT_INFO_UPDATE',
 ]
-const STATUS_LABELS: Record<string, string> = {
-  PENDING: '대기',
-  RUNNING: '실행중',
-  RETRY_WAIT: '재시도대기',
-  FAILED: '실패',
-  UNKNOWN: '결과확인필요',
-  SUCCESS: '성공',
-  CANCELLED: '취소됨',
-}
-const SEVERITY_LABELS: Record<OpsSeverity, string> = {
-  INFO: '정상',
-  WARNING: '주의',
-  ERROR: '오류',
-  CRITICAL: '심각',
-}
 const RESOLUTION_OPTIONS = [
   { value: 'CONFIRMED_SUCCESS', label: '채널에서 성공 확인' },
   { value: 'CONFIRMED_NOT_SENT', label: '채널에서 미처리 확인' },
@@ -58,7 +45,7 @@ const RESOLUTION_OPTIONS = [
 ]
 
 function SeverityBadge({ severity }: { severity: OpsSeverity }) {
-  return <span className={`severity-badge severity-${severity.toLowerCase()}`}>{SEVERITY_LABELS[severity]}</span>
+  return <span className={`severity-badge severity-${severity.toLowerCase()}`}>{label('opsSeverity', severity)}</span>
 }
 
 function formatTime(iso: string | null): string {
@@ -211,7 +198,7 @@ export function OperationsDashboardPage() {
         <>
           <div className="kpi-cards">
             <div className="kpi-card">
-              <div className="kpi-label">오늘 수집된 주문(UTC 기준)</div>
+              <div className="kpi-label">오늘 수집된 주문(세계 표준시 기준)</div>
               <div className="kpi-value">{summary.orders.collected_today}건</div>
             </div>
             <DrillLink to="/orders" filters={{ status_filter: 'NEW' }} className="kpi-card">
@@ -224,11 +211,11 @@ export function OperationsDashboardPage() {
               )}
             </DrillLink>
             <Link to="/cs-cases" className="kpi-card">
-              <div className="kpi-label">미배정 CS</div>
+              <div className="kpi-label">미배정 문의</div>
               <div className={'kpi-value' + (summary.cs.unassigned > 0 ? ' negative' : '')}>{summary.cs.unassigned}건</div>
             </Link>
             <Link to="/cs-cases" className="kpi-card">
-              <div className="kpi-label">지연 CS</div>
+              <div className="kpi-label">지연 문의</div>
               <div className={'kpi-value' + (summary.cs.overdue > 0 ? ' negative' : '')}>{summary.cs.overdue}건</div>
             </Link>
             <Link to="/order-conflicts" className="kpi-card">
@@ -238,7 +225,7 @@ export function OperationsDashboardPage() {
               </div>
             </Link>
             <div className={'kpi-card' + (unresolvedUnknownCount > 0 ? '' : '')}>
-              <div className="kpi-label negative">UNKNOWN(결과확인필요)</div>
+              <div className="kpi-label negative">결과 확인 필요</div>
               <div className={'kpi-value' + (unresolvedUnknownCount > 0 ? ' negative' : '')}>{unresolvedUnknownCount}건</div>
             </div>
           </div>
@@ -298,7 +285,7 @@ export function OperationsDashboardPage() {
           </div>
           <p className="hint-text">{summary.success_rate.scope_note}</p>
 
-          <h3>최근 7일 명령 성공/실패 추이(일별, UTC 기준)</h3>
+          <h3>최근 7일 명령 성공/실패 추이(일별, 세계 표준시 기준)</h3>
           <div className="ops-trend-row">
             <div>
               <p className="hint-text">성공</p>
@@ -327,9 +314,9 @@ export function OperationsDashboardPage() {
               <tbody>
                 {(integrations ?? []).map((row) => (
                   <tr key={`${row.integration_type}-${row.integration_code}`}>
-                    <td>{row.integration_type}</td>
+                    <td>{label('integrationType', row.integration_type)}</td>
                     <td>{row.integration_code}</td>
-                    <td>{row.status}</td>
+                    <td><StatusBadge domain="integrationStatus" value={row.status} /></td>
                     <td>
                       <SeverityBadge severity={row.severity} />
                     </td>
@@ -351,7 +338,7 @@ export function OperationsDashboardPage() {
 
           {canViewScheduler && (
             <>
-              <h3>scheduler 잡 상태(잡별 최근 실행)</h3>
+              <h3>자동 실행 작업 상태(작업별 최근 실행)</h3>
               <div className="table-scroll">
                 <table className="data-table">
                   <thead>
@@ -368,7 +355,7 @@ export function OperationsDashboardPage() {
                     {(schedulerJobs ?? []).map((job) => (
                       <tr key={job.target ?? job.task_type}>
                         <td>{job.target ?? job.task_type}</td>
-                        <td>{job.status}</td>
+                        <td><StatusBadge domain="taskStatus" value={job.status} /></td>
                         <td>
                           <SeverityBadge severity={job.severity} />
                         </td>
@@ -395,7 +382,7 @@ export function OperationsDashboardPage() {
       <h3>통합 실패 작업함</h3>
       <p className="hint-text">
         송장 전송/상품 등록/옵션조합 등록/재고 전송/판매상태 전송/상품정보 수정 명령의 실패·재시도대기·결과확인필요
-        (UNKNOWN)·실행중 건을 한 곳에서 확인합니다. UNKNOWN은 대량 재처리 대상이 아닙니다 - 외부 채널을 직접 확인한
+        ·진행 중 건을 한 곳에서 확인합니다. "결과 확인 필요" 건은 일괄 재처리 대상이 아닙니다 - 외부 채널을 직접 확인한
         뒤 개별적으로 해소해야 합니다.
       </p>
 
@@ -409,7 +396,7 @@ export function OperationsDashboardPage() {
         >
           {COMMAND_TYPE_OPTIONS.map((t) => (
             <option key={t} value={t}>
-              {t || '전체 기능유형'}
+              {t ? label('commandType', t) : '전체 기능 유형'}
             </option>
           ))}
         </select>
@@ -436,7 +423,7 @@ export function OperationsDashboardPage() {
         >
           {FAILURE_STATUS_OPTIONS.map((s) => (
             <option key={s} value={s}>
-              {s ? `${STATUS_LABELS[s] ?? s}만 보기` : '실패/재시도대기/UNKNOWN/실행중(기본)'}
+              {s ? `${label('commandStatus', s)}만 보기` : '실패·재시도 대기·결과 확인 필요·진행 중(기본)'}
             </option>
           ))}
         </select>
@@ -484,7 +471,7 @@ export function OperationsDashboardPage() {
                     />
                   </th>
                 )}
-                <th>ID</th>
+                <th>번호</th>
                 <th>기능유형</th>
                 <th>채널</th>
                 <th>대상</th>
@@ -574,13 +561,13 @@ function FailureRow({
         </td>
       )}
       <td>{row.id}</td>
-      <td>{row.command_type}</td>
+      <td>{label('commandType', row.command_type)}</td>
       <td>{row.platform_code ?? row.platform_id}</td>
       <td>
-        {row.target_type} #{row.target_id}
+        {label('recordTarget', row.target_type)} #{row.target_id}
       </td>
       <td>
-        {row.status === 'UNKNOWN' ? <span className="badge-negative">{STATUS_LABELS[row.status]}</span> : STATUS_LABELS[row.status] ?? row.status}
+        {row.status === 'UNKNOWN' ? <span className="badge-negative">{label('commandStatus', row.status)}</span> : label('commandStatus', row.status)}
       </td>
       <td>{row.attempt_count}</td>
       <td>{formatTime(row.created_at)}</td>
@@ -591,7 +578,7 @@ function FailureRow({
       </td>
       <td>
         <button type="button" onClick={onOpenDetail}>
-          {isActive ? '닫기' : row.status === 'UNKNOWN' && canResolveUnknown ? 'UNKNOWN 해소' : '상세'}
+          {isActive ? '닫기' : row.status === 'UNKNOWN' && canResolveUnknown ? '결과 확인 처리' : '상세'}
         </button>
       </td>
     </tr>
@@ -633,7 +620,7 @@ function FailureDetailPanel({
       })
       onResolved()
     } catch (err) {
-      setSubmitError(err instanceof ApiError ? err.message : 'UNKNOWN 해소 중 오류가 발생했습니다.')
+      setSubmitError(err instanceof ApiError ? err.message : '결과 확인 처리 중 오류가 발생했습니다.')
     } finally {
       setSubmitting(false)
     }
@@ -648,7 +635,7 @@ function FailureDetailPanel({
         {detail && (
           <>
             <p className="hint-text">
-              {detail.command_type} · {STATUS_LABELS[detail.status] ?? detail.status} · 시도 {detail.attempt_count}회
+              {label('commandType', detail.command_type)} · {label('commandStatus', detail.status)} · 시도 {detail.attempt_count}회
             </p>
             {detail.request_summary && <p className="hint-text">요청 요약: {detail.request_summary}</p>}
             {detail.response_summary && <p className="hint-text">응답 요약: {detail.response_summary}</p>}
@@ -656,7 +643,7 @@ function FailureDetailPanel({
             {detail.status === 'UNKNOWN' && (
               <>
                 <p className="form-error">
-                  UNKNOWN은 채널이 실제로 처리했는지 알 수 없는 상태입니다 - 자동/대량 재처리를 절대 하지 마세요.
+                  "결과 확인 필요"는 채널이 실제로 처리했는지 알 수 없는 상태입니다 - 자동/대량 재처리를 절대 하지 마세요.
                   외부 채널(판매자센터 등)에서 직접 확인한 뒤에만 아래에서 해소하세요.
                 </p>
                 {canResolveUnknown ? (
@@ -683,7 +670,7 @@ function FailureDetailPanel({
                     </button>
                   </>
                 ) : (
-                  <p className="hint-text">UNKNOWN 해소 권한이 없습니다 - 권한자에게 요청하세요.</p>
+                  <p className="hint-text">결과 확인 처리 권한이 없습니다 - 권한자에게 요청하세요.</p>
                 )}
               </>
             )}

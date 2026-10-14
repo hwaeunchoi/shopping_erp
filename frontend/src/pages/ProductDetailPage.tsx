@@ -2,6 +2,7 @@ import { Fragment, useEffect, useRef, useState, type ChangeEvent, type FormEvent
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, ApiError } from '../api/client'
 import { useApiData } from '../api/useApiData'
+import { StatusBadge } from '../components/StatusBadge'
 import { useRecentView } from '../api/useRecentView'
 import { FavoriteStar } from '../components/FavoriteStar'
 import type {
@@ -363,15 +364,6 @@ function PlatformMapEditRow({ mapping, onSaved, onCancel }: { mapping: ProductPl
   )
 }
 
-const SYNC_STATUS_LABELS: Record<string, string> = {
-  PENDING: '접수됨(전송 대기)',
-  RUNNING: '전송 중',
-  SUCCESS: '성공',
-  FAILED: '실패',
-  RETRY_WAIT: '재시도 대기',
-  UNKNOWN: '확인 필요(운영자 확인 대상)',
-  CANCELLED: '취소됨(더 최신 요청으로 대체)',
-}
 
 // 상용 ERP 확장(3단계, 첫 묶음) - 기존 채널 상품(옵션) 하나의 재고/판매상태를
 // 채널에 전송하는 최소한의 UI. 이 화면은 "채널의 현재 값을 읽어 보여주는" 기능이
@@ -532,7 +524,7 @@ function ProductSyncControls({ mapping, onClose }: { mapping: ProductPlatformMap
       {error && <p className="form-error">{error}</p>}
       {command && (
         <p>
-          명령 #{command.id}: <span className="status-badge">{SYNC_STATUS_LABELS[command.status] ?? command.status}</span>
+          명령 #{command.id}: <StatusBadge domain="commandStatus" value={command.status} />
           {command.error_code && ` (사유: ${command.error_code})`}
           {' '}
           <button type="button" onClick={() => pollCommand(command.id)}>상태 새로고침</button>
@@ -714,7 +706,7 @@ function ProductPublishControls({ optionId, platformId }: { optionId: number; pl
     if (!draft) return
     if (
       !window.confirm(
-        `카테고리 코드 '${draft.category_code ?? ''}'에 네이버 ETC(기타 재화) 상품정보제공고시 양식을 ` +
+        `카테고리 코드 '${draft.category_code ?? ''}'에 네이버 기타 재화 상품정보제공고시 양식을 ` +
           '쓰는 것이 맞는지 판매자센터에서 직접 확인했습니까?\n' +
           '이 확인은 시스템이 대신 검증한 것이 아니라 운영자 본인의 확인 기록으로 남습니다.',
       )
@@ -730,7 +722,7 @@ function ProductPublishControls({ optionId, platformId }: { optionId: number; pl
       )
       setDraft(updated)
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'ETC 카테고리 적합성 확인 기록 중 오류가 발생했습니다.')
+      setError(err instanceof ApiError ? err.message : '기타 재화 카테고리 적합성 확인을 기록하지 못했습니다.')
     } finally {
       setIsConfirmingEtcNotice(false)
     }
@@ -785,7 +777,7 @@ function ProductPublishControls({ optionId, platformId }: { optionId: number; pl
       {currentNoticeType === 'ETC' && (
         <div className="hint-text" style={{ marginBottom: 8, padding: 8, border: '1px solid var(--border)', borderRadius: 6 }}>
           <p style={{ margin: '0 0 4px' }}>
-            ! 이 채널은 상품정보제공고시로 <strong>ETC(기타 재화)</strong> 양식을 사용합니다. ETC 입력 형식
+            ! 이 채널은 상품정보제공고시로 <strong>기타 재화</strong> 양식을 사용합니다. 기타 재화 입력 형식
             자체는 이 시스템이 지원하지만, <strong>이 카테고리에 ETC 고시가 실제로 맞는지는 공식 API로 검증할
             방법이 없어</strong> 운영자가 네이버 판매자센터에서 직접 확인해야 합니다. 아래 확인은 그 사실을
             기록할 뿐이며 "공식 적합성 검증 완료"를 의미하지 않습니다 - 카테고리 코드나 고시유형을 바꾸면
@@ -843,7 +835,7 @@ function ProductPublishControls({ optionId, platformId }: { optionId: number; pl
       {error && <p className="form-error">{error}</p>}
       {command && (
         <p>
-          명령 #{command.id}: <span className="status-badge">{SYNC_STATUS_LABELS[command.status] ?? command.status}</span>
+          명령 #{command.id}: <StatusBadge domain="commandStatus" value={command.status} />
           {command.error_code && ` (사유: ${command.error_code})`}
           {' '}
           <button type="button" onClick={() => pollCommand(command.id)}>상태 새로고침</button>
@@ -995,7 +987,7 @@ function OptionSubDetail({
             type="number"
             value={platformId}
             onChange={(e) => setPlatformId(Number(e.target.value))}
-            placeholder="플랫폼 ID"
+            placeholder="플랫폼 번호"
             min={1}
           />
           <input
@@ -1025,7 +1017,7 @@ function OptionSubDetail({
           <table className="data-table nested">
             <thead>
               <tr>
-                <th>ID</th><th>플랫폼ID</th><th>옵션번호</th><th>상품번호</th><th>노출상품명</th><th>판매자상품코드</th><th></th><th>관리</th>
+                <th>번호</th><th>플랫폼 번호</th><th>옵션번호</th><th>상품번호</th><th>노출상품명</th><th>판매자상품코드</th><th></th><th>관리</th>
               </tr>
             </thead>
             <tbody>
@@ -1085,7 +1077,7 @@ function OptionSubDetail({
         <p className="hint-text">
           위 "플랫폼 매핑"은 이미 채널에 등록된 상품을 수동으로 연결하는 기능이고, 아래는 아직
           등록되지 않은 상품을 채널에 실제로 등록 요청하는 기능이다. 대상 플랫폼 ID는 위 매핑 등록
-          폼의 "플랫폼 ID" 입력값을 그대로 사용한다(현재: {platformId}).
+          폼의 "플랫폼 번호" 입력값을 그대로 사용한다(현재: {platformId}).
         </p>
         <ProductPublishControls key={platformId} optionId={option.id} platformId={platformId} />
 
@@ -1104,7 +1096,7 @@ function OptionSubDetail({
         {costError && <p className="form-error">{costError}</p>}
         <div className="table-scroll">
           <table className="data-table nested">
-            <thead><tr><th>ID</th><th>원가</th><th>적용시작</th><th>적용종료</th></tr></thead>
+            <thead><tr><th>번호</th><th>원가</th><th>적용시작</th><th>적용종료</th></tr></thead>
             <tbody>
               {history?.map((h) => (
                 <tr key={h.id}>
@@ -1498,7 +1490,7 @@ function ProductOptionGroupPublishControls({
     if (!draft) return
     if (
       !window.confirm(
-        `카테고리 코드 '${draft.category_code ?? ''}'에 네이버 ETC(기타 재화) 상품정보제공고시 양식을 ` +
+        `카테고리 코드 '${draft.category_code ?? ''}'에 네이버 기타 재화 상품정보제공고시 양식을 ` +
           '쓰는 것이 맞는지 판매자센터에서 직접 확인했습니까?\n' +
           '이 확인은 시스템이 대신 검증한 것이 아니라 운영자 본인의 확인 기록으로 남습니다.',
       )
@@ -1514,7 +1506,7 @@ function ProductOptionGroupPublishControls({
       )
       setDraft(updated)
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'ETC 카테고리 적합성 확인 기록 중 오류가 발생했습니다.')
+      setError(err instanceof ApiError ? err.message : '기타 재화 카테고리 적합성 확인을 기록하지 못했습니다.')
     } finally {
       setIsConfirmingEtcNotice(false)
     }
@@ -1560,7 +1552,7 @@ function ProductOptionGroupPublishControls({
       {currentNoticeType === 'ETC' && (
         <div className="hint-text" style={{ marginBottom: 8, padding: 8, border: '1px solid var(--border)', borderRadius: 6 }}>
           <p style={{ margin: '0 0 4px' }}>
-            ! 이 채널은 상품정보제공고시로 <strong>ETC(기타 재화)</strong> 양식을 사용합니다. ETC 입력 형식
+            ! 이 채널은 상품정보제공고시로 <strong>기타 재화</strong> 양식을 사용합니다. 기타 재화 입력 형식
             자체는 이 시스템이 지원하지만, <strong>이 카테고리에 ETC 고시가 실제로 맞는지는 공식 API로 검증할
             방법이 없어</strong> 운영자가 네이버 판매자센터에서 직접 확인해야 합니다. 아래 확인은 그 사실을
             기록할 뿐이며 "공식 적합성 검증 완료"를 의미하지 않습니다 - 카테고리 코드나 고시유형을 바꾸면
@@ -1665,8 +1657,8 @@ function ProductOptionGroupPublishControls({
 
       {draft?.channel_product_id && (
         <p className="hint-text">
-          접수됨 - 채널 상품ID: {draft.channel_product_id}
-          {draft.channel_option_id && ` / 채널 리스팅ID: ${draft.channel_option_id}`}
+          접수됨 - 채널 상품 번호: {draft.channel_product_id}
+          {draft.channel_option_id && ` / 채널 리스팅 번호: ${draft.channel_option_id}`}
         </p>
       )}
 
@@ -1684,7 +1676,7 @@ function ProductOptionGroupPublishControls({
           </p>
           {registrationStatus.items.map((item) => (
             <p key={item.product_option_id} className="hint-text" style={{ margin: '2px 0' }}>
-              SKU(옵션ID {item.product_option_id}, 코드 {item.seller_product_code ?? '-'}):{' '}
+              SKU(옵션 번호 {item.product_option_id}, 코드 {item.seller_product_code ?? '-'}):{' '}
               {item.mapped ? (
                 <span style={{ fontWeight: 600 }}>✓ 매핑 완료(식별자 {item.channel_option_id})</span>
               ) : item.ambiguous ? (
@@ -1711,7 +1703,7 @@ function ProductOptionGroupPublishControls({
 
       {command && (
         <p>
-          명령 #{command.id}: <span className="status-badge">{SYNC_STATUS_LABELS[command.status] ?? command.status}</span>
+          명령 #{command.id}: <StatusBadge domain="commandStatus" value={command.status} />
           {command.error_code && ` (사유: ${command.error_code})`}
           {' '}
           <button type="button" onClick={() => pollCommand(command.id)}>상태 새로고침</button>

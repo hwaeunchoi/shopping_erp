@@ -4,6 +4,7 @@ import { useAuth } from '../auth/AuthContext'
 import { api, ApiError } from '../api/client'
 import { downloadBlob } from '../api/download'
 import { useApiData } from '../api/useApiData'
+import { label, toneOf, type LabelDomain } from '../labels'
 import type {
   BulkResult,
   OrderAlerts,
@@ -15,7 +16,7 @@ import type {
 } from '../api/types'
 
 const CS_FILTER: [string, string][] = [
-  ['', 'CS 전체'],
+  ['', '문의 전체'],
   ['NONE', '정상'],
   ['EXCHANGE', '교환'],
   ['RETURN', '반품'],
@@ -30,21 +31,6 @@ const SHIPPING_STATUS: [string, string][] = [
   ['DELIVERED', '배송완료'],
 ]
 
-const PAY_LABEL: Record<string, [string, string]> = {
-  PAID: ['결제완료', 'spill-ok'],
-  UNPAID: ['미결제', 'spill-warn'],
-}
-const SHIP_LABEL: Record<string, [string, string]> = {
-  UNSHIPPED: ['미발송', 'spill-warn'],
-  SHIPPING: ['배송중', 'spill-info'],
-  DELIVERED: ['배송완료', 'spill-muted'],
-}
-const CS_LABEL: Record<string, [string, string]> = {
-  NONE: ['', ''],
-  EXCHANGE: ['교환', 'spill-info'],
-  RETURN: ['반품', 'spill-danger'],
-  CANCEL: ['취소', 'spill-danger'],
-}
 
 function todayIso(offset = 0): string {
   const d = new Date()
@@ -55,6 +41,12 @@ function todayIso(offset = 0): string {
 function Spill({ text, cls }: { text: string; cls: string }) {
   if (!text) return null
   return <span className={`spill ${cls}`}>{text}</span>
+}
+
+// 상태 값을 공통 한국어 문구와 기호 배지로 보여 준다(내부 코드는 노출하지 않는다).
+function Chip({ domain, value, prefix = '' }: { domain: LabelDomain; value: string | null | undefined; prefix?: string }) {
+  if (!value) return null
+  return <Spill text={prefix + label(domain, value)} cls={`spill-${toneOf(domain, value)}`} />
 }
 
 function DetailPanel({ orderId, onClose, onChanged }: { orderId: number; onClose: () => void; onChanged: () => void }) {
@@ -117,10 +109,10 @@ function DetailPanel({ orderId, onClose, onChanged }: { orderId: number; onClose
           <>
             <div className="sec-title">상태</div>
             <div>
-              <Spill text={`주문 · ${data.order_status}`} cls="spill-muted" />
-              <Spill text={PAY_LABEL[data.payment_status]?.[0] ?? data.payment_status} cls={PAY_LABEL[data.payment_status]?.[1] ?? 'spill-muted'} />
-              <Spill text={SHIP_LABEL[data.shipping_status]?.[0] ?? data.shipping_status} cls={SHIP_LABEL[data.shipping_status]?.[1] ?? 'spill-muted'} />
-              {data.cs_status !== 'NONE' && <Spill text={`CS · ${CS_LABEL[data.cs_status]?.[0]}`} cls={CS_LABEL[data.cs_status]?.[1] ?? 'spill-muted'} />}
+              <Chip domain="orderStatus" value={data.order_status} prefix="주문 · " />
+              <Chip domain="paymentStatus" value={data.payment_status} />
+              <Chip domain="shippingStatus" value={data.shipping_status} />
+              {data.cs_status !== 'NONE' && <Chip domain="orderClaim" value={data.cs_status} prefix="문의 · " />}
             </div>
             <div className="sec-title">주문 / 금액</div>
             <dl className="kv">
@@ -174,7 +166,7 @@ function DetailPanel({ orderId, onClose, onChanged }: { orderId: number; onClose
                   <span>발주 #{po.purchase_order_id} · {po.supplier_name ?? '-'}</span>
                   <span className="sub">{po.order_date ? new Date(po.order_date).toLocaleDateString() : '작성중'}</span>
                 </div>
-                <Spill text={po.status} cls={po.status === 'RECEIVED' ? 'spill-ok' : 'spill-info'} />
+                <Chip domain="purchaseOrderStatus" value={po.status} />
               </div>
             ))}
             {data.purchase_links.length > 0 && (
@@ -222,7 +214,7 @@ function DetailPanel({ orderId, onClose, onChanged }: { orderId: number; onClose
         )}
         {tab === 'cs' && (
           <>
-            <div className="sec-title">CS 이력</div>
+            <div className="sec-title">문의 이력</div>
             {data.cs_history.length === 0 && <p className="sub">접수된 교환·반품·취소가 없습니다.</p>}
             {data.cs_history.map((cs) => (
               <div className="panel-item" key={`${cs.type}-${cs.id}`}>
@@ -230,10 +222,10 @@ function DetailPanel({ orderId, onClose, onChanged }: { orderId: number; onClose
                   <span>{cs.type === 'EXCHANGE' ? '교환' : cs.type === 'RETURN' ? '반품' : '취소'} · {cs.reason ?? '-'}</span>
                   <span className="sub">{new Date(cs.requested_at).toLocaleString()}</span>
                 </div>
-                <Spill text={cs.status} cls="spill-muted" />
+                <Chip domain="claimStatus" value={cs.status} />
               </div>
             ))}
-            <div className="sec-title">CS 접수</div>
+            <div className="sec-title">문의 접수</div>
             <div className="inline-form">
               <button type="button" onClick={() => createCs('EXCHANGE')}>교환</button>
               <button type="button" onClick={() => createCs('RETURN')}>반품</button>
@@ -271,7 +263,7 @@ function DetailPanel({ orderId, onClose, onChanged }: { orderId: number; onClose
             {data.status_history.map((h, i) => (
               <div className="tl-item" key={i}>
                 <div className="tl-dot" />
-                <div><div>{h.from_status ?? '(신규)'} → {h.to_status}</div><div className="t">{new Date(h.changed_at).toLocaleString()}</div></div>
+                <div><div>{h.from_status ? label('orderStatus', h.from_status) : '(신규)'} → {label('orderStatus', h.to_status)}</div><div className="t">{new Date(h.changed_at).toLocaleString()}</div></div>
               </div>
             ))}
           </>
@@ -435,17 +427,17 @@ export function OrdersPage() {
           </select>
           <span className="flabel">주문상태</span>
           <select value={status} onChange={(e) => { setPage(1); setStatus(e.target.value) }}>
-            {ORDER_STATUS.map((s) => <option key={s || 'all'} value={s}>{s || '전체'}</option>)}
+            {ORDER_STATUS.map((s) => <option key={s || 'all'} value={s}>{s ? label('orderStatus', s) : '전체'}</option>)}
           </select>
           <span className="flabel">배송상태</span>
           <select value={shippingStatus} onChange={(e) => { setPage(1); setShippingStatus(e.target.value) }}>
             {SHIPPING_STATUS.map(([v, l]) => <option key={v || 'all'} value={v}>{l}</option>)}
           </select>
-          <span className="flabel">CS상태</span>
+          <span className="flabel">문의 상태</span>
           <select value={csStatus} onChange={(e) => { setPage(1); setCsStatus(e.target.value) }}>
             {CS_FILTER.map(([v, l]) => <option key={v || 'all'} value={v}>{l}</option>)}
           </select>
-          <span className="flabel">SKU</span>
+          <span className="flabel">상품 코드(SKU)</span>
           <input value={sku} onChange={(e) => { setPage(1); setSku(e.target.value) }} placeholder="SKU" style={{ width: 110 }} />
           <label style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 4 }}>
             <input type="checkbox" checked={mineOnly} onChange={(e) => { setPage(1); setMineOnly(e.target.checked) }} /> 내 담당만
@@ -509,10 +501,10 @@ export function OrdersPage() {
                       <span className="sub">{r.platform_name}</span>
                     </td>
                     <td>
-                      <Spill text={r.order_status} cls="spill-muted" />
-                      <Spill text={PAY_LABEL[r.payment_status]?.[0] ?? ''} cls={PAY_LABEL[r.payment_status]?.[1] ?? 'spill-muted'} />
-                      <Spill text={SHIP_LABEL[r.shipping_status]?.[0] ?? ''} cls={SHIP_LABEL[r.shipping_status]?.[1] ?? 'spill-muted'} />
-                      {r.cs_status !== 'NONE' && <Spill text={CS_LABEL[r.cs_status]?.[0] ?? ''} cls={CS_LABEL[r.cs_status]?.[1] ?? 'spill-muted'} />}
+                      <Chip domain="orderStatus" value={r.order_status} />
+                      <Chip domain="paymentStatus" value={r.payment_status} />
+                      <Chip domain="shippingStatus" value={r.shipping_status} />
+                      {r.cs_status !== 'NONE' && <Chip domain="orderClaim" value={r.cs_status} />}
                       {r.is_delayed && <Spill text="지연" cls="spill-danger" />}
                     </td>
                     <td>{r.customer_name ?? '-'}</td>

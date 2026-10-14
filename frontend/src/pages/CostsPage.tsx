@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from 'react'
 import { api, ApiError } from '../api/client'
 import { useApiData } from '../api/useApiData'
+import { label } from '../labels'
 import type { Cost, CostCreate } from '../api/types'
 
 const CATEGORIES = ['SHIPPING', 'PACKAGING', 'PLATFORM_FEE', 'AD_AGENCY_FEE', 'RETURN_SHIPPING', 'ETC']
@@ -44,10 +45,10 @@ export function CostsPage() {
 
       <form className="inline-form" onSubmit={handleCreate}>
         <select value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })}>
-          {CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
+          {CATEGORIES.map((c) => <option key={c} value={c}>{label('costCategory', c)}</option>)}
         </select>
         <select value={form.cost_type} onChange={(e) => setForm({ ...form, cost_type: e.target.value })}>
-          {COST_TYPES.map((c) => <option key={c} value={c}>{c}</option>)}
+          {COST_TYPES.map((c) => <option key={c} value={c}>{label('costType', c)}</option>)}
         </select>
         <input
           type="number" value={form.amount} min={0}
@@ -69,7 +70,7 @@ export function CostsPage() {
       <div className="filter-bar">
         <button type="button" className={category === '' ? 'active' : ''} onClick={() => setCategory('')}>전체</button>
         {CATEGORIES.map((c) => (
-          <button key={c} type="button" className={category === c ? 'active' : ''} onClick={() => setCategory(c)}>{c}</button>
+          <button key={c} type="button" className={category === c ? 'active' : ''} onClick={() => setCategory(c)}>{label('costCategory', c)}</button>
         ))}
       </div>
 
@@ -79,7 +80,7 @@ export function CostsPage() {
         <table className="data-table">
           <thead>
             <tr>
-              <th>ID</th>
+              <th>번호</th>
               <th>카테고리</th>
               <th>유형</th>
               <th>금액</th>
@@ -91,8 +92,8 @@ export function CostsPage() {
             {data.map((c) => (
               <tr key={c.id}>
                 <td>{c.id}</td>
-                <td>{c.category}</td>
-                <td>{c.cost_type}</td>
+                <td>{label('costCategory', c.category)}</td>
+                <td>{label('costType', c.cost_type)}</td>
                 <td>{c.amount.toLocaleString()}</td>
                 <td>{c.incurred_date}</td>
                 <td>{c.memo ?? '-'}</td>

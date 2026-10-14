@@ -2,6 +2,7 @@ import { useState, type FormEvent } from 'react'
 import { api, ApiError } from '../api/client'
 import { downloadBlob } from '../api/download'
 import { useApiData } from '../api/useApiData'
+import { label } from '../labels'
 import type { MonthlyReport, ReportSchedule, ReportScheduleCreate } from '../api/types'
 
 // SRS 3.7 종합 보고서: 월별 경영보고서 조회/다운로드 + 예약 보고서 관리.
@@ -120,7 +121,7 @@ function MonthlyReportTab() {
 
           <h3>베스트 상품 Top 5</h3>
           <table className="data-table">
-            <thead><tr><th>상품옵션ID</th><th>판매수량</th><th>매출</th><th>순이익</th><th>ROAS</th></tr></thead>
+            <thead><tr><th>상품옵션 번호</th><th>판매수량</th><th>매출</th><th>순이익</th><th>ROAS</th></tr></thead>
             <tbody>
               {data.best_products.map((p) => (
                 <tr key={p.product_option_id}>
@@ -137,7 +138,7 @@ function MonthlyReportTab() {
 
           <h3>워스트 상품 Top 5</h3>
           <table className="data-table">
-            <thead><tr><th>상품옵션ID</th><th>판매수량</th><th>매출</th><th>순이익</th><th>ROAS</th></tr></thead>
+            <thead><tr><th>상품옵션 번호</th><th>판매수량</th><th>매출</th><th>순이익</th><th>ROAS</th></tr></thead>
             <tbody>
               {data.worst_products.map((p) => (
                 <tr key={p.product_option_id} className={p.net_profit < 0 ? 'row-warning' : ''}>
@@ -242,13 +243,14 @@ function ReportSchedulesTab() {
         <input
           value={form.report_type}
           onChange={(e) => setForm({ ...form, report_type: e.target.value })}
-          placeholder="보고서 유형 (예: PROFIT_REPORT)"
+          placeholder="보고서 종류 코드(예: PROFIT_REPORT)"
+          aria-label="보고서 종류 코드"
         />
         <select value={form.frequency} onChange={(e) => setForm({ ...form, frequency: e.target.value })}>
-          {FREQUENCY_OPTIONS.map((f) => <option key={f} value={f}>{f}</option>)}
+          {FREQUENCY_OPTIONS.map((f) => <option key={f} value={f}>{label('reportFrequency', f)}</option>)}
         </select>
         <select value={form.output_format} onChange={(e) => setForm({ ...form, output_format: e.target.value })}>
-          {OUTPUT_FORMAT_OPTIONS.map((f) => <option key={f} value={f}>{f}</option>)}
+          {OUTPUT_FORMAT_OPTIONS.map((f) => <option key={f} value={f}>{label('reportFormat', f)}</option>)}
         </select>
         <input
           type="datetime-local"
@@ -263,7 +265,7 @@ function ReportSchedulesTab() {
         <button type="submit">예약 등록</button>
       </form>
       {createError && <p className="form-error">{createError}</p>}
-      <p className="form-info">frequency=MONTHLY인 예약만 스케줄러가 자동 생성합니다(직전 달 보고서, reports/generated에 저장).</p>
+      <p className="form-info">주기가 "매월"인 예약만 스케줄러가 자동 생성합니다(직전 달 보고서, reports/generated에 저장).</p>
 
       {isLoading && <p>불러오는 중...</p>}
       {error && <p className="form-error">{error}</p>}
@@ -276,11 +278,11 @@ function ReportSchedulesTab() {
             {data.map((s) => (
               <tr key={s.id}>
                 <td>{s.report_type}</td>
-                <td>{s.frequency}</td>
-                <td>{s.output_format}</td>
+                <td>{label('reportFrequency', s.frequency)}</td>
+                <td>{label('reportFormat', s.output_format)}</td>
                 <td>{new Date(s.next_run_at).toLocaleString()}</td>
                 <td>{s.last_run_at ? new Date(s.last_run_at).toLocaleString() : '-'}</td>
-                <td><span className="status-badge">{s.is_enabled ? 'ON' : 'OFF'}</span></td>
+                <td><span className="status-badge">{s.is_enabled ? '사용 중' : '사용 안 함'}</span></td>
                 <td>
                   <button type="button" onClick={() => handleToggle(s)}>{s.is_enabled ? '비활성화' : '활성화'}</button>{' '}
                   <button type="button" onClick={() => handleDelete(s.id)}>삭제</button>

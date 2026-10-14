@@ -27,7 +27,7 @@ export function CustomersPage() {
         <table className="data-table">
           <thead>
             <tr>
-              <th>ID</th>
+              <th>번호</th>
               <th>이름</th>
               <th>연락처</th>
               <th>등급</th>

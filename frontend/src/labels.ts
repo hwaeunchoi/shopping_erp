@@ -297,3 +297,13 @@ export function friendlyHttpError(status: number | undefined): string {
   if (status !== undefined && status >= 500) return '서버에서 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.'
   return '요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.'
 }
+
+/**
+ * 채널(쇼핑몰)이 보낸 주문 상태 문자열. 내부 주문 상태와 같은 값이면 한국어로 바꾸고,
+ * 채널 고유 값이면 원문을 그대로 보여 준다(운영자가 채널 화면과 대조해야 하므로 숨기지 않는다).
+ */
+export function channelStatusText(value: string | null | undefined): string {
+  if (!value) return '-'
+  const known = (LABELS.orderStatus as Record<string, Entry>)[value]
+  return known ? known.label : value
+}

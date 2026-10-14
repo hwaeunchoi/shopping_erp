@@ -52,7 +52,7 @@ export function AdsPage() {
         <table className="data-table">
           <thead>
             <tr>
-              <th>ID</th>
+              <th>번호</th>
               <th>광고 플랫폼</th>
               <th>캠페인명</th>
               <th>연결 SKU</th>

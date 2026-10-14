@@ -1,15 +1,10 @@
 import { Fragment, useState, type FormEvent } from 'react'
 import { api, ApiError } from '../api/client'
 import { useApiData } from '../api/useApiData'
+import { label } from '../labels'
+import { StatusBadge } from '../components/StatusBadge'
 import type { PurchaseOrder, Supplier } from '../api/types'
 
-const STATUS_LABEL: Record<PurchaseOrder['status'], string> = {
-  DRAFT: '작성중',
-  ORDERED: '발주완료',
-  PARTIALLY_RECEIVED: '부분입고',
-  RECEIVED: '입고완료',
-  CANCELLED: '취소됨',
-}
 
 function PurchaseOrderRowDetail({
   po,
@@ -98,7 +93,7 @@ function PurchaseOrderRowDetail({
         <table className="data-table nested">
           <thead>
             <tr>
-              <th>상품옵션 ID</th><th>수량</th><th>단가</th><th>입고수량</th><th>입고 처리</th>
+              <th>상품옵션 번호</th><th>수량</th><th>단가</th><th>입고수량</th><th>입고 처리</th>
             </tr>
           </thead>
           <tbody>
@@ -125,7 +120,7 @@ function PurchaseOrderRowDetail({
                       />
                       <input
                         type="number"
-                        placeholder="창고 ID"
+                        placeholder="창고 번호"
                         value={receiveInputs[item.id]?.warehouseId ?? ''}
                         onChange={(e) =>
                           setReceiveInputs((prev) => ({
@@ -151,7 +146,7 @@ function PurchaseOrderRowDetail({
           <form className="inline-form" onSubmit={handleAddItem}>
             <input
               type="number"
-              placeholder="상품옵션 ID"
+              placeholder="상품옵션 번호"
               value={optionId}
               onChange={(e) => setOptionId(e.target.value)}
               style={{ width: '8rem' }}
@@ -228,7 +223,7 @@ export function PurchaseOrdersPage() {
             className={statusFilter === s ? 'active' : ''}
             onClick={() => setStatusFilter(s)}
           >
-            {STATUS_LABEL[s]}
+            {label('purchaseOrderStatus', s)}
           </button>
         ))}
       </div>
@@ -251,7 +246,7 @@ export function PurchaseOrdersPage() {
         <table className="data-table">
           <thead>
             <tr>
-              <th>ID</th>
+              <th>번호</th>
               <th>공급처</th>
               <th>상태</th>
               <th>발주일</th>
@@ -265,7 +260,7 @@ export function PurchaseOrdersPage() {
                 <tr>
                   <td>{po.id}</td>
                   <td>{suppliers?.find((s) => s.id === po.supplier_id)?.name ?? po.supplier_id}</td>
-                  <td>{STATUS_LABEL[po.status]}</td>
+                  <td><StatusBadge domain="purchaseOrderStatus" value={po.status} /></td>
                   <td>{po.order_date ? new Date(po.order_date).toLocaleString() : '-'}</td>
                   <td>{po.memo ?? '-'}</td>
                   <td>

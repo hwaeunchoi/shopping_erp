@@ -183,7 +183,7 @@ export function ProductsPage() {
         <table className="data-table">
           <thead>
             <tr>
-              <th>ID</th>
+              <th>번호</th>
               <th>상품명</th>
               <th>카테고리</th>
               <th>브랜드</th>

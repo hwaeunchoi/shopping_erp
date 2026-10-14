@@ -2,6 +2,8 @@
 // 공용 fetch 래퍼. JWT 토큰을 localStorage에서 읽어 Authorization 헤더에 붙이고,
 // 401 응답 시 토큰을 지우고 로그인 화면으로 보낸다.
 
+import { friendlyHttpError } from '../labels'
+
 const TOKEN_KEY = 'erp_access_token'
 
 export function getToken(): string | null {
@@ -24,6 +26,13 @@ export class ApiError extends Error {
   }
 }
 
+// 서버가 한국어로 보낸 업무 안내 문구는 그대로 쓰고, 영어·개발자용 문구나 검증 오류 배열은
+// 상태 코드에 맞는 안전한 한국어 문구로 바꾼다(내부 오류 내용이 화면에 그대로 나오지 않도록).
+function toUserMessage(status: number, detail: unknown): string {
+  if (typeof detail === 'string' && /[가-힣]/.test(detail)) return detail
+  return friendlyHttpError(status)
+}
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = getToken()
   const headers = new Headers(options.headers)
@@ -41,14 +50,14 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   }
 
   if (!response.ok) {
-    let detail = response.statusText
+    let detail: unknown = response.statusText
     try {
       const data = await response.json()
       detail = data.detail ?? detail
     } catch {
       // 응답 바디가 JSON이 아닌 경우 statusText를 그대로 사용한다.
     }
-    throw new ApiError(response.status, detail)
+    throw new ApiError(response.status, toUserMessage(response.status, detail))
   }
 
   if (response.status === 204) {
@@ -68,7 +77,7 @@ async function requestBlob(path: string): Promise<Blob> {
     clearToken()
   }
   if (!response.ok) {
-    throw new ApiError(response.status, response.statusText)
+    throw new ApiError(response.status, friendlyHttpError(response.status))
   }
   return response.blob()
 }

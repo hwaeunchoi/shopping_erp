@@ -2,6 +2,7 @@ import { useState, type FormEvent } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { api, ApiError } from '../api/client'
 import { useApiData } from '../api/useApiData'
+import { label } from '../labels'
 import { useRecentView } from '../api/useRecentView'
 import type { OrderDetail, OrderMemo } from '../api/types'
 
@@ -47,7 +48,7 @@ export function OrderDetailPage() {
         <>
           <dl className="detail-grid">
             <dt>주문번호</dt><dd>{data.platform_order_no}</dd>
-            <dt>상태</dt><dd>{data.status}</dd>
+            <dt>상태</dt><dd>{label('orderStatus', data.status)}</dd>
             <dt>주문일시</dt><dd>{new Date(data.order_date).toLocaleString()}</dd>
             <dt>구매자명</dt><dd>{data.customer_name ?? '-'}</dd>
             <dt>구매자 연락처</dt><dd>{data.customer_phone ?? '-'}</dd>

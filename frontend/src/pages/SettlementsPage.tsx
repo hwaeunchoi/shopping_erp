@@ -1,6 +1,7 @@
 import { Fragment, useState } from 'react'
 import { api } from '../api/client'
 import { useApiData } from '../api/useApiData'
+import { StatusBadge } from '../components/StatusBadge'
 import type { Settlement, SettlementDetail, SettlementDiscrepancy } from '../api/types'
 
 const DISCREPANCY_REASON_LABELS: Record<string, string> = {
@@ -24,10 +25,10 @@ function DiscrepanciesSection() {
         <table className="data-table">
           <thead>
             <tr>
-              <th>ID</th>
-              <th>플랫폼ID</th>
-              <th>정산ID</th>
-              <th>주문ID</th>
+              <th>번호</th>
+              <th>플랫폼 번호</th>
+              <th>정산 번호</th>
+              <th>주문 번호</th>
               <th>사유</th>
               <th>예상금액</th>
               <th>실제금액</th>
@@ -96,8 +97,8 @@ export function SettlementsPage() {
         <table className="data-table">
           <thead>
             <tr>
-              <th>ID</th>
-              <th>플랫폼ID</th>
+              <th>번호</th>
+              <th>플랫폼 번호</th>
               <th>정산회차</th>
               <th>회차유형</th>
               <th>상태</th>
@@ -115,7 +116,7 @@ export function SettlementsPage() {
                   <td>{s.platform_id}</td>
                   <td>{s.settlement_cycle}</td>
                   <td>{s.settlement_type ?? '-'}</td>
-                  <td>{s.status}</td>
+                  <td><StatusBadge domain="settlementStatus" value={s.status} /></td>
                   <td>{s.expected_amount.toLocaleString()}</td>
                   <td>{s.settled_amount.toLocaleString()}</td>
                   <td>{s.unsettled_amount.toLocaleString()}</td>

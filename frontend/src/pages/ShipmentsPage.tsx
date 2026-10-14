@@ -1,6 +1,8 @@
 import { useState, type FormEvent } from 'react'
 import { api, ApiError } from '../api/client'
 import { useApiData } from '../api/useApiData'
+import { label } from '../labels'
+import { StatusBadge } from '../components/StatusBadge'
 import { Pagination } from '../components/Pagination'
 import { SHIPMENT_STATUSES } from '../api/types'
 import type { PaginatedResponse, Shipment } from '../api/types'
@@ -152,7 +154,7 @@ export function ShipmentsPage() {
           type="number"
           value={orderId}
           onChange={(e) => setOrderId(e.target.value)}
-          placeholder="주문 ID"
+          placeholder="주문 번호"
           min={1}
         />
         <input value={carrier} onChange={(e) => setCarrier(e.target.value)} placeholder="운송사" />
@@ -180,7 +182,7 @@ export function ShipmentsPage() {
               setPage(1)
             }}
           >
-            {s || '전체'}
+            {s ? label('shipmentStatus', s) : '전체'}
           </button>
         ))}
       </div>
@@ -193,8 +195,8 @@ export function ShipmentsPage() {
           <table className="data-table">
             <thead>
               <tr>
-                <th>ID</th>
-                <th>주문ID</th>
+                <th>번호</th>
+                <th>주문 번호</th>
                 <th>운송사</th>
                 <th>송장번호</th>
                 <th>상태</th>
@@ -213,7 +215,7 @@ export function ShipmentsPage() {
                     <td>{s.order_id}</td>
                     <td>{s.carrier ?? '-'}</td>
                     <td>{s.tracking_no ?? '-'}</td>
-                    <td><span className="status-badge">{s.status}</span></td>
+                    <td><StatusBadge domain="shipmentStatus" value={s.status} /></td>
                     <td>{s.shipped_at ? new Date(s.shipped_at).toLocaleString() : '-'}</td>
                     <td>{s.delivered_at ? new Date(s.delivered_at).toLocaleString() : '-'}</td>
                     <td>
@@ -226,7 +228,7 @@ export function ShipmentsPage() {
                         >
                           <option value="">상태 선택</option>
                           {SHIPMENT_STATUSES.map((st) => (
-                            <option key={st} value={st}>{st}</option>
+                            <option key={st} value={st}>{label('shipmentStatus', st)}</option>
                           ))}
                         </select>
                         <input
@@ -235,7 +237,7 @@ export function ShipmentsPage() {
                           onChange={(e) =>
                             setStatusDrafts({ ...statusDrafts, [s.id]: { ...draft, warehouseId: e.target.value } })
                           }
-                          placeholder="창고ID"
+                          placeholder="창고 번호"
                           min={1}
                           style={{ width: 70 }}
                         />

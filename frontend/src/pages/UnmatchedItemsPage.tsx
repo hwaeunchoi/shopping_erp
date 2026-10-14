@@ -30,7 +30,7 @@ export function UnmatchedItemsPage() {
     <div>
       <h2>미매칭 상품</h2>
       <p>
-        자동매칭(플랫폼옵션번호/플랫폼상품번호/판매자상품코드, 실제 고유ID 기준)에 모두 실패한
+        자동매칭(플랫폼옵션번호/플랫폼상품번호/판매자상품코드, 실제 고유 번호 기준)에 모두 실패한
         주문상품 목록입니다. 상품명/옵션명 유사도는 오탐 위험이 커 자동매칭에 쓰지 않습니다 -
         상품 화면에서 옵션 ID를 확인한 뒤 아래에서 직접 연결하세요.
       </p>
@@ -41,8 +41,8 @@ export function UnmatchedItemsPage() {
         <table className="data-table">
           <thead>
             <tr>
-              <th>ID</th>
-              <th>플랫폼ID</th>
+              <th>번호</th>
+              <th>플랫폼 번호</th>
               <th>주문번호</th>
               <th>플랫폼옵션번호</th>
               <th>상품명</th>
@@ -50,7 +50,7 @@ export function UnmatchedItemsPage() {
               <th>판매자상품코드</th>
               <th>수량</th>
               <th>단가</th>
-              <th>연결할 옵션 ID</th>
+              <th>연결할 옵션 번호</th>
               <th></th>
             </tr>
           </thead>

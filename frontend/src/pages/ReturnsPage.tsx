@@ -3,6 +3,8 @@ import { useSearchParams } from 'react-router-dom'
 import { api, ApiError } from '../api/client'
 import { downloadBlob } from '../api/download'
 import { useApiData } from '../api/useApiData'
+import { label } from '../labels'
+import { StatusBadge } from '../components/StatusBadge'
 import { Pagination } from '../components/Pagination'
 import { RETURN_STATUSES } from '../api/types'
 import type { PaginatedResponse, Return } from '../api/types'
@@ -109,12 +111,12 @@ export function ReturnsPage() {
       <h2>반품</h2>
 
       <form className="inline-form" onSubmit={handleCreate}>
-        <input type="number" value={orderId} onChange={(e) => setOrderId(e.target.value)} placeholder="주문 ID" min={1} />
+        <input type="number" value={orderId} onChange={(e) => setOrderId(e.target.value)} placeholder="주문 번호" min={1} />
         <input
           type="number"
           value={orderItemId}
           onChange={(e) => setOrderItemId(e.target.value)}
-          placeholder="주문상품 ID(선택)"
+          placeholder="주문상품 번호(선택)"
           min={1}
         />
         <input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="반품 사유" />
@@ -141,7 +143,7 @@ export function ReturnsPage() {
             className={status === s ? 'active' : ''}
             onClick={() => { setStatus(s); setPage(1) }}
           >
-            {s || '전체'}
+            {s ? label('claimStatus', s) : '전체'}
           </button>
         ))}
         <button type="button" onClick={handleExport} disabled={isExporting}>
@@ -158,12 +160,12 @@ export function ReturnsPage() {
           <table className="data-table">
             <thead>
               <tr>
-                <th>ID</th>
-                <th>주문ID</th>
+                <th>번호</th>
+                <th>주문 번호</th>
                 <th>사유</th>
                 <th>환불금액</th>
                 <th>상태</th>
-                <th>채널 클레임ID</th>
+                <th>채널 클레임 번호</th>
                 <th>채널 원본상태</th>
                 <th>귀책</th>
                 <th>신청일시</th>
@@ -179,7 +181,7 @@ export function ReturnsPage() {
                     <td>{r.order_id}</td>
                     <td>{r.reason ?? '-'}</td>
                     <td>{r.refund_amount != null ? r.refund_amount.toLocaleString() : '-'}</td>
-                    <td><span className="status-badge">{r.status}</span></td>
+                    <td><StatusBadge domain="claimStatus" value={r.status} /></td>
                     <td>{r.platform_claim_id ?? '-'}</td>
                     <td>{r.raw_status ?? '-'}</td>
                     <td>{r.fault_type ?? '-'}</td>
@@ -194,7 +196,7 @@ export function ReturnsPage() {
                         >
                           <option value="">상태 선택</option>
                           {RETURN_STATUSES.map((st) => (
-                            <option key={st} value={st}>{st}</option>
+                            <option key={st} value={st}>{label('claimStatus', st)}</option>
                           ))}
                         </select>
                         <input
@@ -203,7 +205,7 @@ export function ReturnsPage() {
                           onChange={(e) =>
                             setStatusDrafts({ ...statusDrafts, [r.id]: { ...draft, warehouseId: e.target.value } })
                           }
-                          placeholder="창고ID"
+                          placeholder="창고 번호"
                           min={1}
                           style={{ width: 70 }}
                         />

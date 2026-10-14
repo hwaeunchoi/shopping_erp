@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { api, ApiError } from '../api/client'
 import { useApiData } from '../api/useApiData'
+import { label } from '../labels'
 import type {
   ApiCredentialMasked,
   ApiCredentialUpsert,
@@ -160,7 +161,7 @@ function UsersTab() {
       {data && (
         <table className="data-table">
           <thead>
-            <tr><th>ID</th><th>아이디</th><th>이름</th><th>역할</th><th>상태</th><th></th></tr>
+            <tr><th>번호</th><th>아이디</th><th>이름</th><th>역할</th><th>상태</th><th></th></tr>
           </thead>
           <tbody>
             {data.map((u) => (
@@ -224,7 +225,7 @@ function RolesTab() {
       {error && <p className="form-error">{error}</p>}
       {data && (
         <table className="data-table">
-          <thead><tr><th>ID</th><th>이름</th><th>설명</th></tr></thead>
+          <thead><tr><th>번호</th><th>이름</th><th>설명</th></tr></thead>
           <tbody>
             {data.map((r) => (
               <tr key={r.id}><td>{r.id}</td><td>{r.name}</td><td>{r.description ?? '-'}</td></tr>
@@ -357,7 +358,7 @@ function CredentialsTab() {
       setForm({ key_name: form.key_name, plain_value: '' })
       reload()
     } catch (err) {
-      setFormError(err instanceof ApiError ? err.message : 'API Credential 저장 중 오류가 발생했습니다.')
+      setFormError(err instanceof ApiError ? err.message : '채널 인증 정보를 저장하지 못했습니다.')
     }
   }
 
@@ -376,7 +377,7 @@ function CredentialsTab() {
         그 플랫폼의 커넥터가 요구하는 키 목록이 나타납니다. 필수 연결정보가 모두 등록되어야 실제 API를 호출할 수
         있습니다. 누락된 정보가 있으면 동기화를 시작하지 않고 연결정보 오류를 반환합니다.
       </p>
-      <p className="hint-text">쿠팡 Open API 호출 IP 허용등록이 별도로 필요합니다.</p>
+      <p className="hint-text">쿠팡 API를 호출하는 서버 IP를 쿠팡에 별도로 등록해야 합니다.</p>
       <form className="inline-form" onSubmit={handleSave}>
         <select value={ownerId} onChange={(e) => setOwnerId(Number(e.target.value))}>
           <option value={0}>플랫폼 선택</option>
@@ -432,7 +433,7 @@ function CredentialsTab() {
                 <td><button type="button" onClick={() => handleDelete(c.id)}>삭제</button></td>
               </tr>
             ))}
-            {data.length === 0 && <tr><td colSpan={4}>등록된 API Credential이 없습니다.</td></tr>}
+            {data.length === 0 && <tr><td colSpan={4}>등록된 채널 인증 정보가 없습니다.</td></tr>}
           </tbody>
         </table>
       )}
@@ -465,9 +466,9 @@ function SystemSettingsTab() {
     <div>
       <form className="inline-form" onSubmit={handleSave}>
         <select value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })}>
-          <option value="BACKUP">BACKUP</option>
-          <option value="REPORT">REPORT</option>
-          <option value="SYSTEM">SYSTEM</option>
+          <option value="BACKUP">{label('settingCategory', 'BACKUP')}</option>
+          <option value="REPORT">{label('settingCategory', 'REPORT')}</option>
+          <option value="SYSTEM">{label('settingCategory', 'SYSTEM')}</option>
         </select>
         <input value={form.key} onChange={(e) => setForm({ ...form, key: e.target.value })} placeholder="키" />
         <input value={form.value} onChange={(e) => setForm({ ...form, value: e.target.value })} placeholder="값" />
@@ -501,7 +502,7 @@ export function SettingsPage() {
     { key: 'users', label: '사용자 관리' },
     { key: 'roles', label: '역할 관리' },
     { key: 'permissions', label: '권한 관리' },
-    { key: 'credentials', label: 'API Credential 관리' },
+    { key: 'credentials', label: '채널 인증 정보 관리' },
     { key: 'channels', label: '채널 연동 현황' },
     { key: 'system', label: '시스템 설정' },
   ]

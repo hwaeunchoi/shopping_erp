@@ -1,6 +1,7 @@
 import { Fragment, useState, type FormEvent } from 'react'
 import { api, ApiError } from '../api/client'
 import { useApiData } from '../api/useApiData'
+import { label } from '../labels'
 import type { InventoryItem, InventoryTransaction } from '../api/types'
 
 function InventoryRowDetail({ inv, onSaved }: { inv: InventoryItem; onSaved: () => void }) {
@@ -98,9 +99,9 @@ function InventoryRowDetail({ inv, onSaved }: { inv: InventoryItem; onSaved: () 
             {transactions?.map((t) => (
               <tr key={t.id}>
                 <td>{new Date(t.created_at).toLocaleString()}</td>
-                <td>{t.type}</td>
+                <td>{label('inventoryTransaction', t.type)}</td>
                 <td>{t.quantity > 0 ? `+${t.quantity}` : t.quantity}</td>
-                <td>{t.reference_type ? `${t.reference_type}${t.reference_id ? ` #${t.reference_id}` : ''}` : '-'}</td>
+                <td>{t.reference_type ? `${label('referenceType', t.reference_type)}${t.reference_id ? ` #${t.reference_id}` : ''}` : '-'}</td>
                 <td>{t.memo ?? '-'}</td>
               </tr>
             ))}

@@ -92,12 +92,12 @@ function TaskHistoryTab({ initialTaskType }: { initialTaskType: string }) {
       <div className="filter-bar">
         <select value={taskType} onChange={(e) => setTaskType(e.target.value)}>
           {TASK_TYPE_OPTIONS.map((t) => (
-            <option key={t} value={t}>{t || '유형 전체'}</option>
+            <option key={t} value={t}>{t ? label('taskType', t) : '유형 전체'}</option>
           ))}
         </select>
         <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
           {TASK_STATUS_OPTIONS.map((s) => (
-            <option key={s} value={s}>{s || '상태 전체'}</option>
+            <option key={s} value={s}>{s ? label('taskStatus', s) : '상태 전체'}</option>
           ))}
         </select>
         <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
@@ -114,9 +114,9 @@ function TaskHistoryTab({ initialTaskType }: { initialTaskType: string }) {
             {data.map((row) => (
               <tr key={row.id} className={row.status === 'FAILED' ? 'row-warning' : ''}>
                 <td>{new Date(row.started_at).toLocaleString()}</td>
-                <td>{row.task_type}</td>
-                <td>{row.trigger_type === 'SCHEDULE' ? '자동' : '수동'}</td>
-                <td>{row.status}</td>
+                <td>{label('taskType', row.task_type)}</td>
+                <td>{label('triggerType', row.trigger_type)}</td>
+                <td><StatusBadge domain="taskStatus" value={row.status} /></td>
                 <td>{row.status === 'FAILED' ? row.error_message : row.result_summary}</td>
               </tr>
             ))}
@@ -151,13 +151,13 @@ function StatusTab() {
         <div className="kpi-label">최근 백업</div>
         <div className="kpi-value">
           {data.latest_backup
-            ? `${data.latest_backup.status} (${data.latest_backup.file_size_bytes ? formatBytes(data.latest_backup.file_size_bytes) : '-'})`
+            ? `${label('taskStatus', data.latest_backup.status)} (${data.latest_backup.file_size_bytes ? formatBytes(data.latest_backup.file_size_bytes) : '-'})`
             : '백업 이력 없음'}
         </div>
         {data.latest_backup && <div className="kpi-label">{new Date(data.latest_backup.created_at).toLocaleString()}</div>}
       </div>
       <div className="kpi-card">
-        <div className="kpi-label">서버 Uptime</div>
+        <div className="kpi-label">서버 가동 시간</div>
         <div className="kpi-value">{formatUptime(data.uptime_seconds)}</div>
       </div>
     </div>

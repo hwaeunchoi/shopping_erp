@@ -1,6 +1,8 @@
 import { useState, type FormEvent } from 'react'
 import { api, ApiError } from '../api/client'
 import { useApiData } from '../api/useApiData'
+import { label } from '../labels'
+import { StatusBadge } from '../components/StatusBadge'
 import type { AlertRule, AlertRuleCreate, AppNotification } from '../api/types'
 
 // UI v1.0 알림센터: 알림 목록 + 사용자 정의 알림 규칙(alert_rules) 관리.
@@ -35,8 +37,8 @@ function NotificationsTab() {
           <tbody>
             {data.map((n) => (
               <tr key={n.id} className={!n.is_read ? 'row-warning' : ''}>
-                <td>{n.severity}</td>
-                <td>{n.type}</td>
+                <td><StatusBadge domain="notificationSeverity" value={n.severity} /></td>
+                <td>{label('alertMetric', n.type)}</td>
                 <td>{n.message}</td>
                 <td>{new Date(n.created_at).toLocaleString()}</td>
                 <td>{n.is_read ? '읽음' : '안읽음'}</td>
@@ -91,10 +93,10 @@ function AlertRulesTab() {
           placeholder="규칙 이름"
         />
         <select value={form.metric} onChange={(e) => setForm({ ...form, metric: e.target.value })}>
-          {METRIC_OPTIONS.map((m) => <option key={m} value={m}>{m}</option>)}
+          {METRIC_OPTIONS.map((m) => <option key={m} value={m}>{label('alertMetric', m)}</option>)}
         </select>
         <select value={form.operator} onChange={(e) => setForm({ ...form, operator: e.target.value })}>
-          {OPERATOR_OPTIONS.map((o) => <option key={o} value={o}>{o}</option>)}
+          {OPERATOR_OPTIONS.map((o) => <option key={o} value={o}>{label('alertOperator', o)}</option>)}
         </select>
         <input
           type="number"
@@ -117,9 +119,9 @@ function AlertRulesTab() {
             {data.map((rule) => (
               <tr key={rule.id}>
                 <td>{rule.name}</td>
-                <td>{rule.metric}</td>
-                <td>{rule.operator} {rule.threshold_value}</td>
-                <td>{rule.check_frequency}</td>
+                <td>{label('alertMetric', rule.metric)}</td>
+                <td>{label('alertOperator', rule.operator)} {rule.threshold_value}</td>
+                <td>{label('alertCheckFrequency', rule.check_frequency)}</td>
                 <td><span className="status-badge">{rule.is_enabled ? 'ON' : 'OFF'}</span></td>
                 <td>
                   <button type="button" onClick={() => handleToggle(rule)}>{rule.is_enabled ? '비활성화' : '활성화'}</button>{' '}

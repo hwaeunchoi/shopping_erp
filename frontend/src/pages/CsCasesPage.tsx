@@ -2,6 +2,8 @@ import { useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { api, ApiError } from '../api/client'
 import { useApiData } from '../api/useApiData'
+import { label } from '../labels'
+import { StatusBadge } from '../components/StatusBadge'
 import type {
   CsBulkOutcomeItem,
   CsCase,
@@ -19,24 +21,6 @@ import type {
 // 목록/상세에서 다룬다. 실제 채널 답변 전송은 이번 단계에 없다 - 답변 초안
 // 저장까지만 지원하고 화면에 명확히 "미지원" 안내를 낸다. 내부 메모와 고객
 // 답변 초안은 서로 다른 저장소를 쓰며 화면에서도 절대 같은 영역에 섞지 않는다.
-
-const STATUS_LABELS: Record<string, string> = {
-  OPEN: '접수',
-  IN_PROGRESS: '처리중',
-  WAITING_CUSTOMER: '고객답변대기',
-  WAITING_CHANNEL: '채널응답대기',
-  RESOLVED: '해결완료',
-  CLOSED: '종결',
-}
-
-const PRIORITY_LABELS: Record<string, string> = { LOW: '낮음', NORMAL: '보통', HIGH: '높음', URGENT: '긴급' }
-
-const BULK_OUTCOME_LABELS: Record<string, string> = {
-  ACCEPTED: '접수됨',
-  BLOCKED: '막힘',
-  VALIDATION_FAILED: '검증 실패',
-  NOT_FOUND: '대상 없음',
-}
 
 const STATUS_FILTER_OPTIONS = ['ALL', 'OPEN', 'IN_PROGRESS', 'WAITING_CUSTOMER', 'WAITING_CHANNEL', 'RESOLVED', 'CLOSED']
 
@@ -209,7 +193,7 @@ export function CsCasesPage() {
           <span className="status-badge">지연 {summary.overdue_count}건</span>
           {Object.entries(summary.by_status).map(([s, count]) => (
             <span key={s} className="status-badge">
-              {STATUS_LABELS[s] ?? s} {count}건
+              {label('csStatus', s)} {count}건
             </span>
           ))}
         </div>
@@ -219,7 +203,7 @@ export function CsCasesPage() {
         <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
           {STATUS_FILTER_OPTIONS.map((s) => (
             <option key={s} value={s}>
-              {s === 'ALL' ? '전체 상태' : STATUS_LABELS[s] ?? s}
+              {s === 'ALL' ? '전체 상태' : label('csStatus', s)}
             </option>
           ))}
         </select>
@@ -243,7 +227,7 @@ export function CsCasesPage() {
           <option value="">전체 우선순위</option>
           {(reference?.priorities ?? []).map((p) => (
             <option key={p} value={p}>
-              {PRIORITY_LABELS[p] ?? p}
+              {label('csPriority', p)}
             </option>
           ))}
         </select>
@@ -259,7 +243,7 @@ export function CsCasesPage() {
             setSearch(searchInput.trim())
           }}
         >
-          <input value={searchInput} onChange={(e) => setSearchInput(e.target.value)} placeholder="제목/외부ID/태그 검색" />
+          <input value={searchInput} onChange={(e) => setSearchInput(e.target.value)} placeholder="제목, 외부 번호, 태그 검색" />
           <button type="submit">검색</button>
         </form>
         <button type="button" onClick={() => setCreateOpen(true)}>
@@ -270,7 +254,7 @@ export function CsCasesPage() {
       {createOpen && (
         <div className="bulk-bar confirm-panel">
           <div>
-            <strong>CS 건 수기 생성</strong>
+            <strong>문의 직접 등록</strong>
             <div className="inline-form">
               <select
                 value={createForm.inquiry_type}
@@ -279,14 +263,14 @@ export function CsCasesPage() {
                 <option value="">문의유형 선택</option>
                 {(reference?.inquiry_types ?? []).map((t) => (
                   <option key={t} value={t}>
-                    {t}
+                    {label('inquiryType', t)}
                   </option>
                 ))}
               </select>
               <select value={createForm.priority} onChange={(e) => setCreateForm((f) => ({ ...f, priority: e.target.value }))}>
                 {(reference?.priorities ?? []).map((p) => (
                   <option key={p} value={p}>
-                    {PRIORITY_LABELS[p] ?? p}
+                    {label('csPriority', p)}
                   </option>
                 ))}
               </select>
@@ -298,28 +282,28 @@ export function CsCasesPage() {
             </div>
             <div className="inline-form">
               <input
-                placeholder="연결할 주문 ID(선택)"
+                placeholder="연결할 주문 번호(선택)"
                 type="number"
                 value={createForm.order_id}
                 onChange={(e) => setCreateForm((f) => ({ ...f, order_id: e.target.value }))}
                 style={{ width: 150 }}
               />
               <input
-                placeholder="주문라인 ID(선택)"
+                placeholder="주문라인 번호(선택)"
                 type="number"
                 value={createForm.order_item_id}
                 onChange={(e) => setCreateForm((f) => ({ ...f, order_item_id: e.target.value }))}
                 style={{ width: 150 }}
               />
               <input
-                placeholder="상품옵션 ID(선택)"
+                placeholder="상품옵션 번호(선택)"
                 type="number"
                 value={createForm.product_option_id}
                 onChange={(e) => setCreateForm((f) => ({ ...f, product_option_id: e.target.value }))}
                 style={{ width: 150 }}
               />
               <input
-                placeholder="배송 ID(선택)"
+                placeholder="배송 번호(선택)"
                 type="number"
                 value={createForm.shipment_id}
                 onChange={(e) => setCreateForm((f) => ({ ...f, shipment_id: e.target.value }))}
@@ -363,7 +347,7 @@ export function CsCasesPage() {
                 <th>
                   <input type="checkbox" checked={rows.length > 0 && selected.size === rows.length} onChange={toggleAll} />
                 </th>
-                <th>ID</th>
+                <th>번호</th>
                 <th>채널</th>
                 <th>문의유형</th>
                 <th>우선순위</th>
@@ -382,10 +366,10 @@ export function CsCasesPage() {
                   </td>
                   <td>{c.id}</td>
                   <td>{(platforms ?? []).find((p) => p.id === c.platform_id)?.name ?? '수기'}</td>
-                  <td>{c.inquiry_type}</td>
-                  <td>{PRIORITY_LABELS[c.priority] ?? c.priority}</td>
+                  <td>{label('inquiryType', c.inquiry_type)}</td>
+                  <td>{label('csPriority', c.priority)}</td>
                   <td>
-                    <span className="status-badge">{STATUS_LABELS[c.status] ?? c.status}</span>
+                    <StatusBadge domain="csStatus" value={c.status} />
                   </td>
                   <td>{c.customer_name_masked ?? '-'}</td>
                   <td>{c.assignee_id ?? '미배정'}</td>
@@ -402,7 +386,7 @@ export function CsCasesPage() {
               ))}
               {rows.length === 0 && (
                 <tr>
-                  <td colSpan={10}>표시할 CS 건이 없습니다.</td>
+                  <td colSpan={10}>표시할 문의가 없습니다.</td>
                 </tr>
               )}
             </tbody>
@@ -414,7 +398,7 @@ export function CsCasesPage() {
         <div className="bulk-bar">
           <span className="count">{selected.size}건 선택됨</span>
           <input
-            placeholder="담당자 ID"
+            placeholder="담당자 번호"
             value={bulkAssignee}
             onChange={(e) => setBulkAssignee(e.target.value)}
             style={{ width: 90 }}
@@ -423,7 +407,7 @@ export function CsCasesPage() {
             대량 배정
           </button>
           <button type="button" disabled={bulkRunning} onClick={() => runBulkStatus('IN_PROGRESS')}>
-            대량 처리중 전환
+            일괄 처리 중으로 변경
           </button>
           <button type="button" disabled={bulkRunning} onClick={() => runBulkStatus('RESOLVED')}>
             대량 해결완료 전환
@@ -437,8 +421,8 @@ export function CsCasesPage() {
         <ul>
           {bulkResults.map((r) => (
             <li key={r.case_id}>
-              #{r.case_id}: {BULK_OUTCOME_LABELS[r.outcome] ?? r.outcome}
-              {r.error_code ? ` (${r.error_code})` : ''}
+              #{r.case_id}: {label('csBulkOutcome', r.outcome)}
+              
             </li>
           ))}
         </ul>
@@ -620,9 +604,9 @@ function CaseDetailPanel({
       {actionError && <p className="form-error">{actionError}</p>}
 
       <div className="filter-bar">
-        <span className="status-badge">{STATUS_LABELS[caseDetail.status] ?? caseDetail.status}</span>
+        <StatusBadge domain="csStatus" value={caseDetail.status} />
         <span>{platformName ?? '수기 생성'}</span>
-        {caseDetail.external_inquiry_id && <span className="hint-text">외부ID: {caseDetail.external_inquiry_id}</span>}
+        {caseDetail.external_inquiry_id && <span className="hint-text">외부 번호: {caseDetail.external_inquiry_id}</span>}
       </div>
 
       <p>
@@ -632,7 +616,7 @@ function CaseDetailPanel({
         )}
       </p>
       {!caseDetail.customer_phone_full && caseDetail.customer_phone_masked && (
-        <p className="hint-text">전체 전화번호/주소는 개인정보 상세 조회 권한(CS_PII_DETAIL)이 있어야 볼 수 있습니다.</p>
+        <p className="hint-text">전체 전화번호와 주소는 개인정보 상세 조회 권한이 있어야 볼 수 있습니다.</p>
       )}
 
       <p>
@@ -644,13 +628,13 @@ function CaseDetailPanel({
         {caseDetail.shipment_id && <span className="hint-text">연결된 배송 #{caseDetail.shipment_id}</span>}
         {caseDetail.claim_type && (
           <span className="hint-text">
-            연결된 클레임: {caseDetail.claim_type} #{caseDetail.claim_id}
+            연결된 접수: {label('orderClaim', caseDetail.claim_type)} #{caseDetail.claim_id}
           </span>
         )}
       </div>
 
       <div className="inline-form">
-        <input placeholder="담당자 ID(비우면 미배정)" value={assigneeInput} onChange={(e) => setAssigneeInput(e.target.value)} style={{ width: 140 }} />
+        <input placeholder="담당자 번호(비우면 미배정)" value={assigneeInput} onChange={(e) => setAssigneeInput(e.target.value)} style={{ width: 140 }} />
         <button type="button" disabled={pending} onClick={runAssign}>
           담당자 배정
         </button>
@@ -661,7 +645,7 @@ function CaseDetailPanel({
           <option value="">상태 선택</option>
           {STATUS_FILTER_OPTIONS.filter((s) => s !== 'ALL' && s !== 'CLOSED').map((s) => (
             <option key={s} value={s}>
-              {STATUS_LABELS[s] ?? s}
+              {label('csStatus', s)}
             </option>
           ))}
         </select>
@@ -736,8 +720,8 @@ function CaseDetailPanel({
           </button>
           {syncResult && (
             <p className="hint-text">
-              {syncResult.platform_code}: {syncResult.status} (생성 {syncResult.created} / 갱신 {syncResult.updated} /
-              실패 {syncResult.failed}){syncResult.reason_code ? ` - ${syncResult.reason_code}` : ''}
+              {syncResult.platform_code}: {label('taskStatus', syncResult.status)} (생성 {syncResult.created} / 갱신 {syncResult.updated} /
+              실패 {syncResult.failed})
             </p>
           )}
         </>

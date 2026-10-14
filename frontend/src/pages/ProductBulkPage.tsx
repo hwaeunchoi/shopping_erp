@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api, ApiError } from '../api/client'
 import { useApiData } from '../api/useApiData'
+import { label } from '../labels'
+import { StatusBadge } from '../components/StatusBadge'
 import type {
   BulkCommandStatus,
   BulkItemResult,
-  BulkOutcome,
   BulkRetryResult,
   BulkSubmitResult,
   BulkTarget,
@@ -52,24 +53,6 @@ const KIND_CONFIG: Record<Kind, { label: string; listPath: string; submitPath: s
   },
 }
 
-const OUTCOME_LABELS: Record<BulkOutcome, string> = {
-  ACCEPTED: '접수됨',
-  VALIDATION_FAILED: '검증 실패',
-  UNSUPPORTED: '미지원 채널',
-  BLOCKED_BY_UNKNOWN: '선행 확인필요 명령으로 차단',
-  DUPLICATE_OR_SUPERSEDED: '중복/대체됨',
-  FAILED_TO_ENQUEUE: '접수 실패',
-}
-
-const COMMAND_STATUS_LABELS: Record<string, string> = {
-  PENDING: '접수됨(전송 대기)',
-  RUNNING: '전송 중',
-  SUCCESS: '성공',
-  FAILED: '실패',
-  RETRY_WAIT: '재시도 대기',
-  UNKNOWN: '확인 필요(운영자 확인 대상)',
-  CANCELLED: '취소됨(더 최신 요청으로 대체)',
-}
 
 const STATUS_FILTER_OPTIONS = ['ALL', 'PENDING', 'RUNNING', 'SUCCESS', 'FAILED', 'RETRY_WAIT', 'UNKNOWN', 'CANCELLED']
 
@@ -262,7 +245,7 @@ export function ProductBulkPage() {
                     onChange={toggleAll}
                   />
                 </th>
-                <th>ID</th>
+                <th>번호</th>
                 <th>채널</th>
                 <th>상품명</th>
                 <th>SKU</th>
@@ -390,7 +373,7 @@ export function ProductBulkPage() {
                 </li>
               ))}
             </ul>
-            <p className="hint-text">실제 채널 전송은 하지 않고 접수(outbox 명령 생성)만 합니다. 계속할까요?</p>
+            <p className="hint-text">실제 채널 전송은 하지 않고 접수(전송 대기 명령 생성)만 합니다. 계속할까요?</p>
           </div>
           <button type="button" disabled={submitting} onClick={runSubmit}>
             {submitting ? '접수 중...' : '접수 실행'}
@@ -405,13 +388,13 @@ export function ProductBulkPage() {
 
       {submitResult && (
         <div className="table-scroll">
-          <h3>접수 결과 {submitResult.aborted && <span className="status-badge">중단됨(DB 오류)</span>}</h3>
+          <h3>접수 결과 {submitResult.aborted && <span className="status-badge">중단됨(데이터 저장 오류)</span>}</h3>
           <table className="data-table">
             <thead>
               <tr>
-                <th>대상 ID</th>
+                <th>대상 번호</th>
                 <th>결과</th>
-                <th>명령 ID</th>
+                <th>명령 번호</th>
                 <th>사유</th>
               </tr>
             </thead>
@@ -434,7 +417,7 @@ function BulkItemRow({ item }: { item: BulkItemResult }) {
     <tr>
       <td>{item.target_id}</td>
       <td>
-        <span className="status-badge">{OUTCOME_LABELS[item.outcome]}</span>
+        <StatusBadge domain="requestOutcome" value={item.outcome} />
       </td>
       <td>{item.command_id ?? '-'}</td>
       <td>{item.error_code ?? '-'}</td>
@@ -512,7 +495,7 @@ function ProgressPanel({ initialCommandIds }: { initialCommandIds: number[] }) {
         <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
           {STATUS_FILTER_OPTIONS.map((s) => (
             <option key={s} value={s}>
-              {s === 'ALL' ? '전체' : COMMAND_STATUS_LABELS[s] ?? s}
+              {s === 'ALL' ? '전체' : label('commandStatus', s)}
             </option>
           ))}
         </select>
@@ -530,7 +513,7 @@ function ProgressPanel({ initialCommandIds }: { initialCommandIds: number[] }) {
         <thead>
           <tr>
             <th>재처리 선택</th>
-            <th>명령 ID</th>
+            <th>명령 번호</th>
             <th>종류</th>
             <th>상태</th>
             <th>시도횟수</th>
@@ -550,9 +533,9 @@ function ProgressPanel({ initialCommandIds }: { initialCommandIds: number[] }) {
                 )}
               </td>
               <td>{s.id}</td>
-              <td>{s.command_type}</td>
+              <td>{label('commandType', s.command_type)}</td>
               <td>
-                <span className="status-badge">{COMMAND_STATUS_LABELS[s.status] ?? s.status}</span>
+                <StatusBadge domain="commandStatus" value={s.status} />
               </td>
               <td>{s.attempt_count}</td>
               <td>{s.error_code ?? '-'}</td>

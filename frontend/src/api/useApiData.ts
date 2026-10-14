@@ -22,7 +22,7 @@ export function useApiData<T>(fetcher: () => Promise<T>, deps: unknown[]): ApiDa
     fetcher()
       .then((result) => setData(result))
       .catch((err: unknown) => {
-        setError(err instanceof ApiError ? `${err.message} (HTTP ${err.status})` : '알 수 없는 오류가 발생했습니다.')
+        setError(err instanceof ApiError ? err.message : '네트워크 연결을 확인한 뒤 다시 시도해 주세요.')
       })
       .finally(() => setIsLoading(false))
     // eslint-disable-next-line react-hooks/exhaustive-deps

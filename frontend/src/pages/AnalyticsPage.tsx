@@ -110,7 +110,7 @@ export function AnalyticsPage() {
         <table className="data-table">
           <thead>
             <tr>
-              <th>SKU ID</th>
+              <th>상품 옵션 번호</th>
               <th>판매수량</th>
               <th>매출</th>
               <th>광고비</th>
