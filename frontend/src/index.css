@@ -709,17 +709,22 @@ textarea::placeholder {
 .tab-button {
   padding: 8px 16px;
   border: none;
+  border-radius: 0;
   background: none;
+  color: var(--text-muted);
   cursor: pointer;
   font-size: 14px;
   border-bottom: 2px solid transparent;
   white-space: nowrap;
 }
 
-.tab-button.active {
-  border-bottom-color: var(--accent);
-  color: var(--accent);
-  font-weight: 600;
+/* 활성 탭: 글자색은 본문색, 아래 굵은 선과 굵은 글씨로 구분한다(전역 button.active 검정 바탕을 덮어씀). */
+.tab-button.active,
+.tab-button.active:hover {
+  background: none;
+  border-bottom-color: var(--primary);
+  color: var(--text);
+  font-weight: 700;
 }
 
 .favorite-toggle {
@@ -821,15 +826,16 @@ textarea::placeholder {
 
 /* === 주문관리 재설계 (이지어드민 수준) === */
 .order-toolbar { background: var(--panel-bg); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 14px 16px; margin-bottom: 12px; }
-.order-search-row { display: flex; gap: 8px; align-items: center; }
-.order-search-row input.search { flex: 1; padding: 9px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); color: var(--text); font-size: 14px; }
+.order-search-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.order-search-row button { white-space: nowrap; }
+.order-search-row input.search { flex: 1 1 220px; min-width: 0; padding: 9px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); color: var(--text); font-size: 14px; }
 .order-search-hint { font-size: 11px; color: var(--text-muted); margin-top: 6px; }
 .order-filters { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); align-items: center; }
 .order-filters .flabel { font-size: 11px; color: var(--text-muted); }
 .order-filters select, .order-filters input { padding: 6px 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel-bg); color: var(--text); font-size: 12.5px; }
 
 .bulk-bar { display: flex; align-items: center; gap: 10px; background: var(--selected); border: 1px solid var(--primary); border-radius: var(--radius-lg); padding: 10px 14px; margin-bottom: 12px; flex-wrap: wrap; }
-.bulk-bar .count { font-weight: 600; color: var(--accent); font-size: 12.5px; }
+.bulk-bar .count { font-weight: 600; color: var(--text); font-size: 12.5px; }
 /* confirm-panel 안의 이름없는 래퍼 div(제목+입력폼을 담는 블록)가 기본
    min-width:auto라 내부 입력칸들의 내재 너비(예: 여러 개의 고정폭 input)만큼
    줄어들지 못해 페이지를 옆으로 밀어낼 수 있다 - flex-wrap이 있어도 이
@@ -908,3 +914,104 @@ textarea::placeholder {
 .kpi-o .kval { font-size: 22px; font-weight: 500; margin-top: 2px; }
 .kpi-o.alert .kval { color: var(--danger); }
 .kpi-o .ksub { font-size: 10.5px; color: var(--text-muted); margin-top: 2px; }
+
+/* --- 표·필터·폼 공통 (정보 구조 단순화) --- */
+.data-table tbody tr:hover td,
+.order-table tbody tr:hover td {
+  background: var(--hover);
+}
+
+.data-table th {
+  white-space: nowrap;
+}
+
+/* 긴 값은 한 줄로 줄이고(title 로 전체 확인), 표 안에서만 가로 스크롤한다. */
+.cell-ellipsis {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.more-filters {
+  margin-top: 8px;
+}
+
+.more-filters > summary {
+  display: inline-block;
+  padding: 6px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--secondary-bg);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.more-filters > summary:hover {
+  background: var(--hover);
+}
+
+.more-filters[open] > summary {
+  margin-bottom: 4px;
+}
+
+.check-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.empty-state {
+  padding: 24px;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+/* 좁은 화면: 표는 표 안에서만 가로로 스크롤하고, 누르는 영역은 충분히 크게 한다. */
+@media (max-width: 900px) {
+  .data-table {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+  }
+
+  button,
+  input,
+  select {
+    min-height: 40px;
+  }
+
+  .filter-bar,
+  .inline-form {
+    gap: 6px;
+  }
+
+  .filter-bar > input,
+  .filter-bar > select,
+  .inline-form > input,
+  .inline-form > select {
+    flex: 1 1 140px;
+    min-width: 0;
+  }
+
+  .kpi-cards {
+    flex-wrap: wrap;
+  }
+
+  .kpi-card {
+    flex: 1 1 140px;
+    min-width: 0;
+  }
+
+  .detail-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
+}

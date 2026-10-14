@@ -3,6 +3,7 @@ import { Link, NavLink, useLocation } from 'react-router-dom'
 import { useAuth } from '../auth/AuthContext'
 import { findNavLocation, visibleGroups } from '../navigation'
 import { AIAssistantPanel } from './AIAssistantPanel'
+import { ErrorBoundary } from './ErrorBoundary'
 import { GlobalSearch } from './GlobalSearch'
 import { Icon } from './Icon'
 import { NotificationBell } from './NotificationBell'
@@ -151,7 +152,7 @@ export function Layout({ children }: { children: ReactNode }) {
               )}
             </nav>
           )}
-          {children}
+          <ErrorBoundary key={pathname}>{children}</ErrorBoundary>
         </main>
         <AIAssistantPanel />
       </div>

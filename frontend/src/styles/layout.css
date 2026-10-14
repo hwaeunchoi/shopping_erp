@@ -326,9 +326,9 @@
     row-gap: 8px;
   }
 
-  .global-search {
+  .topbar .global-search {
     order: 3;
-    flex-basis: 100%;
+    flex: 1 1 100%;
     max-width: none;
   }
 

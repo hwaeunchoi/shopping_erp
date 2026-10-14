@@ -271,7 +271,7 @@ export function FulfillmentPage() {
         <select value={batchStatusFilter} onChange={(e) => setBatchStatusFilter(e.target.value)}>
           {BATCH_STATUS_FILTERS.map((s) => (
             <option key={s} value={s}>
-              {s === 'ALL' ? '전체' : s}
+              {s === 'ALL' ? '전체' : label('fulfillmentStatus', s)}
             </option>
           ))}
         </select>

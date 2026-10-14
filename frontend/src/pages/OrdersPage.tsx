@@ -18,17 +18,13 @@ import type {
 const CS_FILTER: [string, string][] = [
   ['', '문의 전체'],
   ['NONE', '정상'],
-  ['EXCHANGE', '교환'],
-  ['RETURN', '반품'],
-  ['CANCEL', '취소'],
+  ...['EXCHANGE', 'RETURN', 'CANCEL'].map((v): [string, string] => [v, label('orderClaim', v)]),
 ]
 
 const ORDER_STATUS = ['', 'NEW', 'PREPARING', 'SHIPPING', 'DELIVERED', 'CANCELED', 'EXCHANGED', 'RETURNED', 'REFUNDED']
 const SHIPPING_STATUS: [string, string][] = [
   ['', '배송 전체'],
-  ['UNSHIPPED', '미발송'],
-  ['SHIPPING', '배송중'],
-  ['DELIVERED', '배송완료'],
+  ...['UNSHIPPED', 'SHIPPING', 'DELIVERED'].map((v): [string, string] => [v, label('shippingStatus', v)]),
 ]
 
 
@@ -294,6 +290,22 @@ export function OrdersPage() {
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const [openId, setOpenId] = useState<number | null>(null)
   const [actionMsg, setActionMsg] = useState<string | null>(null)
+  const detailFilterCount = [supplierId, shippingStatus, csStatus, sku, mineOnly ? '1' : ''].filter(Boolean).length
+  const anyFilterActive = Boolean(detailFilterCount || status || platformId || startDate || endDate || keyword)
+  const resetFilters = () => {
+    setStatus('')
+    setPlatformId('')
+    setShippingStatus('')
+    setSupplierId('')
+    setCsStatus('')
+    setMineOnly(false)
+    setSku('')
+    setStartDate('')
+    setEndDate('')
+    setKeyword('')
+    setKeywordInput('')
+    setPage(1)
+  }
 
   const q = new URLSearchParams()
   if (status) q.set('status_filter', status)
@@ -406,43 +418,49 @@ export function OrdersPage() {
           <input className="search" value={keywordInput} onChange={(e) => setKeywordInput(e.target.value)}
             placeholder="통합검색: 주문번호·송장번호·고객명·연락처·주소·상품명·옵션·SKU·공급처·메모" />
           <button type="submit">검색</button>
-          {keyword && <button type="button" onClick={() => { setKeyword(''); setKeywordInput('') }}>초기화</button>}
-          <button type="button" onClick={exportExcel}>엑셀</button>
+          {keyword && <button type="button" onClick={() => { setKeyword(''); setKeywordInput('') }}>검색어 지우기</button>}
+          <button type="button" onClick={exportExcel}>엑셀 내려받기</button>
         </form>
         <div className="order-search-hint">통합검색 1개 입력창으로 9개 항목을 동시에 조회합니다.</div>
         <div className="order-filters">
           <span className="flabel">기간</span>
-          <input type="date" value={startDate} onChange={(e) => { setPage(1); setStartDate(e.target.value) }} />
+          <input type="date" aria-label="시작일" value={startDate} onChange={(e) => { setPage(1); setStartDate(e.target.value) }} />
           <span>~</span>
-          <input type="date" value={endDate} onChange={(e) => { setPage(1); setEndDate(e.target.value) }} />
+          <input type="date" aria-label="종료일" value={endDate} onChange={(e) => { setPage(1); setEndDate(e.target.value) }} />
           <span className="flabel">쇼핑몰</span>
           <select value={platformId} onChange={(e) => { setPage(1); setPlatformId(e.target.value) }}>
             <option value="">전체</option>
             {platforms?.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
           </select>
-          <span className="flabel">공급처</span>
-          <select value={supplierId} onChange={(e) => { setPage(1); setSupplierId(e.target.value) }}>
-            <option value="">전체</option>
-            {suppliers?.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-          </select>
-          <span className="flabel">주문상태</span>
+          <span className="flabel">주문 상태</span>
           <select value={status} onChange={(e) => { setPage(1); setStatus(e.target.value) }}>
             {ORDER_STATUS.map((s) => <option key={s || 'all'} value={s}>{s ? label('orderStatus', s) : '전체'}</option>)}
           </select>
-          <span className="flabel">배송상태</span>
-          <select value={shippingStatus} onChange={(e) => { setPage(1); setShippingStatus(e.target.value) }}>
-            {SHIPPING_STATUS.map(([v, l]) => <option key={v || 'all'} value={v}>{l}</option>)}
-          </select>
-          <span className="flabel">문의 상태</span>
-          <select value={csStatus} onChange={(e) => { setPage(1); setCsStatus(e.target.value) }}>
-            {CS_FILTER.map(([v, l]) => <option key={v || 'all'} value={v}>{l}</option>)}
-          </select>
-          <span className="flabel">상품 코드(SKU)</span>
-          <input value={sku} onChange={(e) => { setPage(1); setSku(e.target.value) }} placeholder="SKU" style={{ width: 110 }} />
-          <label style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 4 }}>
-            <input type="checkbox" checked={mineOnly} onChange={(e) => { setPage(1); setMineOnly(e.target.checked) }} /> 내 담당만
-          </label>
+          {anyFilterActive && <button type="button" onClick={resetFilters}>필터 초기화</button>}
         </div>
+        <details className="more-filters" open={detailFilterCount > 0}>
+          <summary>상세 필터{detailFilterCount > 0 ? ` (적용 ${detailFilterCount}개)` : ''}</summary>
+          <div className="order-filters">
+            <span className="flabel">공급처</span>
+            <select value={supplierId} onChange={(e) => { setPage(1); setSupplierId(e.target.value) }}>
+              <option value="">전체</option>
+              {suppliers?.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
+            <span className="flabel">배송 상태</span>
+            <select value={shippingStatus} onChange={(e) => { setPage(1); setShippingStatus(e.target.value) }}>
+              {SHIPPING_STATUS.map(([v, l]) => <option key={v || 'all'} value={v}>{l}</option>)}
+            </select>
+            <span className="flabel">문의 상태</span>
+            <select value={csStatus} onChange={(e) => { setPage(1); setCsStatus(e.target.value) }}>
+              {CS_FILTER.map(([v, l]) => <option key={v || 'all'} value={v}>{l}</option>)}
+            </select>
+            <span className="flabel">상품 코드(SKU)</span>
+            <input value={sku} onChange={(e) => { setPage(1); setSku(e.target.value) }} aria-label="상품 코드(SKU)" style={{ width: 110 }} />
+            <label className="check-label">
+              <input type="checkbox" checked={mineOnly} onChange={(e) => { setPage(1); setMineOnly(e.target.checked) }} /> 내 담당만
+            </label>
+          </div>
+        </details>
       </div>
 
       {canEdit && selected.size > 0 && (
@@ -452,7 +470,7 @@ export function OrdersPage() {
           <button type="button" onClick={bulkStatus}>상태변경</button>
           <button type="button" onClick={bulkAssign}>담당자 지정</button>
           <button type="button" onClick={bulkMemo}>메모추가</button>
-          <button type="button" onClick={exportExcel}>엑셀다운로드</button>
+          <button type="button" onClick={exportExcel}>엑셀 내려받기</button>
         </div>
       )}
       {actionMsg && <p className="form-info">{actionMsg}</p>}
