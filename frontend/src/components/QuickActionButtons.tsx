@@ -79,7 +79,7 @@ export function QuickActionButtons() {
             onClick={() => handleClick(action)}
             disabled={runningType !== null}
           >
-            {runningType === action.taskType ? '실행 중...' : `▶ ${action.label}`}
+            {runningType === action.taskType ? '실행 중...' : action.label}
           </button>
         ))}
       </div>

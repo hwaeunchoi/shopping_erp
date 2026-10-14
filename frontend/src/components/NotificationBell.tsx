@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../api/client'
+import { label } from '../labels'
+import { Icon } from './Icon'
 import type { AppNotification } from '../api/types'
 
 // UI v1.0 알림센터: 상단바 알림 벨(🔔). 배지 숫자는 notifications.is_read=0 기준.
@@ -55,8 +57,16 @@ export function NotificationBell() {
 
   return (
     <div className="topbar-dropdown" ref={ref}>
-      <button type="button" className="topbar-icon-button notification-bell" onClick={toggle} title="알림">
-        🔔{unreadCount > 0 && <span className="notification-badge">{unreadCount}</span>}
+      <button
+        type="button"
+        className="icon-button notification-bell"
+        onClick={toggle}
+        title="알림"
+        aria-label={unreadCount > 0 ? `알림, 읽지 않은 알림 ${unreadCount}건` : '알림'}
+        aria-expanded={isOpen}
+      >
+        <Icon name="bell" />
+        {unreadCount > 0 && <span className="notification-badge">{unreadCount}</span>}
       </button>
       {isOpen && (
         <div className="dropdown-panel">
@@ -64,7 +74,7 @@ export function NotificationBell() {
           {items.map((n) => (
             <button key={n.id} type="button" className="dropdown-item notification-item" onClick={() => handleSelect(n)}>
               <span className={`notification-severity notification-severity-${n.severity.toLowerCase()}`}>
-                {n.severity}
+                {label('notificationSeverity', n.severity)}
               </span>
               <span>{n.message}</span>
             </button>

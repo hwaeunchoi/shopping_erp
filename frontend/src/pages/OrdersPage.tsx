@@ -206,7 +206,7 @@ function DetailPanel({ orderId, onClose, onChanged }: { orderId: number; onClose
                 <tr><td>판매가</td><td>{data.contribution.sale_amount.toLocaleString()}</td></tr>
                 <tr><td>원가(스냅샷)</td><td>-{data.contribution.cost_of_goods.toLocaleString()}</td></tr>
                 <tr><td>쇼핑몰수수료</td><td>-{data.contribution.platform_fee.toLocaleString()}</td></tr>
-                <tr className="tot"><td>공헌이익 ({data.contribution.contribution_rate}%)</td><td style={{ color: 'var(--done)' }}>{data.contribution.contribution_margin.toLocaleString()}</td></tr>
+                <tr className="tot"><td>공헌이익 ({data.contribution.contribution_rate}%)</td><td style={{ fontWeight: 600 }}>{data.contribution.contribution_margin.toLocaleString()}</td></tr>
               </tbody>
             </table>
             <p className="sub" style={{ marginTop: 8, color: 'var(--text-muted)' }}>{data.contribution.ad_cost_note}</p>

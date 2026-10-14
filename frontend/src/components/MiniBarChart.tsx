@@ -54,7 +54,7 @@ export function MiniBarChart({ data, height = 180, onBarClick, formatValue }: Mi
               y={y}
               width={barWidth}
               height={Math.max(barHeight, 1)}
-              fill={isNegative ? 'var(--danger)' : 'var(--accent, #2563eb)'}
+              fill={isNegative ? 'var(--danger)' : 'var(--primary)'}
               rx={2}
             />
             <text x={x + barWidth / 2} y={height + 14} textAnchor="middle" fontSize={10} fill="var(--text-muted)">

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api/client'
+import { Icon } from './Icon'
 import type { Favorite } from '../api/types'
 
 // UI 와이어프레임 v1.1 5장: 상품관리 목록/상세 등에 배치하는 즐겨찾기 토글 아이콘.
@@ -26,8 +27,15 @@ export function FavoriteStar({ targetType, targetId }: { targetType: string; tar
   }
 
   return (
-    <button type="button" className="favorite-toggle" onClick={toggle} title={isFavorited ? '즐겨찾기 해제' : '즐겨찾기 추가'}>
-      {isFavorited ? '⭐' : '☆'}
+    <button
+      type="button"
+      className={'favorite-toggle' + (isFavorited ? ' is-on' : '')}
+      onClick={toggle}
+      title={isFavorited ? '즐겨찾기 해제' : '즐겨찾기 추가'}
+      aria-label={isFavorited ? '즐겨찾기 해제' : '즐겨찾기 추가'}
+      aria-pressed={isFavorited === true}
+    >
+      <Icon name="star" size={16} />
     </button>
   )
 }

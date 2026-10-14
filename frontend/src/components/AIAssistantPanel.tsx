@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { api } from '../api/client'
+import { Icon } from './Icon'
 import type { AiAssistantAnswer } from '../api/types'
 
 // UI 와이어프레임 v1.1 8장: 상단바 AI Assistant(🤖) 버튼 + 우측 슬라이드 패널.
@@ -27,7 +28,7 @@ export function AIAssistantPanel() {
       const res = await api.post<AiAssistantAnswer>('/api/ai-assistant/ask', { question: q })
       setMessages((prev) => [...prev, { role: 'assistant', text: res.answer }])
     } catch {
-      setMessages((prev) => [...prev, { role: 'assistant', text: '오류가 발생했습니다. 잠시 후 다시 시도해주세요.' }])
+      setMessages((prev) => [...prev, { role: 'assistant', text: '답변을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.' }])
     } finally {
       setIsLoading(false)
     }
@@ -35,19 +36,26 @@ export function AIAssistantPanel() {
 
   return (
     <>
-      <button type="button" className="ai-assistant-trigger" onClick={() => setIsOpen((o) => !o)} title="AI Assistant">
-        🤖
+      <button
+        type="button"
+        className="ai-assistant-trigger"
+        onClick={() => setIsOpen((o) => !o)}
+        title="AI 도우미"
+        aria-label="AI 도우미 열기"
+        aria-expanded={isOpen}
+      >
+        <Icon name="chat" size={22} />
       </button>
       {isOpen && (
-        <div className="ai-assistant-panel">
+        <div className="ai-assistant-panel" role="dialog" aria-label="AI 도우미">
           <div className="ai-assistant-header">
-            <span>ERP AI Assistant</span>
-            <button type="button" onClick={() => setIsOpen(false)}>
-              ✕
+            <span>AI 도우미</span>
+            <button type="button" onClick={() => setIsOpen(false)} aria-label="AI 도우미 닫기">
+              <Icon name="close" size={16} />
             </button>
           </div>
           <div className="ai-assistant-messages">
-            {messages.length === 0 && <p className="form-info">궁금한 점을 물어보거나 아래 빠른 질문을 눌러보세요.</p>}
+            {messages.length === 0 && <p className="form-info">궁금한 점을 입력하거나 아래 빠른 질문을 선택해 주세요.</p>}
             {messages.map((m, i) => (
               <div key={i} className={`ai-message ai-message-${m.role}`}>
                 {m.text}
@@ -73,6 +81,7 @@ export function AIAssistantPanel() {
               value={question}
               onChange={(e) => setQuestion(e.target.value)}
               placeholder="질문을 입력하세요"
+              aria-label="질문"
               disabled={isLoading}
             />
             <button type="submit" disabled={isLoading}>

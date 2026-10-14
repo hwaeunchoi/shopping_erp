@@ -2,13 +2,13 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../api/client'
 import { useApiData } from '../api/useApiData'
+import { StatusBadge } from '../components/StatusBadge'
+import { label } from '../labels'
 import type { IntegrationStatus, SystemStatus, TaskExecutionHistoryItem } from '../api/types'
 
 // UI 와이어프레임 v1.1 4장: 시스템 모니터링(연동상태/작업이력/시스템상태 탭 3종 통합).
 type Tab = 'integrations' | 'task-history' | 'status'
 
-const STATUS_ICON: Record<string, string> = { NORMAL: '🟢', ERROR: '🔴', TOKEN_EXPIRING: '🟡' }
-const INTEGRATION_TYPE_LABEL: Record<string, string> = { MALL: '쇼핑몰', AD: '광고' }
 const TASK_TYPE_OPTIONS = ['', 'ORDER_COLLECT', 'AD_COLLECT', 'BACKUP', 'REPORT_GENERATE', 'FULL_SYNC']
 const TASK_STATUS_OPTIONS = ['', 'RUNNING', 'SUCCESS', 'FAILED']
 
@@ -58,9 +58,9 @@ function IntegrationsTab({ onDrillToTaskHistory }: { onDrillToTaskHistory: (task
             className={row.status === 'ERROR' || row.status === 'TOKEN_EXPIRING' ? 'row-warning clickable-row' : ''}
             onClick={row.status === 'ERROR' || row.status === 'TOKEN_EXPIRING' ? () => handleRowClick(row) : undefined}
           >
-            <td>{INTEGRATION_TYPE_LABEL[row.integration_type] ?? row.integration_type}</td>
+            <td>{label('integrationType', row.integration_type)}</td>
             <td>{row.integration_code}</td>
-            <td>{STATUS_ICON[row.status] ?? ''} {row.status}</td>
+            <td><StatusBadge domain="integrationStatus" value={row.status} /></td>
             <td>{row.last_success_at ? new Date(row.last_success_at).toLocaleString() : '-'}</td>
             <td>{row.last_error_message ?? '-'}</td>
           </tr>

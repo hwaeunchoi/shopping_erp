@@ -9,7 +9,7 @@ import type { SearchResultItem, SearchResults } from '../api/types'
 const CATEGORY_LABELS: Record<keyof SearchResults, string> = {
   orders: '주문',
   products: '상품',
-  product_options: 'SKU',
+  product_options: '상품 옵션(SKU)',
   customers: '고객',
   shipments: '송장번호',
 }
@@ -78,7 +78,8 @@ export function GlobalSearch() {
     <div className="global-search" ref={containerRef}>
       <input
         type="text"
-        placeholder="🔍 통합검색: 주문번호/상품명/SKU/고객명/송장번호..."
+        placeholder="주문번호, 상품명, SKU, 고객명, 송장번호 검색"
+        aria-label="통합 검색"
         value={query}
         onChange={(e) => setQuery(e.target.value)}
         onFocus={() => results && setIsOpen(true)}

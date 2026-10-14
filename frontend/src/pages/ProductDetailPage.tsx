@@ -483,8 +483,8 @@ function ProductSyncControls({ mapping, onClose }: { mapping: ProductPlatformMap
         <button type="button" onClick={onClose}>닫기</button>
       </div>
       {mapping.sibling_mapping_ids.length > 0 && (
-        <p className="hint-text" style={{ color: '#b45309' }}>
-          ⚠️ 이 매핑은 같은 원상품(origin product)을 매핑 #{mapping.sibling_mapping_ids.join(', #')}과(와)
+        <p className="hint-text" style={{ fontWeight: 600 }}>
+          ! 이 매핑은 같은 원상품(origin product)을 매핑 #{mapping.sibling_mapping_ids.join(', #')}과(와)
           공유합니다 - 판매상태 변경은 해당 매핑들에도 함께 반영됩니다.
         </p>
       )}
@@ -738,7 +738,7 @@ function ProductPublishControls({ optionId, platformId }: { optionId: number; pl
 
   if (draft?.registered_at) {
     return (
-      <p className="hint-text">✅ 등록 완료(매핑 생성됨) - {new Date(draft.registered_at).toLocaleString()}</p>
+      <p className="hint-text">✓ 등록 완료(매핑 생성됨) - {new Date(draft.registered_at).toLocaleString()}</p>
     )
   }
 
@@ -780,30 +780,30 @@ function ProductPublishControls({ optionId, platformId }: { optionId: number; pl
         </button>
       </form>
       {missingCoreFields.length > 0 && (
-        <p className="hint-text" style={{ color: '#b45309' }}>입력 필요: {missingCoreFields.join(', ')}</p>
+        <p className="hint-text" style={{ fontWeight: 600 }}>입력 필요: {missingCoreFields.join(', ')}</p>
       )}
       {currentNoticeType === 'ETC' && (
         <div className="hint-text" style={{ marginBottom: 8, padding: 8, border: '1px solid var(--border)', borderRadius: 6 }}>
           <p style={{ margin: '0 0 4px' }}>
-            ⚠️ 이 채널은 상품정보제공고시로 <strong>ETC(기타 재화)</strong> 양식을 사용합니다. ETC 입력 형식
+            ! 이 채널은 상품정보제공고시로 <strong>ETC(기타 재화)</strong> 양식을 사용합니다. ETC 입력 형식
             자체는 이 시스템이 지원하지만, <strong>이 카테고리에 ETC 고시가 실제로 맞는지는 공식 API로 검증할
             방법이 없어</strong> 운영자가 네이버 판매자센터에서 직접 확인해야 합니다. 아래 확인은 그 사실을
             기록할 뿐이며 "공식 적합성 검증 완료"를 의미하지 않습니다 - 카테고리 코드나 고시유형을 바꾸면
             이 확인은 자동으로 무효화됩니다.
           </p>
           {draft?.etc_notice_confirmation_valid ? (
-            <p style={{ margin: '0 0 4px', color: '#15803d' }}>
-              ✅ 확인됨 - 사용자 #{draft.etc_notice_confirmed_by}
+            <p style={{ margin: '0 0 4px' }}>
+              ✓ 확인됨 - 사용자 #{draft.etc_notice_confirmed_by}
               {draft.etc_notice_confirmed_at && `, ${new Date(draft.etc_notice_confirmed_at).toLocaleString()}`}
               (카테고리 {draft.etc_notice_confirmed_category_code})
             </p>
           ) : draft?.etc_notice_confirmed_at ? (
-            <p style={{ margin: '0 0 4px', color: '#b45309' }}>
-              ⚠️ 이전 확인(카테고리 {draft.etc_notice_confirmed_category_code})이 카테고리/고시유형 변경으로
+            <p style={{ margin: '0 0 4px', fontWeight: 600 }}>
+              ! 이전 확인(카테고리 {draft.etc_notice_confirmed_category_code})이 카테고리/고시유형 변경으로
               무효화되었습니다 - 다시 확인이 필요합니다.
             </p>
           ) : (
-            <p style={{ margin: '0 0 4px', color: '#b45309' }}>❌ 아직 확인되지 않았습니다 - 확인 전에는 등록이 차단됩니다.</p>
+            <p style={{ margin: '0 0 4px', fontWeight: 600 }}>✕ 아직 확인되지 않았습니다 - 확인 전에는 등록이 차단됩니다.</p>
           )}
           <button type="button" onClick={handleConfirmEtcNotice} disabled={!draft || isConfirmingEtcNotice}>
             {isConfirmingEtcNotice ? '기록 중...' : '이 카테고리에 ETC 고시가 맞음을 확인'}
@@ -1560,25 +1560,25 @@ function ProductOptionGroupPublishControls({
       {currentNoticeType === 'ETC' && (
         <div className="hint-text" style={{ marginBottom: 8, padding: 8, border: '1px solid var(--border)', borderRadius: 6 }}>
           <p style={{ margin: '0 0 4px' }}>
-            ⚠️ 이 채널은 상품정보제공고시로 <strong>ETC(기타 재화)</strong> 양식을 사용합니다. ETC 입력 형식
+            ! 이 채널은 상품정보제공고시로 <strong>ETC(기타 재화)</strong> 양식을 사용합니다. ETC 입력 형식
             자체는 이 시스템이 지원하지만, <strong>이 카테고리에 ETC 고시가 실제로 맞는지는 공식 API로 검증할
             방법이 없어</strong> 운영자가 네이버 판매자센터에서 직접 확인해야 합니다. 아래 확인은 그 사실을
             기록할 뿐이며 "공식 적합성 검증 완료"를 의미하지 않습니다 - 카테고리 코드나 고시유형을 바꾸면
             이 확인은 자동으로 무효화됩니다.
           </p>
           {draft?.etc_notice_confirmation_valid ? (
-            <p style={{ margin: '0 0 4px', color: '#15803d' }}>
-              ✅ 확인됨 - 사용자 #{draft.etc_notice_confirmed_by}
+            <p style={{ margin: '0 0 4px' }}>
+              ✓ 확인됨 - 사용자 #{draft.etc_notice_confirmed_by}
               {draft.etc_notice_confirmed_at && `, ${new Date(draft.etc_notice_confirmed_at).toLocaleString()}`}
               (카테고리 {draft.etc_notice_confirmed_category_code})
             </p>
           ) : draft?.etc_notice_confirmed_at ? (
-            <p style={{ margin: '0 0 4px', color: '#b45309' }}>
-              ⚠️ 이전 확인(카테고리 {draft.etc_notice_confirmed_category_code})이 카테고리/고시유형 변경으로
+            <p style={{ margin: '0 0 4px', fontWeight: 600 }}>
+              ! 이전 확인(카테고리 {draft.etc_notice_confirmed_category_code})이 카테고리/고시유형 변경으로
               무효화되었습니다 - 다시 확인이 필요합니다.
             </p>
           ) : (
-            <p style={{ margin: '0 0 4px', color: '#b45309' }}>❌ 아직 확인되지 않았습니다 - 확인 전에는 등록이 차단됩니다.</p>
+            <p style={{ margin: '0 0 4px', fontWeight: 600 }}>✕ 아직 확인되지 않았습니다 - 확인 전에는 등록이 차단됩니다.</p>
           )}
           <button type="button" onClick={handleConfirmEtcNotice} disabled={!draft || isConfirmingEtcNotice}>
             {isConfirmingEtcNotice ? '기록 중...' : '이 카테고리에 ETC 고시가 맞음을 확인'}
@@ -1640,7 +1640,7 @@ function ProductOptionGroupPublishControls({
                 <button type="button" onClick={() => handleSaveRow(option)} disabled={savingRowId === option.id}>
                   {row.itemId ? '수정 저장' : '품목 저장'}
                 </button>
-                {row.itemId && <span className="hint-text">✅ 저장됨</span>}
+                {row.itemId && <span className="hint-text">✓ 저장됨</span>}
               </>
             )}
           </div>
@@ -1686,10 +1686,10 @@ function ProductOptionGroupPublishControls({
             <p key={item.product_option_id} className="hint-text" style={{ margin: '2px 0' }}>
               SKU(옵션ID {item.product_option_id}, 코드 {item.seller_product_code ?? '-'}):{' '}
               {item.mapped ? (
-                <span style={{ color: '#15803d' }}>✅ 매핑 완료(식별자 {item.channel_option_id})</span>
+                <span style={{ fontWeight: 600 }}>✓ 매핑 완료(식별자 {item.channel_option_id})</span>
               ) : item.ambiguous ? (
-                <span style={{ color: '#b45309' }}>
-                  ⚠️ 후보가 여러 개라 자동 확정할 수 없습니다 - 채널에서 직접 확인 후 수동 확정하세요.{' '}
+                <span style={{ fontWeight: 600 }}>
+                  ! 후보가 여러 개라 자동 확정할 수 없습니다 - 채널에서 직접 확인 후 수동 확정하세요.{' '}
                   <input
                     value={confirmInputs[item.product_option_id] ?? ''}
                     onChange={(e) =>
@@ -1702,7 +1702,7 @@ function ProductOptionGroupPublishControls({
                   </button>
                 </span>
               ) : (
-                <span style={{ color: '#b45309' }}>❌ 아직 확인되지 않음(심사 대기 중일 수 있습니다)</span>
+                <span style={{ fontWeight: 600 }}>✕ 아직 확인되지 않음(심사 대기 중일 수 있습니다)</span>
               )}
             </p>
           ))}
