@@ -1,41 +1,58 @@
+import { lazy, Suspense, type ComponentType } from 'react'
 import { Route, Routes } from 'react-router-dom'
 import { AuthProvider } from './auth/AuthContext'
 import { ProtectedRoute } from './components/ProtectedRoute'
 import { Layout } from './components/Layout'
-import { LoginPage } from './pages/LoginPage'
-import { DashboardPage } from './pages/DashboardPage'
-import { OperationsDashboardPage } from './pages/OperationsDashboardPage'
-import { OrdersPage } from './pages/OrdersPage'
-import { OrderDetailPage } from './pages/OrderDetailPage'
-import { ShipmentsPage } from './pages/ShipmentsPage'
-import { FulfillmentPage } from './pages/FulfillmentPage'
-import { CsCasesPage } from './pages/CsCasesPage'
-import { OrderConflictsPage } from './pages/OrderConflictsPage'
-import { ExchangesPage } from './pages/ExchangesPage'
-import { ReturnsPage } from './pages/ReturnsPage'
-import { CancellationsPage } from './pages/CancellationsPage'
-import { ProductsPage } from './pages/ProductsPage'
-import { ProductDetailPage } from './pages/ProductDetailPage'
-import { ProductBulkPage } from './pages/ProductBulkPage'
-import { UnmatchedItemsPage } from './pages/UnmatchedItemsPage'
-import { CustomersPage } from './pages/CustomersPage'
-import { InventoryPage } from './pages/InventoryPage'
-import { SuppliersPage } from './pages/SuppliersPage'
-import { PurchaseOrdersPage } from './pages/PurchaseOrdersPage'
-import { SettlementsPage } from './pages/SettlementsPage'
-import { CostsPage } from './pages/CostsPage'
-import { AdsPage } from './pages/AdsPage'
-import { AnalyticsPage } from './pages/AnalyticsPage'
-import { ReportsPage } from './pages/ReportsPage'
-import { SystemMonitoringPage } from './pages/SystemMonitoringPage'
-import { NotificationsPage } from './pages/NotificationsPage'
-import { SettingsPage } from './pages/SettingsPage'
-import { NotFoundPage } from './pages/NotFoundPage'
+
+// 화면(route) 단위로 코드를 나눠 처음 접속할 때 내려받는 JS 를 줄인다. 이름 있는 export 를 그대로 쓴다.
+function lazyPage<T extends Record<string, ComponentType>>(load: () => Promise<T>, name: keyof T & string) {
+  return lazy(() => load().then((m) => ({ default: m[name] })))
+}
+
+const LoginPage = lazyPage(() => import('./pages/LoginPage'), 'LoginPage')
+const DashboardPage = lazyPage(() => import('./pages/DashboardPage'), 'DashboardPage')
+const OperationsDashboardPage = lazyPage(() => import('./pages/OperationsDashboardPage'), 'OperationsDashboardPage')
+const OrdersPage = lazyPage(() => import('./pages/OrdersPage'), 'OrdersPage')
+const OrderDetailPage = lazyPage(() => import('./pages/OrderDetailPage'), 'OrderDetailPage')
+const ShipmentsPage = lazyPage(() => import('./pages/ShipmentsPage'), 'ShipmentsPage')
+const FulfillmentPage = lazyPage(() => import('./pages/FulfillmentPage'), 'FulfillmentPage')
+const CsCasesPage = lazyPage(() => import('./pages/CsCasesPage'), 'CsCasesPage')
+const OrderConflictsPage = lazyPage(() => import('./pages/OrderConflictsPage'), 'OrderConflictsPage')
+const ExchangesPage = lazyPage(() => import('./pages/ExchangesPage'), 'ExchangesPage')
+const ReturnsPage = lazyPage(() => import('./pages/ReturnsPage'), 'ReturnsPage')
+const CancellationsPage = lazyPage(() => import('./pages/CancellationsPage'), 'CancellationsPage')
+const ProductsPage = lazyPage(() => import('./pages/ProductsPage'), 'ProductsPage')
+const ProductDetailPage = lazyPage(() => import('./pages/ProductDetailPage'), 'ProductDetailPage')
+const ProductBulkPage = lazyPage(() => import('./pages/ProductBulkPage'), 'ProductBulkPage')
+const UnmatchedItemsPage = lazyPage(() => import('./pages/UnmatchedItemsPage'), 'UnmatchedItemsPage')
+const CustomersPage = lazyPage(() => import('./pages/CustomersPage'), 'CustomersPage')
+const InventoryPage = lazyPage(() => import('./pages/InventoryPage'), 'InventoryPage')
+const SuppliersPage = lazyPage(() => import('./pages/SuppliersPage'), 'SuppliersPage')
+const PurchaseOrdersPage = lazyPage(() => import('./pages/PurchaseOrdersPage'), 'PurchaseOrdersPage')
+const SettlementsPage = lazyPage(() => import('./pages/SettlementsPage'), 'SettlementsPage')
+const CostsPage = lazyPage(() => import('./pages/CostsPage'), 'CostsPage')
+const AdsPage = lazyPage(() => import('./pages/AdsPage'), 'AdsPage')
+const AnalyticsPage = lazyPage(() => import('./pages/AnalyticsPage'), 'AnalyticsPage')
+const ReportsPage = lazyPage(() => import('./pages/ReportsPage'), 'ReportsPage')
+const SystemMonitoringPage = lazyPage(() => import('./pages/SystemMonitoringPage'), 'SystemMonitoringPage')
+const NotificationsPage = lazyPage(() => import('./pages/NotificationsPage'), 'NotificationsPage')
+const SettingsPage = lazyPage(() => import('./pages/SettingsPage'), 'SettingsPage')
+const NotFoundPage = lazyPage(() => import('./pages/NotFoundPage'), 'NotFoundPage')
+
+function PageLoading() {
+  return (
+    <div className="page-loading" role="status">
+      화면을 불러오는 중입니다...
+    </div>
+  )
+}
 
 function Protected({ children }: { children: React.ReactNode }) {
   return (
     <ProtectedRoute>
-      <Layout>{children}</Layout>
+      <Layout>
+        <Suspense fallback={<PageLoading />}>{children}</Suspense>
+      </Layout>
     </ProtectedRoute>
   )
 }
@@ -44,7 +61,7 @@ function App() {
   return (
     <AuthProvider>
       <Routes>
-        <Route path="/login" element={<LoginPage />} />
+        <Route path="/login" element={<Suspense fallback={<PageLoading />}><LoginPage /></Suspense>} />
         <Route path="/" element={<Protected><DashboardPage /></Protected>} />
         <Route path="/operations" element={<Protected><OperationsDashboardPage /></Protected>} />
         <Route path="/orders" element={<Protected><OrdersPage /></Protected>} />

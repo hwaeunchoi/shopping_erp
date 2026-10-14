@@ -121,7 +121,7 @@ test('현재 위치: 대분류·소분류·상세 화면을 찾는다', () => {
 
 test('페이지 제목(h2)이 사이드바 메뉴 이름과 같다', () => {
   const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8')
-  const imports = new Map([...app.matchAll(/import \{ (\w+) \} from '\.\/pages\/(\w+)'/g)].map((m) => [m[1], m[2]]))
+  const imports = new Map([...app.matchAll(/const (\w+) = lazyPage\(\(\) => import\('\.\/pages\/(\w+)'\)/g)].map((m) => [m[1], m[2]]))
   let checked = 0
   for (const item of allNavItems()) {
     const re = new RegExp(`path="${item.to === '/' ? '/' : item.to}" element=\\{<Protected><(\\w+) />`)
