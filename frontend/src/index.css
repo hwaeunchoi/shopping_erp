@@ -523,7 +523,7 @@ textarea::placeholder {
   top: calc(100% + 4px);
   left: 0;
   min-width: 280px;
-  max-height: 360px;
+  max-height: min(70vh, 420px);
   overflow-y: auto;
   background: var(--panel-bg);
   border: 1px solid var(--border);

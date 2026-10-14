@@ -73,6 +73,14 @@ export function UserMenu() {
             <strong>{user?.name}</strong>
             <span>{user?.username}</span>
           </div>
+          <div className="dropdown-section-title">계정</div>
+          <button type="button" className="dropdown-item" onClick={toggleTheme}>
+            <Icon name={isDark ? 'sun' : 'moon'} size={16} />
+            {isDark ? '밝은 화면으로 전환' : '어두운 화면으로 전환'}
+          </button>
+          <button type="button" className="dropdown-item" onClick={logout}>
+            로그아웃
+          </button>
           <div className="dropdown-section-title">최근 본 항목</div>
           {recent.length === 0 && <div className="dropdown-empty">최근 본 항목이 없습니다.</div>}
           {recent.map((item) => (
@@ -87,14 +95,6 @@ export function UserMenu() {
               {item.target_type === 'REPORT' ? '보고서' : label('recordTarget', item.target_type)} #{item.target_id}
             </Link>
           ))}
-          <div className="dropdown-section-title">계정</div>
-          <button type="button" className="dropdown-item" onClick={toggleTheme}>
-            <Icon name={isDark ? 'sun' : 'moon'} size={16} />
-            {isDark ? '밝은 화면으로 전환' : '어두운 화면으로 전환'}
-          </button>
-          <button type="button" className="dropdown-item" onClick={logout}>
-            로그아웃
-          </button>
         </div>
       )}
     </div>
