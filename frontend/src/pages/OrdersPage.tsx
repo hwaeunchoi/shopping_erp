@@ -381,7 +381,7 @@ export function OrdersPage() {
 
   return (
     <div>
-      <h2>주문 워크벤치</h2>
+      <h2>주문</h2>
 
       {alerts && (
         <div className="kpi-strip-o">

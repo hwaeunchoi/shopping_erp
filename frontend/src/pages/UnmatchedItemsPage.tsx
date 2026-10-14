@@ -32,7 +32,7 @@ export function UnmatchedItemsPage() {
       <p>
         자동매칭(플랫폼옵션번호/플랫폼상품번호/판매자상품코드, 실제 고유ID 기준)에 모두 실패한
         주문상품 목록입니다. 상품명/옵션명 유사도는 오탐 위험이 커 자동매칭에 쓰지 않습니다 -
-        상품관리에서 옵션 ID를 확인한 뒤 아래에서 직접 연결하세요.
+        상품 화면에서 옵션 ID를 확인한 뒤 아래에서 직접 연결하세요.
       </p>
       {isLoading && <p>불러오는 중...</p>}
       {error && <p className="form-error">{error}</p>}

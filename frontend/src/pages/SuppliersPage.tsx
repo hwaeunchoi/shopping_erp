@@ -155,7 +155,7 @@ export function SuppliersPage() {
 
   return (
     <div>
-      <h2>공급처관리</h2>
+      <h2>공급처</h2>
       <div className="filter-bar">
         <button type="button" className={!activeOnly ? 'active' : ''} onClick={() => setActiveOnly(false)}>전체</button>
         <button type="button" className={activeOnly ? 'active' : ''} onClick={() => setActiveOnly(true)}>사용중만</button>

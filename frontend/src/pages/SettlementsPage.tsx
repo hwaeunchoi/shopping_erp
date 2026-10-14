@@ -89,7 +89,7 @@ export function SettlementsPage() {
 
   return (
     <div>
-      <h2>정산관리</h2>
+      <h2>정산</h2>
       {isLoading && <p>불러오는 중...</p>}
       {error && <p className="form-error">{error}</p>}
       {data && (

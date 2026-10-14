@@ -1,0 +1,342 @@
+/* 앱 전체 레이아웃: 왼쪽 사이드바(대분류 > 소분류) + 상단바 + 본문.
+   색은 모두 tokens.css의 변수를 쓴다. 사이드바는 넓은 화면에서는 고정, 좁은 화면(<=900px)에서는 서랍이다. */
+
+.app-shell {
+  display: flex;
+  min-height: 100vh;
+}
+
+.skip-link {
+  position: absolute;
+  left: 8px;
+  top: -48px;
+  z-index: 300;
+  padding: 8px 12px;
+  background: var(--primary);
+  color: var(--primary-text);
+  border-radius: var(--radius);
+}
+
+.skip-link:focus {
+  top: 8px;
+}
+
+/* --- 사이드바 --- */
+.sidebar {
+  width: 248px;
+  flex-shrink: 0;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+  background: var(--sidebar-bg);
+  color: var(--text);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding: 0 0 16px;
+}
+
+.sidebar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 16px 12px;
+}
+
+.sidebar-title {
+  font-weight: 700;
+  font-size: 16px;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.sidebar nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 8px;
+}
+
+.nav-group-button,
+.nav-group-single {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 10px 12px;
+  border: none;
+  border-radius: var(--radius);
+  background: none;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  text-align: left;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.nav-group-button:hover,
+.nav-group-single:hover {
+  background: var(--hover);
+  border-color: transparent;
+}
+
+.nav-group-button.has-current {
+  color: var(--text);
+}
+
+.nav-group-single.active {
+  background: var(--selected);
+  box-shadow: inset 3px 0 0 var(--primary);
+}
+
+.nav-chevron {
+  display: inline-flex;
+  color: var(--text-muted);
+  transition: none;
+}
+
+.nav-chevron.is-open {
+  transform: rotate(180deg);
+}
+
+.nav-sublist {
+  list-style: none;
+  margin: 0 0 4px;
+  padding: 0;
+}
+
+.nav-link {
+  display: block;
+  padding: 8px 12px 8px 28px;
+  border-radius: var(--radius);
+  color: var(--text-muted);
+  font-size: 14px;
+  text-decoration: none;
+}
+
+.nav-link:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+/* 현재 위치는 배경색뿐 아니라 왼쪽 막대와 굵은 글씨로도 구분한다(흑백 화면에서도 보이도록). */
+.nav-link.active {
+  background: var(--selected);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: inset 3px 0 0 var(--primary);
+}
+
+/* --- 본문 영역과 상단바 --- */
+.main-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 24px;
+  background: var(--panel-bg);
+  border-bottom: 1px solid var(--border);
+  font-size: 14px;
+}
+
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.content {
+  flex: 1;
+  width: 100%;
+  max-width: 1480px;
+  padding: 20px 24px 40px;
+  margin: 0 auto;
+}
+
+.content:focus {
+  outline: none;
+}
+
+.breadcrumb {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.breadcrumb a {
+  color: var(--text-muted);
+}
+
+.breadcrumb [aria-current='page'] {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.icon {
+  flex-shrink: 0;
+}
+
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 40px;
+  min-height: 40px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: none;
+  color: var(--text);
+}
+
+.icon-button:hover {
+  background: var(--hover);
+  border-color: var(--border);
+}
+
+.menu-button,
+.drawer-close,
+.drawer-overlay {
+  display: none;
+}
+
+.user-menu-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 40px;
+  padding: 0 10px;
+  background: var(--panel-bg);
+  color: var(--text);
+}
+
+.user-menu-name {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-menu-panel {
+  min-width: 260px;
+}
+
+.user-menu-id {
+  display: flex;
+  flex-direction: column;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.user-menu-id span {
+  color: var(--text-muted);
+}
+
+.dropdown-section-title {
+  padding: 8px 12px 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  border-top: 1px solid var(--border);
+}
+
+.dropdown-item {
+  align-items: center;
+  gap: 8px;
+}
+
+.empty-page {
+  max-width: 560px;
+  margin: 48px auto;
+  text-align: center;
+}
+
+.button-link {
+  display: inline-block;
+  padding: 8px 14px;
+  border: 1px solid var(--primary);
+  border-radius: var(--radius);
+  background: var(--primary);
+  color: var(--primary-text);
+  text-decoration: none;
+}
+
+/* --- 좁은 화면: 사이드바가 서랍으로 바뀐다 --- */
+@media (max-width: 900px) {
+  .sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    z-index: 120;
+    width: min(86vw, 320px);
+    height: 100%;
+    visibility: hidden;
+    transform: translateX(-100%);
+  }
+
+  .sidebar.is-open {
+    visibility: visible;
+    transform: translateX(0);
+  }
+
+  .drawer-overlay {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 110;
+    width: 100%;
+    padding: 0;
+    border: none;
+    border-radius: 0;
+    background: rgba(0, 0, 0, 0.45);
+  }
+
+  .menu-button,
+  .drawer-close {
+    display: inline-flex;
+  }
+
+  .nav-link,
+  .nav-group-button,
+  .nav-group-single {
+    min-height: 44px;
+  }
+
+  .topbar {
+    flex-wrap: wrap;
+    padding: 8px 12px;
+    row-gap: 8px;
+  }
+
+  .global-search {
+    order: 3;
+    flex-basis: 100%;
+    max-width: none;
+  }
+
+  .content {
+    padding: 16px 12px 32px;
+  }
+
+  .user-menu-name {
+    display: none;
+  }
+}

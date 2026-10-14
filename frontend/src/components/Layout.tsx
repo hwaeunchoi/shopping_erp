@@ -1,80 +1,158 @@
-import type { ReactNode } from 'react'
-import { NavLink } from 'react-router-dom'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { Link, NavLink, useLocation } from 'react-router-dom'
 import { useAuth } from '../auth/AuthContext'
+import { findNavLocation, visibleGroups } from '../navigation'
 import { AIAssistantPanel } from './AIAssistantPanel'
-import { FavoritesDropdown } from './FavoritesDropdown'
 import { GlobalSearch } from './GlobalSearch'
+import { Icon } from './Icon'
 import { NotificationBell } from './NotificationBell'
-import { RecentViewsDropdown } from './RecentViewsDropdown'
+import { UserMenu } from './UserMenu'
 
-// permission이 없는 메뉴(대시보드/고객관리)는 로그인만 하면 누구나 볼 수 있다.
-// 나머지는 백엔드 라우터가 요구하는 권한 코드와 동일한 값을 매칭해 role에 없는
-// 메뉴는 사이드바에서 아예 숨긴다(백엔드가 403으로 막는 것과 동일하게 동작).
-const NAV_ITEMS: Array<{ to: string; label: string; permission?: string }> = [
-  { to: '/', label: '대시보드' },
-  { to: '/operations', label: '운영 대시보드', permission: 'DASHBOARD_VIEW' },
-  { to: '/orders', label: '주문관리', permission: 'ORDER_VIEW' },
-  { to: '/shipments', label: '배송관리', permission: 'SHIPMENT_VIEW' },
-  { to: '/fulfillment', label: '출고관리', permission: 'SHIPMENT_VIEW' },
-  { to: '/cs-cases', label: 'CS 관리', permission: 'CS_VIEW' },
-  { to: '/order-conflicts', label: '주문상태 충돌', permission: 'ORDER_EDIT' },
-  { to: '/exchanges', label: '교환관리', permission: 'EXCHANGE_RETURN_MANAGE' },
-  { to: '/returns', label: '반품관리', permission: 'EXCHANGE_RETURN_MANAGE' },
-  { to: '/cancellations', label: '취소관리', permission: 'EXCHANGE_RETURN_MANAGE' },
-  { to: '/products', label: '상품관리', permission: 'PRODUCT_MANAGE' },
-  { to: '/products-bulk', label: '상품 대량처리', permission: 'PRODUCT_MANAGE' },
-  { to: '/unmatched-items', label: '미매칭 상품', permission: 'PRODUCT_MANAGE' },
-  { to: '/customers', label: '고객관리' },
-  { to: '/inventory', label: '재고관리', permission: 'INVENTORY_VIEW' },
-  { to: '/suppliers', label: '공급처관리', permission: 'SUPPLIER_MANAGE' },
-  { to: '/purchase-orders', label: '발주관리', permission: 'SUPPLIER_MANAGE' },
-  { to: '/settlements', label: '정산관리', permission: 'SETTLEMENT_VIEW' },
-  { to: '/costs', label: '비용관리', permission: 'COST_MANAGE' },
-  { to: '/ads', label: '광고관리', permission: 'AD_MANAGE' },
-  { to: '/analytics', label: '매출/손익분석', permission: 'ANALYTICS_VIEW' },
-  { to: '/reports', label: '보고서', permission: 'REPORT_VIEW' },
-  { to: '/system-monitoring', label: '시스템 모니터링', permission: 'SYSTEM_MONITOR_VIEW' },
-  { to: '/notifications', label: '알림센터', permission: 'NOTIFICATION_VIEW' },
-  { to: '/settings', label: '설정', permission: 'SETTINGS_MANAGE' },
-]
-
+// 왼쪽 사이드바(대분류 > 소분류) + 간결한 상단바.
+// 메뉴 구조는 navigation.ts가 단일 출처이며 권한이 없는 메뉴는 보이지 않는다.
+// 좁은 화면(<=900px)에서는 사이드바가 서랍(drawer)으로 바뀐다.
 export function Layout({ children }: { children: ReactNode }) {
-  const { user, logout, toggleTheme } = useAuth()
-  const permissions = new Set(user?.permissions ?? [])
-  const visibleNavItems = NAV_ITEMS.filter((item) => !item.permission || permissions.has(item.permission))
+  const { user } = useAuth()
+  const { pathname } = useLocation()
+  const groups = visibleGroups(user?.permissions ?? [])
+  const current = findNavLocation(pathname)
+  const currentGroupId = current?.group.id
+  const [drawerOpen, setDrawerOpen] = useState(false)
+  const [toggled, setToggled] = useState<Record<string, boolean>>({})
+  const menuButtonRef = useRef<HTMLButtonElement>(null)
+  const closeButtonRef = useRef<HTMLButtonElement>(null)
+
+  // 화면을 옮기면 서랍을 닫고, 현재 화면의 대분류는 자동으로 펼친다.
+  useEffect(() => {
+    setDrawerOpen(false)
+    if (currentGroupId) setToggled((prev) => ({ ...prev, [currentGroupId]: true }))
+  }, [pathname, currentGroupId])
+
+  useEffect(() => {
+    if (!drawerOpen) return
+    closeButtonRef.current?.focus()
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === 'Escape') {
+        setDrawerOpen(false)
+        menuButtonRef.current?.focus()
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [drawerOpen])
+
+  function isGroupOpen(id: string): boolean {
+    return toggled[id] ?? currentGroupId === id
+  }
 
   return (
     <div className="app-shell">
-      <aside className="sidebar">
-        <div className="sidebar-title">쇼핑몰 통합 ERP</div>
+      <a className="skip-link" href="#main-content">본문 바로가기</a>
+      {drawerOpen && (
+        <button type="button" className="drawer-overlay" aria-label="메뉴 닫기" onClick={() => setDrawerOpen(false)} />
+      )}
+      <aside id="app-sidebar" className={'sidebar' + (drawerOpen ? ' is-open' : '')} aria-label="주 메뉴">
+        <div className="sidebar-head">
+          <Link to="/" className="sidebar-title">쇼핑몰 통합 ERP</Link>
+          <button
+            ref={closeButtonRef}
+            type="button"
+            className="icon-button drawer-close"
+            aria-label="메뉴 닫기"
+            onClick={() => setDrawerOpen(false)}
+          >
+            <Icon name="close" />
+          </button>
+        </div>
         <nav>
-          {visibleNavItems.map((item) => (
-            <NavLink
-              key={item.to}
-              to={item.to}
-              end={item.to === '/'}
-              className={({ isActive }) => 'nav-link' + (isActive ? ' active' : '')}
-            >
-              {item.label}
-            </NavLink>
-          ))}
+          {groups.map((group) => {
+            // 소분류가 하나뿐인 대분류(홈, 설정)는 펼침 없이 바로 이동하는 링크로 보여 준다.
+            if (group.items.length === 1) {
+              const only = group.items[0]
+              return (
+                <NavLink
+                  key={group.id}
+                  to={only.to}
+                  end={only.to === '/'}
+                  className={({ isActive }) => 'nav-group-single' + (isActive ? ' active' : '')}
+                >
+                  {group.label}
+                </NavLink>
+              )
+            }
+            const open = isGroupOpen(group.id)
+            return (
+              <div key={group.id} className="nav-group">
+                <button
+                  type="button"
+                  className={'nav-group-button' + (currentGroupId === group.id ? ' has-current' : '')}
+                  aria-expanded={open}
+                  aria-controls={`nav-${group.id}`}
+                  onClick={() => setToggled((prev) => ({ ...prev, [group.id]: !open }))}
+                >
+                  <span>{group.label}</span>
+                  <span className={'nav-chevron' + (open ? ' is-open' : '')}>
+                    <Icon name="chevronDown" size={14} />
+                  </span>
+                </button>
+                {open && (
+                  <ul id={`nav-${group.id}`} className="nav-sublist">
+                    {group.items.map((item) => (
+                      <li key={item.to}>
+                        <NavLink
+                          to={item.to}
+                          end={item.to === '/'}
+                          className={'nav-link' + (current?.item.to === item.to ? ' active' : '')}
+                          aria-current={current?.item.to === item.to ? 'page' : undefined}
+                        >
+                          {item.label}
+                        </NavLink>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )
+          })}
         </nav>
       </aside>
       <div className="main-area">
         <header className="topbar">
+          <button
+            ref={menuButtonRef}
+            type="button"
+            className="icon-button menu-button"
+            aria-label="메뉴 열기"
+            aria-expanded={drawerOpen}
+            aria-controls="app-sidebar"
+            onClick={() => setDrawerOpen(true)}
+          >
+            <Icon name="menu" />
+          </button>
           <GlobalSearch />
           <div className="topbar-right">
             <NotificationBell />
-            <RecentViewsDropdown />
-            <FavoritesDropdown />
-            <button type="button" className="topbar-icon-button" onClick={toggleTheme} title="다크모드 전환">
-              {user?.theme_preference === 'DARK' ? '☀️' : '🌙'}
-            </button>
-            <span>{user?.name} ({user?.username})</span>
-            <button type="button" onClick={logout}>로그아웃</button>
+            <UserMenu />
           </div>
         </header>
-        <main className="content">{children}</main>
+        <main id="main-content" className="content" tabIndex={-1}>
+          {current && (
+            <nav className="breadcrumb" aria-label="현재 위치">
+              <span>{current.group.label}</span>
+              <span aria-hidden="true">/</span>
+              {current.detailLabel ? (
+                <>
+                  <Link to={current.item.to}>{current.item.label}</Link>
+                  <span aria-hidden="true">/</span>
+                  <span aria-current="page">{current.detailLabel}</span>
+                </>
+              ) : (
+                <span aria-current="page">{current.item.label}</span>
+              )}
+            </nav>
+          )}
+          {children}
+        </main>
         <AIAssistantPanel />
       </div>
     </div>

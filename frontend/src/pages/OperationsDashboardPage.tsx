@@ -184,7 +184,7 @@ export function OperationsDashboardPage() {
   return (
     <div className="operations-dashboard-page">
       <div className="ops-header">
-        <h2>운영 대시보드</h2>
+        <h2>운영 현황</h2>
         <div className="ops-header-actions">
           <span className="hint-text">
             마지막 갱신: {lastUpdatedAt ? lastUpdatedAt.toLocaleTimeString() : '-'}

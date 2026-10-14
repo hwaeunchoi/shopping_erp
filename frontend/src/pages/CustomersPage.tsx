@@ -15,7 +15,7 @@ export function CustomersPage() {
 
   return (
     <div>
-      <h2>고객관리</h2>
+      <h2>고객</h2>
       <div className="filter-bar">
         <button type="button" className={filter === 'all' ? 'active' : ''} onClick={() => setFilter('all')}>전체</button>
         <button type="button" className={filter === 'vip' ? 'active' : ''} onClick={() => setFilter('vip')}>VIP</button>

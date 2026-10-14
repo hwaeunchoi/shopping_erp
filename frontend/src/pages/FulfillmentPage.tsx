@@ -161,7 +161,7 @@ export function FulfillmentPage() {
 
   return (
     <div className="fulfillment-page">
-      <h2>출고 관리</h2>
+      <h2>출고</h2>
       <p className="hint-text">
         출고대기 주문라인을 배치로 묶어 피킹-검수-포장-송장등록-채널전송 접수까지 처리합니다. 실제 채널 HTTP
         전송은 여기서 하지 않고 기존 outbox로 접수만 합니다.
@@ -704,7 +704,7 @@ function BatchDetailPanel({
       {unknownProgressItems.length > 0 && (
         <p className="form-error">
           UNKNOWN(확인 필요) {unknownProgressItems.length}건 - 채널 응답이 불명확합니다. 자동 재처리하지 않으며,
-          기존 배송관리 화면에서 운영자가 직접 확인 후 해소해야 합니다.
+          배송 화면에서 운영자가 직접 확인 후 해소해야 합니다.
         </p>
       )}
       <div className="table-scroll">

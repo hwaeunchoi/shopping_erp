@@ -175,7 +175,7 @@ export function SystemMonitoringPage() {
 
   return (
     <div>
-      <h2>시스템 모니터링</h2>
+      <h2>작업 이력·시스템 상태</h2>
       <div className="tabs">
         <button type="button" className={'tab-button' + (tab === 'integrations' ? ' active' : '')} onClick={() => setTab('integrations')}>
           연동상태

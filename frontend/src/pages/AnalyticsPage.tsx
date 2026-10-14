@@ -50,7 +50,7 @@ export function AnalyticsPage() {
 
   return (
     <div>
-      <h2>매출/손익분석</h2>
+      <h2>매출·손익 분석</h2>
 
       <form className="inline-form" onSubmit={handleCalculate}>
         <input type="date" value={targetDate} onChange={(e) => setTargetDate(e.target.value)} />

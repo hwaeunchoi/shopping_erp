@@ -40,7 +40,7 @@ export function CostsPage() {
 
   return (
     <div>
-      <h2>비용관리</h2>
+      <h2>비용</h2>
 
       <form className="inline-form" onSubmit={handleCreate}>
         <select value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })}>

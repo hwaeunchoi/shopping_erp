@@ -140,7 +140,7 @@ export function NotificationsPage() {
 
   return (
     <div>
-      <h2>알림센터</h2>
+      <h2>알림</h2>
       <div className="tabs">
         <button type="button" className={'tab-button' + (tab === 'notifications' ? ' active' : '')} onClick={() => setTab('notifications')}>
           알림 목록

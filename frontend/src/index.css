@@ -1,50 +1,11 @@
-:root {
-  --text: #333;
-  --text-muted: #6b7280;
-  --bg: #f5f6f8;
-  --panel-bg: #fff;
-  --border: #e2e4e9;
-  --accent: #2563eb;
-  --accent-hover: #1d4ed8;
-  --danger: #dc2626;
-  --warning: #b45309;
-  --warning-bg: #fef3c7;
-  --sidebar-bg: #111827;
-  --sidebar-text: #d1d5db;
-
-  font: 15px/1.5 system-ui, 'Segoe UI', Roboto, sans-serif;
-  color: var(--text);
-  background: var(--bg);
-}
-
-/* UI 와이어프레임 v1.1 1장: 다크모드 토글. users.theme_preference에 저장된 값을
-   <html data-theme="dark">로 반영한다. */
-:root[data-theme='dark'] {
-  --text: #e5e7eb;
-  --text-muted: #9ca3af;
-  --bg: #15181f;
-  --panel-bg: #1f232c;
-  --border: #333844;
-  --accent: #3b82f6;
-  --accent-hover: #60a5fa;
-  --danger: #f87171;
-  --warning: #fbbf24;
-  --warning-bg: #453b1a;
-  --sidebar-bg: #0b0d12;
-  --sidebar-text: #cbd5e1;
-}
-
-:root[data-theme='dark'] body {
-  background: var(--bg);
-  color: var(--text);
-}
-
 * {
   box-sizing: border-box;
 }
 
 body {
   margin: 0;
+  background: var(--bg);
+  color: var(--text);
 }
 
 h1, h2, h3 {
@@ -114,72 +75,6 @@ input, select {
   gap: 4px;
   font-size: 13px;
   color: var(--text-muted);
-}
-
-/* --- App shell --- */
-.app-shell {
-  display: flex;
-  min-height: 100vh;
-}
-
-.sidebar {
-  width: 220px;
-  flex-shrink: 0;
-  background: var(--sidebar-bg);
-  color: var(--sidebar-text);
-  display: flex;
-  flex-direction: column;
-  padding: 16px 0;
-}
-
-.sidebar-title {
-  font-weight: 700;
-  color: #fff;
-  padding: 0 20px 16px;
-  font-size: 16px;
-}
-
-.sidebar nav {
-  display: flex;
-  flex-direction: column;
-}
-
-.nav-link {
-  color: var(--sidebar-text);
-  text-decoration: none;
-  padding: 10px 20px;
-  font-size: 14px;
-}
-
-.nav-link:hover {
-  background: rgba(255, 255, 255, 0.06);
-}
-
-.nav-link.active {
-  background: var(--accent);
-  color: #fff;
-}
-
-.main-area {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
-
-.topbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 12px 24px;
-  background: var(--panel-bg);
-  border-bottom: 1px solid var(--border);
-  font-size: 14px;
-}
-
-.content {
-  padding: 24px;
-  flex: 1;
 }
 
 .page-loading {
@@ -551,32 +446,6 @@ input, select {
   font-size: 14px;
 }
 
-/* 모든 페이지가 공유하는 상단바 - 좁은 화면에서 검색창(.global-search, flex:1)과
-   우측 아이콘/드롭다운 묶음(.topbar-right)이 한 줄에 다 들어가지 못해 페이지
-   전체가 옆으로 넘치는 문제를 최소한으로만 고친다: 768px 이하에서 둘 다 자기
-   줄 전체를 쓰도록 만들어(flex-basis:100%) 검색창이 1번째 줄, 아이콘/드롭다운
-   묶음이 2번째 줄에 오게 한다(레이아웃 재설계 없이 기존 요소 그대로, 두
-   줄로만 배치) - flex-wrap만으로는 flex-basis:0%인 .global-search가 "내용이
-   거의 없는 것"처럼 취급돼 줄바꿈 판단이 어긋난다. */
-@media (max-width: 768px) {
-  .topbar {
-    flex-wrap: wrap;
-    row-gap: 8px;
-  }
-
-  .global-search {
-    flex-basis: 100%;
-    min-width: 0;
-    max-width: none;
-  }
-
-  .topbar-right {
-    flex-basis: 100%;
-    justify-content: flex-end;
-    flex-wrap: wrap;
-  }
-}
-
 .search-dropdown,
 .dropdown-panel {
   position: absolute;
@@ -642,12 +511,6 @@ input, select {
   padding: 12px;
   color: var(--text-muted);
   font-size: 13px;
-}
-
-.topbar-right {
-  display: flex;
-  align-items: center;
-  gap: 12px;
 }
 
 .topbar-dropdown {

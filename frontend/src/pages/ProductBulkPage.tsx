@@ -200,7 +200,7 @@ export function ProductBulkPage() {
 
   return (
     <div>
-      <h2>상품 대량 처리</h2>
+      <h2>상품 일괄 처리</h2>
       <p className="hint-text">
         여러 상품/옵션을 한 번에 선택해 채널별 등록·재고·판매상태·정보수정을 접수합니다. 실제 채널 전송은 스케줄러가
         비동기로 수행하며, 여기서는 접수와 진행상태만 다룹니다.

@@ -100,7 +100,7 @@ export function ExchangesPage() {
 
   return (
     <div>
-      <h2>교환관리</h2>
+      <h2>교환</h2>
 
       <form className="inline-form" onSubmit={handleCreate}>
         <input type="number" value={orderId} onChange={(e) => setOrderId(e.target.value)} placeholder="주문 ID" min={1} />

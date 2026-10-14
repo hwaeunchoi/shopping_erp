@@ -30,6 +30,7 @@ import { ReportsPage } from './pages/ReportsPage'
 import { SystemMonitoringPage } from './pages/SystemMonitoringPage'
 import { NotificationsPage } from './pages/NotificationsPage'
 import { SettingsPage } from './pages/SettingsPage'
+import { NotFoundPage } from './pages/NotFoundPage'
 
 function Protected({ children }: { children: React.ReactNode }) {
   return (
@@ -71,6 +72,7 @@ function App() {
         <Route path="/system-monitoring" element={<Protected><SystemMonitoringPage /></Protected>} />
         <Route path="/notifications" element={<Protected><NotificationsPage /></Protected>} />
         <Route path="/settings" element={<Protected><SettingsPage /></Protected>} />
+        <Route path="*" element={<Protected><NotFoundPage /></Protected>} />
       </Routes>
     </AuthProvider>
   )

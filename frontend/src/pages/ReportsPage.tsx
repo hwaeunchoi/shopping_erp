@@ -300,7 +300,7 @@ export function ReportsPage() {
 
   return (
     <div>
-      <h2>종합 보고서</h2>
+      <h2>보고서</h2>
       <div className="tabs">
         <button type="button" className={'tab-button' + (tab === 'monthly' ? ' active' : '')} onClick={() => setTab('monthly')}>
           월별 경영보고서

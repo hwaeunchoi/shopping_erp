@@ -124,7 +124,7 @@ export function InventoryPage() {
 
   return (
     <div>
-      <h2>재고관리</h2>
+      <h2>재고</h2>
       <div className="filter-bar">
         <button type="button" className={!lowStockOnly ? 'active' : ''} onClick={() => setLowStockOnly(false)}>전체</button>
         <button type="button" className={lowStockOnly ? 'active' : ''} onClick={() => setLowStockOnly(true)}>안전재고 미만</button>

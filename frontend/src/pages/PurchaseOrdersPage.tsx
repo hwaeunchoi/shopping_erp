@@ -218,7 +218,7 @@ export function PurchaseOrdersPage() {
 
   return (
     <div>
-      <h2>발주관리</h2>
+      <h2>발주</h2>
       <div className="filter-bar">
         <button type="button" className={statusFilter === '' ? 'active' : ''} onClick={() => setStatusFilter('')}>전체</button>
         {(['DRAFT', 'ORDERED', 'PARTIALLY_RECEIVED', 'RECEIVED', 'CANCELLED'] as const).map((s) => (

@@ -197,7 +197,7 @@ export function CsCasesPage() {
 
   return (
     <div className="cs-cases-page">
-      <h2>CS 관리</h2>
+      <h2>고객 문의</h2>
       <p className="hint-text">
         채널 문의(현재 쿠팡 콜센터 문의·상품별 문의 조회 동기화 지원)와 수기 등록 문의를 함께 관리합니다. 실제 채널 답변
         전송은 아직 지원하지 않습니다 - 답변 초안 저장까지만 가능합니다.

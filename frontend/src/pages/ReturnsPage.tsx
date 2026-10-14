@@ -106,7 +106,7 @@ export function ReturnsPage() {
 
   return (
     <div>
-      <h2>반품관리</h2>
+      <h2>반품</h2>
 
       <form className="inline-form" onSubmit={handleCreate}>
         <input type="number" value={orderId} onChange={(e) => setOrderId(e.target.value)} placeholder="주문 ID" min={1} />

@@ -103,7 +103,7 @@ export function CancellationsPage() {
 
   return (
     <div>
-      <h2>취소관리</h2>
+      <h2>취소</h2>
 
       <form className="inline-form" onSubmit={handleCreate}>
         <input type="number" value={orderId} onChange={(e) => setOrderId(e.target.value)} placeholder="주문 ID" min={1} />

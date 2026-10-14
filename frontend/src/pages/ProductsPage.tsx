@@ -116,7 +116,7 @@ export function ProductsPage() {
 
   return (
     <div>
-      <h2>상품관리</h2>
+      <h2>상품</h2>
 
       <h3>네이버 상품 동기화</h3>
       <form className="inline-form" onSubmit={handleSyncFromNaver}>

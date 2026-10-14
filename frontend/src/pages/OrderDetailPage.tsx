@@ -79,7 +79,7 @@ export function OrderDetailPage() {
                 </tr>
               ))}
               {data.items.length === 0 && (
-                <tr><td colSpan={6}>주문상품이 없습니다(상품 매핑 없이 수집된 주문일 수 있습니다 - 상품관리에서 해당 SKU의 플랫폼 매핑을 등록해주세요).</td></tr>
+                <tr><td colSpan={6}>주문상품이 없습니다(상품 매핑 없이 수집된 주문일 수 있습니다 - 상품 화면에서 해당 SKU의 플랫폼 매핑을 등록해주세요).</td></tr>
               )}
             </tbody>
           </table>

@@ -29,7 +29,7 @@ export function OrderConflictsPage() {
 
   return (
     <div>
-      <h2>주문상태 충돌</h2>
+      <h2>주문 상태 충돌</h2>
       <p className="form-hint">
         채널에서 수집한 주문상태가 내부 상태에서 허용되지 않는 전이일 때 여기 남습니다.
         채널 상태 채택 시 내부 상태를 강제로 덮어쓰고(상태머신 우회, 감사로그 기록), 내부 상태 유지 시 채널 값은 폐기됩니다.

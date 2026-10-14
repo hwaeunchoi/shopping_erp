@@ -145,7 +145,7 @@ export function ShipmentsPage() {
 
   return (
     <div>
-      <h2>배송관리</h2>
+      <h2>배송</h2>
 
       <form className="inline-form" onSubmit={handleCreate}>
         <input
