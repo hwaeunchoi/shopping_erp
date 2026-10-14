@@ -57,7 +57,7 @@ export function AdsPage() {
               <th>캠페인명</th>
               <th>연결 SKU</th>
               <th>활성</th>
-              <th></th>
+              <th><span className="sr-only">작업</span></th>
             </tr>
           </thead>
           <tbody>

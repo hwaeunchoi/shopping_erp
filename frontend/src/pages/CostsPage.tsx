@@ -44,10 +44,10 @@ export function CostsPage() {
       <h2>비용</h2>
 
       <form className="inline-form" onSubmit={handleCreate}>
-        <select value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })}>
+        <select aria-label="비용 분류" value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })}>
           {CATEGORIES.map((c) => <option key={c} value={c}>{label('costCategory', c)}</option>)}
         </select>
-        <select value={form.cost_type} onChange={(e) => setForm({ ...form, cost_type: e.target.value })}>
+        <select aria-label="비용 유형" value={form.cost_type} onChange={(e) => setForm({ ...form, cost_type: e.target.value })}>
           {COST_TYPES.map((c) => <option key={c} value={c}>{label('costType', c)}</option>)}
         </select>
         <input
@@ -56,7 +56,7 @@ export function CostsPage() {
           placeholder="금액"
         />
         <input
-          type="date" value={form.incurred_date}
+          type="date" aria-label="발생일" value={form.incurred_date}
           onChange={(e) => setForm({ ...form, incurred_date: e.target.value })}
         />
         <input

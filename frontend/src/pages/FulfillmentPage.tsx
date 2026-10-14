@@ -141,7 +141,7 @@ export function FulfillmentPage() {
 
       <h3>출고 배치 생성</h3>
       <div className="filter-bar">
-        <select value={platformId} onChange={(e) => setPlatformId(e.target.value ? Number(e.target.value) : '')}>
+        <select aria-label="채널 필터" value={platformId} onChange={(e) => setPlatformId(e.target.value ? Number(e.target.value) : '')}>
           <option value="">전체 채널</option>
           {(platforms ?? []).map((p) => (
             <option key={p.id} value={p.id}>
@@ -149,7 +149,7 @@ export function FulfillmentPage() {
             </option>
           ))}
         </select>
-        <select value={warehouseId} onChange={(e) => setWarehouseId(e.target.value ? Number(e.target.value) : '')}>
+        <select aria-label="창고 선택" value={warehouseId} onChange={(e) => setWarehouseId(e.target.value ? Number(e.target.value) : '')}>
           <option value="">창고 선택</option>
           {(warehouses ?? []).map((w) => (
             <option key={w.id} value={w.id}>
@@ -268,7 +268,7 @@ export function FulfillmentPage() {
 
       <h3>출고 배치 목록</h3>
       <div className="filter-bar">
-        <select value={batchStatusFilter} onChange={(e) => setBatchStatusFilter(e.target.value)}>
+        <select aria-label="출고 묶음 상태 필터" value={batchStatusFilter} onChange={(e) => setBatchStatusFilter(e.target.value)}>
           {BATCH_STATUS_FILTERS.map((s) => (
             <option key={s} value={s}>
               {s === 'ALL' ? '전체' : label('fulfillmentStatus', s)}
@@ -290,7 +290,7 @@ export function FulfillmentPage() {
                 <th>창고</th>
                 <th>상태</th>
                 <th>생성시각</th>
-                <th></th>
+                <th><span className="sr-only">선택</span></th>
               </tr>
             </thead>
             <tbody>
@@ -534,7 +534,7 @@ function BatchDetailPanel({
               <tr key={item.id}>
                 <td>
                   {item.status === 'VERIFIED' ? (
-                    <input type="checkbox" checked={packSelected.has(item.id)} onChange={() => togglePack(item.id)} />
+                    <input type="checkbox" aria-label={`출고 항목 ${item.id} 선택`} checked={packSelected.has(item.id)} onChange={() => togglePack(item.id)} />
                   ) : (
                     '-'
                   )}
@@ -625,7 +625,7 @@ function BatchDetailPanel({
       <h4>포장완료 + 송장등록</h4>
       <div className="filter-bar">
         <span>{packSelected.size}건 선택됨(검수완료 항목만 선택 가능)</span>
-        <select value={carrier} onChange={(e) => setCarrier(e.target.value)}>
+        <select aria-label="택배사 선택" value={carrier} onChange={(e) => setCarrier(e.target.value)}>
           <option value="">택배사 선택</option>
           {(carriers ?? []).map((c) => (
             <option key={c.code} value={c.code}>
@@ -695,7 +695,7 @@ function BatchDetailPanel({
             <tr key={p.batch_item.id}>
               <td>
                 {p.command_status === 'FAILED' ? (
-                  <input type="checkbox" checked={retrySelected.has(p.batch_item.id)} onChange={() => toggleRetry(p.batch_item.id)} />
+                  <input type="checkbox" aria-label={`출고 항목 ${p.batch_item.id} 재시도 선택`} checked={retrySelected.has(p.batch_item.id)} onChange={() => toggleRetry(p.batch_item.id)} />
                 ) : (
                   '-'
                 )}

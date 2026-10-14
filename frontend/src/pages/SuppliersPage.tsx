@@ -95,7 +95,7 @@ function SupplierRowDetail({ supplier, onSaved }: { supplier: Supplier; onSaved:
         <table className="data-table nested">
           <thead>
             <tr>
-              <th>이름</th><th>연락처</th><th>이메일</th><th></th>
+              <th>이름</th><th>연락처</th><th>이메일</th><th><span className="sr-only">작업</span></th>
             </tr>
           </thead>
           <tbody>
@@ -183,7 +183,7 @@ export function SuppliersPage() {
               <th>결제조건</th>
               <th>계좌</th>
               <th>사용여부</th>
-              <th></th>
+              <th><span className="sr-only">작업</span></th>
             </tr>
           </thead>
           <tbody>

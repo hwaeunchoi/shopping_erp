@@ -229,7 +229,7 @@ export function PurchaseOrdersPage() {
       </div>
 
       <form className="inline-form" onSubmit={handleCreate}>
-        <select value={supplierId} onChange={(e) => setSupplierId(e.target.value)}>
+        <select aria-label="공급처 선택" value={supplierId} onChange={(e) => setSupplierId(e.target.value)}>
           <option value="">공급처 선택</option>
           {suppliers?.map((s) => (
             <option key={s.id} value={s.id}>{s.name}</option>
@@ -251,7 +251,7 @@ export function PurchaseOrdersPage() {
               <th>상태</th>
               <th>발주일</th>
               <th>메모</th>
-              <th></th>
+              <th><span className="sr-only">작업</span></th>
             </tr>
           </thead>
           <tbody>

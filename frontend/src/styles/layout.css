@@ -340,3 +340,23 @@
     display: none;
   }
 }
+
+/* 좁은 화면: 표·문단 안의 링크와 요약 토글도 손가락으로 누를 수 있는 크기(40px)를 갖는다. */
+@media (max-width: 900px) {
+  .data-table a,
+  .order-table a,
+  .content p > a,
+  .breadcrumb a,
+  .sidebar-title,
+  .more-filters > summary,
+  .button-link,
+  .kpi-card {
+    display: inline-flex;
+    align-items: center;
+    min-height: 40px;
+  }
+
+  .kpi-card {
+    display: block;
+  }
+}

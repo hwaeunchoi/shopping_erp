@@ -51,7 +51,7 @@ export function UnmatchedItemsPage() {
               <th>수량</th>
               <th>단가</th>
               <th>연결할 옵션 번호</th>
-              <th></th>
+              <th><span className="sr-only">작업</span></th>
             </tr>
           </thead>
           <tbody>

@@ -62,11 +62,15 @@ export function NotificationBell() {
         className="icon-button notification-bell"
         onClick={toggle}
         title="알림"
-        aria-label={unreadCount > 0 ? `알림, 읽지 않은 알림 ${unreadCount}건` : '알림'}
         aria-expanded={isOpen}
       >
         <Icon name="bell" />
-        {unreadCount > 0 && <span className="notification-badge">{unreadCount}</span>}
+        <span className="sr-only">알림{unreadCount > 0 ? `, 읽지 않은 알림 ${unreadCount}건` : ''}</span>
+        {unreadCount > 0 && (
+          <span className="notification-badge" aria-hidden="true">
+            {unreadCount}
+          </span>
+        )}
       </button>
       {isOpen && (
         <div className="dropdown-panel">

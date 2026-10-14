@@ -143,7 +143,7 @@ export function InventoryPage() {
               <th>예약재고</th>
               <th>가용재고</th>
               <th>안전재고</th>
-              <th></th>
+              <th><span className="sr-only">작업</span></th>
             </tr>
           </thead>
           <tbody>

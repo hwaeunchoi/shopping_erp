@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { api, ApiError } from '../api/client'
 import { useApiData } from '../api/useApiData'
 import { RowActionMenu } from '../components/RowActionMenu'
+import { label } from '../labels'
 import { FavoriteStar } from '../components/FavoriteStar'
 import type { Platform, Product, ProductCreate, ProductNaverSyncResult } from '../api/types'
 
@@ -121,7 +122,7 @@ export function ProductsPage() {
 
       <h3>네이버 상품 동기화</h3>
       <form className="inline-form" onSubmit={handleSyncFromNaver}>
-        <select
+        <select aria-label="플랫폼 선택"
           value={syncPlatformId}
           onChange={(e) => setSyncPlatformId(e.target.value ? Number(e.target.value) : '')}
         >
@@ -191,10 +192,8 @@ export function ProductsPage() {
               <th>제조사</th>
               <th>판매가</th>
               <th>상태</th>
-              <th></th>
-              <th></th>
-              <th></th>
-              <th></th>
+              <th>즐겨찾기</th>
+              <th>작업</th>
             </tr>
           </thead>
           <tbody>
@@ -207,7 +206,7 @@ export function ProductsPage() {
                 <td>{p.manufacturer ?? '-'}</td>
                 <td>{p.base_price?.toLocaleString() ?? '-'}</td>
                 <td>
-                  <span className="status-badge">{p.is_deleted ? '삭제됨' : p.status}</span>
+                  <span className="status-badge">{p.is_deleted ? '삭제됨' : label('productStatus', p.status)}</span>
                 </td>
                 <td>{p.is_deleted ? '-' : <FavoriteStar targetType="PRODUCT" targetId={p.id} />}</td>
                 <td>

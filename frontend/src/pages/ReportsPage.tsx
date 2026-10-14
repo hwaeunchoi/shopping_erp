@@ -51,8 +51,8 @@ function MonthlyReportTab() {
   return (
     <div>
       <form className="inline-form" onSubmit={handleQuery}>
-        <input type="number" value={year} onChange={(e) => setYear(Number(e.target.value))} min={2020} max={2100} />
-        <input type="number" value={month} onChange={(e) => setMonth(Number(e.target.value))} min={1} max={12} />
+        <input type="number" aria-label="연도" value={year} onChange={(e) => setYear(Number(e.target.value))} min={2020} max={2100} />
+        <input type="number" aria-label="월" value={month} onChange={(e) => setMonth(Number(e.target.value))} min={1} max={12} />
         <button type="submit">조회</button>
         <button type="button" onClick={() => handleDownload('excel')} disabled={isDownloading}>
           {isDownloading ? '다운로드 중...' : '엑셀 다운로드'}
@@ -247,10 +247,10 @@ function ReportSchedulesTab() {
           placeholder="구분용 이름(기본값 PROFIT_REPORT = 손익 보고서)"
           aria-label="보고서 구분 이름"
         />
-        <select value={form.frequency} onChange={(e) => setForm({ ...form, frequency: e.target.value })}>
+        <select aria-label="보고서 주기" value={form.frequency} onChange={(e) => setForm({ ...form, frequency: e.target.value })}>
           {FREQUENCY_OPTIONS.map((f) => <option key={f} value={f}>{label('reportFrequency', f)}</option>)}
         </select>
-        <select value={form.output_format} onChange={(e) => setForm({ ...form, output_format: e.target.value })}>
+        <select aria-label="보고서 형식" value={form.output_format} onChange={(e) => setForm({ ...form, output_format: e.target.value })}>
           {OUTPUT_FORMAT_OPTIONS.map((f) => <option key={f} value={f}>{label('reportFormat', f)}</option>)}
         </select>
         <input
@@ -273,7 +273,7 @@ function ReportSchedulesTab() {
       {data && (
         <table className="data-table">
           <thead>
-            <tr><th>구분 이름</th><th>주기</th><th>형식</th><th>다음실행</th><th>마지막실행</th><th>활성</th><th></th></tr>
+            <tr><th>구분 이름</th><th>주기</th><th>형식</th><th>다음실행</th><th>마지막실행</th><th>활성</th><th><span className="sr-only">작업</span></th></tr>
           </thead>
           <tbody>
             {data.map((s) => (

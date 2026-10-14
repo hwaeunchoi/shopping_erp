@@ -220,7 +220,7 @@ export function ShipmentsPage() {
                     <td>{s.delivered_at ? new Date(s.delivered_at).toLocaleString() : '-'}</td>
                     <td>
                       <div className="inline-form" style={{ margin: 0 }}>
-                        <select
+                        <select aria-label="상태 변경 선택"
                           value={draft.status}
                           onChange={(e) =>
                             setStatusDrafts({ ...statusDrafts, [s.id]: { ...draft, status: e.target.value } })

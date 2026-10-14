@@ -8,6 +8,13 @@ body {
   color: var(--text);
 }
 
+/* 링크는 파란색 대신 본문색 + 밑줄로 구분한다(흑백 디자인). */
+a {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 h1, h2, h3 {
   margin: 0 0 12px;
   font-weight: 600;
@@ -55,6 +62,7 @@ button:disabled {
 }
 
 input, select, textarea {
+  accent-color: var(--primary);
   font: inherit;
   min-height: 34px;
   padding: 6px 8px;
@@ -380,6 +388,7 @@ textarea::placeholder {
 
 .kpi-cards {
   display: flex;
+  flex-wrap: wrap;
   gap: 16px;
   margin-bottom: 24px;
 }
@@ -970,10 +979,15 @@ textarea::placeholder {
 
 /* 좁은 화면: 표는 표 안에서만 가로로 스크롤하고, 누르는 영역은 충분히 크게 한다. */
 @media (max-width: 900px) {
-  .data-table {
+  .content table:not(.order-table) {
     display: block;
     max-width: 100%;
     overflow-x: auto;
+  }
+
+  .content table:not(.order-table) th,
+  .content table:not(.order-table) td {
+    min-width: 84px;
   }
 
   button,
@@ -1079,4 +1093,27 @@ textarea::placeholder {
   gap: 6px;
   flex-wrap: nowrap;
   white-space: nowrap;
+}
+
+/* 화면에는 보이지 않지만 스크린 리더에는 읽히는 텍스트(빈 표 머리글에 이름을 주기 위함). */
+th {
+  position: relative;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* 라벨 안의 체크박스는 글자와 같은 줄·같은 높이에 맞춘다. */
+label > input[type='checkbox'] {
+  margin: 0 6px 0 0;
+  vertical-align: middle;
 }

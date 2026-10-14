@@ -120,9 +120,9 @@ export function ExchangesPage() {
 
       <div className="filter-bar">
         <input value={search} onChange={(e) => { setSearch(e.target.value); setPage(1) }} placeholder="사유 검색" />
-        <input type="date" value={startDate} onChange={(e) => { setStartDate(e.target.value); setPage(1) }} />
+        <input type="date" aria-label="시작일" value={startDate} onChange={(e) => { setStartDate(e.target.value); setPage(1) }} />
         <span>~</span>
-        <input type="date" value={endDate} onChange={(e) => { setEndDate(e.target.value); setPage(1) }} />
+        <input type="date" aria-label="종료일" value={endDate} onChange={(e) => { setEndDate(e.target.value); setPage(1) }} />
         {['', ...EXCHANGE_STATUSES].map((s) => (
           <button
             key={s || 'all'}
@@ -173,7 +173,7 @@ export function ExchangesPage() {
                   <td>{ex.completed_at ? new Date(ex.completed_at).toLocaleString() : '-'}</td>
                   <td>
                     <div className="inline-form" style={{ margin: 0 }}>
-                      <select
+                      <select aria-label="상태 변경 선택"
                         value={statusDrafts[ex.id] ?? ''}
                         onChange={(e) => setStatusDrafts({ ...statusDrafts, [ex.id]: e.target.value })}
                       >

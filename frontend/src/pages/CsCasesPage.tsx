@@ -173,7 +173,7 @@ export function CsCasesPage() {
       reloadAll()
       setActiveCaseId(result.case.id)
     } catch (err) {
-      setCreateError(err instanceof ApiError ? err.message : 'CS 케이스 생성 중 오류가 발생했습니다.')
+      setCreateError(err instanceof ApiError ? err.message : '문의를 등록하지 못했습니다.')
     } finally {
       setCreating(false)
     }
@@ -200,14 +200,14 @@ export function CsCasesPage() {
       )}
 
       <div className="filter-bar">
-        <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+        <select aria-label="문의 상태 필터" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
           {STATUS_FILTER_OPTIONS.map((s) => (
             <option key={s} value={s}>
               {s === 'ALL' ? '전체 상태' : label('csStatus', s)}
             </option>
           ))}
         </select>
-        <select value={platformId} onChange={(e) => setPlatformId(e.target.value ? Number(e.target.value) : '')}>
+        <select aria-label="채널 필터" value={platformId} onChange={(e) => setPlatformId(e.target.value ? Number(e.target.value) : '')}>
           <option value="">전체 채널</option>
           {(platforms ?? []).map((p) => (
             <option key={p.id} value={p.id}>
@@ -215,7 +215,7 @@ export function CsCasesPage() {
             </option>
           ))}
         </select>
-        <select value={inquiryType} onChange={(e) => setInquiryType(e.target.value)}>
+        <select aria-label="문의 유형 필터" value={inquiryType} onChange={(e) => setInquiryType(e.target.value)}>
           <option value="">전체 문의유형</option>
           {(reference?.inquiry_types ?? []).map((t) => (
             <option key={t} value={t}>
@@ -223,7 +223,7 @@ export function CsCasesPage() {
             </option>
           ))}
         </select>
-        <select value={priority} onChange={(e) => setPriority(e.target.value)}>
+        <select aria-label="우선순위 필터" value={priority} onChange={(e) => setPriority(e.target.value)}>
           <option value="">전체 우선순위</option>
           {(reference?.priorities ?? []).map((p) => (
             <option key={p} value={p}>
@@ -247,7 +247,7 @@ export function CsCasesPage() {
           <button type="submit">검색</button>
         </form>
         <button type="button" onClick={() => setCreateOpen(true)}>
-          CS 건 생성
+          문의 직접 등록
         </button>
       </div>
 
@@ -256,7 +256,7 @@ export function CsCasesPage() {
           <div>
             <strong>문의 직접 등록</strong>
             <div className="inline-form">
-              <select
+              <select aria-label="문의 유형"
                 value={createForm.inquiry_type}
                 onChange={(e) => setCreateForm((f) => ({ ...f, inquiry_type: e.target.value }))}
               >
@@ -267,7 +267,7 @@ export function CsCasesPage() {
                   </option>
                 ))}
               </select>
-              <select value={createForm.priority} onChange={(e) => setCreateForm((f) => ({ ...f, priority: e.target.value }))}>
+              <select aria-label="우선순위" value={createForm.priority} onChange={(e) => setCreateForm((f) => ({ ...f, priority: e.target.value }))}>
                 {(reference?.priorities ?? []).map((p) => (
                   <option key={p} value={p}>
                     {label('csPriority', p)}
@@ -345,7 +345,7 @@ export function CsCasesPage() {
             <thead>
               <tr>
                 <th>
-                  <input type="checkbox" checked={rows.length > 0 && selected.size === rows.length} onChange={toggleAll} />
+                  <input type="checkbox" aria-label="현재 목록 전체 선택" checked={rows.length > 0 && selected.size === rows.length} onChange={toggleAll} />
                 </th>
                 <th>번호</th>
                 <th>채널</th>
@@ -355,14 +355,14 @@ export function CsCasesPage() {
                 <th>고객</th>
                 <th>담당자</th>
                 <th>기한</th>
-                <th></th>
+                <th><span className="sr-only">선택</span></th>
               </tr>
             </thead>
             <tbody>
               {rows.map((c) => (
                 <tr key={c.id} className={[selected.has(c.id) ? 'sel' : '', activeCaseId === c.id ? 'clickable-row' : ''].join(' ')}>
                   <td>
-                    <input type="checkbox" checked={selected.has(c.id)} onChange={() => toggle(c.id)} />
+                    <input type="checkbox" aria-label={`문의 ${c.id} 선택`} checked={selected.has(c.id)} onChange={() => toggle(c.id)} />
                   </td>
                   <td>{c.id}</td>
                   <td>{(platforms ?? []).find((p) => p.id === c.platform_id)?.name ?? '수기'}</td>
@@ -588,14 +588,14 @@ function CaseDetailPanel({
   }
 
   if (detailLoading) return <p>불러오는 중...</p>
-  if (detailError || !caseDetail) return <p className="form-error">{detailError ?? 'CS 케이스를 찾을 수 없습니다.'}</p>
+  if (detailError || !caseDetail) return <p className="form-error">{detailError ?? '문의를 찾을 수 없습니다.'}</p>
 
   const platformName = platforms.find((p) => p.id === caseDetail.platform_id)?.name
 
   return (
     <div>
       <h3>
-        CS #{caseId} 상세{' '}
+        문의 #{caseId} 상세{' '}
         <button type="button" onClick={onClose}>
           닫기
         </button>
@@ -640,7 +640,7 @@ function CaseDetailPanel({
       </div>
 
       <div className="inline-form">
-        <select value={statusInput} onChange={(e) => setStatusInput(e.target.value)}>
+        <select aria-label="변경할 상태" value={statusInput} onChange={(e) => setStatusInput(e.target.value)}>
           <option value="">상태 선택</option>
           {STATUS_FILTER_OPTIONS.filter((s) => s !== 'ALL' && s !== 'CLOSED').map((s) => (
             <option key={s} value={s}>

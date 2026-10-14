@@ -387,7 +387,7 @@ export function OperationsDashboardPage() {
       </p>
 
       <div className="filter-bar">
-        <select
+        <select aria-label="기능 유형 필터"
           value={commandType}
           onChange={(e) => {
             setCommandType(e.target.value)
@@ -400,7 +400,7 @@ export function OperationsDashboardPage() {
             </option>
           ))}
         </select>
-        <select
+        <select aria-label="채널 필터"
           value={platformId}
           onChange={(e) => {
             setPlatformId(e.target.value ? Number(e.target.value) : '')
@@ -414,7 +414,7 @@ export function OperationsDashboardPage() {
             </option>
           ))}
         </select>
-        <select
+        <select aria-label="명령 상태 필터"
           value={statusFilter}
           onChange={(e) => {
             setStatusFilter(e.target.value)
@@ -481,7 +481,7 @@ export function OperationsDashboardPage() {
                 <th>다음 재시도</th>
                 <th>오류코드</th>
                 <th>상세화면</th>
-                <th></th>
+                <th><span className="sr-only">선택</span></th>
               </tr>
             </thead>
             <tbody>
@@ -557,7 +557,7 @@ function FailureRow({
     <tr className={[selected ? 'sel' : '', 'clickable-row'].join(' ')}>
       {canRetry && (
         <td>
-          <input type="checkbox" checked={selected} onChange={onToggle} disabled={row.status !== 'FAILED'} />
+          <input type="checkbox" aria-label={`명령 ${row.id} 선택`} checked={selected} onChange={onToggle} disabled={row.status !== 'FAILED'} />
         </td>
       )}
       <td>{row.id}</td>
@@ -649,7 +649,7 @@ function FailureDetailPanel({
                 {canResolveUnknown ? (
                   <>
                     <div className="inline-form">
-                      <select value={resolution} onChange={(e) => setResolution(e.target.value)}>
+                      <select aria-label="확인 결과 선택" value={resolution} onChange={(e) => setResolution(e.target.value)}>
                         {RESOLUTION_OPTIONS.map((o) => (
                           <option key={o.value} value={o.value}>
                             {o.label}

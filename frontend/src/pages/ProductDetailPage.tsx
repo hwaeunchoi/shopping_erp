@@ -106,7 +106,7 @@ function ProductInfoEdit({ product, onSaved }: { product: ProductDetail; onSaved
         placeholder="판매가"
         min={0}
       />
-      <select value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value })}>
+      <select aria-label="상품 상태" value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value })}>
         <option value="ACTIVE">판매중</option>
         <option value="DISCONTINUED">단종</option>
       </select>
@@ -502,7 +502,7 @@ function ProductSyncControls({ mapping, onClose }: { mapping: ProductPlatformMap
         </button>
       </form>
       <div className="inline-form" style={{ marginBottom: 4 }}>
-        <select value={saleStatus} onChange={(e) => setSaleStatus(e.target.value as SaleStatusValue)}>
+        <select aria-label="판매 상태 변경" value={saleStatus} onChange={(e) => setSaleStatus(e.target.value as SaleStatusValue)}>
           <option value="ON_SALE">판매중으로</option>
           <option value="SUSPENDED">판매중지로</option>
         </select>
@@ -1101,7 +1101,7 @@ function OptionSubDetail({
             placeholder="원가"
             min={0}
           />
-          <input type="date" value={effectiveFrom} onChange={(e) => setEffectiveFrom(e.target.value)} />
+          <input type="date" aria-label="적용 시작일" value={effectiveFrom} onChange={(e) => setEffectiveFrom(e.target.value)} />
           <button type="submit">원가 등록</button>
         </form>
         {costError && <p className="form-error">{costError}</p>}
@@ -1179,7 +1179,7 @@ function ProductImages({ productId, images, onChanged }: { productId: string; im
       {error && <p className="form-error">{error}</p>}
       <div className="table-scroll">
         <table className="data-table">
-          <thead><tr><th>미리보기</th><th>URL</th><th>구분</th><th></th><th></th></tr></thead>
+          <thead><tr><th>미리보기</th><th>URL</th><th>구분</th><th><span className="sr-only">작업</span></th><th><span className="sr-only">작업</span></th></tr></thead>
           <tbody>
             {images.map((img) => (
               <tr key={img.id}>
@@ -1855,7 +1855,7 @@ export function ProductDetailPage() {
       </form>
       {optionError && <p className="form-error">{optionError}</p>}
 
-      <p className="hint-text">옵션명·색상·사이즈·바코드·단가를 칸에서 바로 고친 뒤 <strong>저장</strong>을 누르세요(Enter로도 저장).</p>
+      <p className="hint-text">옵션명·색상·사이즈·바코드·단가를 칸에서 바로 고친 뒤 <strong>저장</strong>을 누르세요(엔터 키로도 저장).</p>
       <div className="table-scroll">
         <table className="data-table">
           <thead>

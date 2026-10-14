@@ -53,8 +53,8 @@ export function AnalyticsPage() {
       <h2>매출·손익 분석</h2>
 
       <form className="inline-form" onSubmit={handleCalculate}>
-        <input type="date" value={targetDate} onChange={(e) => setTargetDate(e.target.value)} />
-        <select value={platformId} onChange={(e) => setPlatformId(e.target.value ? Number(e.target.value) : '')}>
+        <input type="date" aria-label="기준일" value={targetDate} onChange={(e) => setTargetDate(e.target.value)} />
+        <select aria-label="플랫폼 필터" value={platformId} onChange={(e) => setPlatformId(e.target.value ? Number(e.target.value) : '')}>
           <option value="">전체(플랫폼 무관)</option>
           {platforms?.map((p) => (
             <option key={p.id} value={p.id}>{p.name}</option>

@@ -105,7 +105,7 @@ export function SettlementsPage() {
               <th>예정금액</th>
               <th>정산금액</th>
               <th>미정산금액</th>
-              <th></th>
+              <th><span className="sr-only">작업</span></th>
             </tr>
           </thead>
           <tbody>

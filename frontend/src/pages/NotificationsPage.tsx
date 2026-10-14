@@ -33,7 +33,7 @@ function NotificationsTab() {
       {data && (
         <table className="data-table">
           <thead>
-            <tr><th>심각도</th><th>유형</th><th>메시지</th><th>발생시각</th><th>상태</th><th></th></tr>
+            <tr><th>심각도</th><th>유형</th><th>메시지</th><th>발생시각</th><th>상태</th><th><span className="sr-only">작업</span></th></tr>
           </thead>
           <tbody>
             {data.map((n) => (
@@ -93,10 +93,10 @@ function AlertRulesTab() {
           onChange={(e) => setForm({ ...form, name: e.target.value })}
           placeholder="규칙 이름"
         />
-        <select value={form.metric} onChange={(e) => setForm({ ...form, metric: e.target.value })}>
+        <select aria-label="알림 지표" value={form.metric} onChange={(e) => setForm({ ...form, metric: e.target.value })}>
           {METRIC_OPTIONS.map((m) => <option key={m} value={m}>{label('alertMetric', m)}</option>)}
         </select>
-        <select value={form.operator} onChange={(e) => setForm({ ...form, operator: e.target.value })}>
+        <select aria-label="알림 조건" value={form.operator} onChange={(e) => setForm({ ...form, operator: e.target.value })}>
           {OPERATOR_OPTIONS.map((o) => <option key={o} value={o}>{label('alertOperator', o)}</option>)}
         </select>
         <input
@@ -114,7 +114,7 @@ function AlertRulesTab() {
       {data && (
         <table className="data-table">
           <thead>
-            <tr><th>이름</th><th>지표</th><th>조건</th><th>주기</th><th>활성</th><th></th></tr>
+            <tr><th>이름</th><th>지표</th><th>조건</th><th>주기</th><th>활성</th><th><span className="sr-only">작업</span></th></tr>
           </thead>
           <tbody>
             {data.map((rule) => (

@@ -148,7 +148,7 @@ function UsersTab() {
           placeholder="비밀번호"
         />
         <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="이름" />
-        <select value={form.role_id} onChange={(e) => setForm({ ...form, role_id: Number(e.target.value) })}>
+        <select aria-label="사용자 역할" value={form.role_id} onChange={(e) => setForm({ ...form, role_id: Number(e.target.value) })}>
           <option value={0}>역할 선택</option>
           {roles?.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
         </select>
@@ -161,7 +161,7 @@ function UsersTab() {
       {data && (
         <table className="data-table">
           <thead>
-            <tr><th>번호</th><th>아이디</th><th>이름</th><th>역할</th><th>상태</th><th></th></tr>
+            <tr><th>번호</th><th>아이디</th><th>이름</th><th>역할</th><th>상태</th><th><span className="sr-only">작업</span></th></tr>
           </thead>
           <tbody>
             {data.map((u) => (
@@ -170,7 +170,7 @@ function UsersTab() {
                 <td>{u.username}</td>
                 <td>{u.name}</td>
                 <td>
-                  <select value={u.role_id} onChange={(e) => changeRole(u, Number(e.target.value))}>
+                  <select aria-label="사용자 역할 변경" value={u.role_id} onChange={(e) => changeRole(u, Number(e.target.value))}>
                     {roles?.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
                   </select>
                 </td>
@@ -278,7 +278,7 @@ function PermissionsTab() {
   return (
     <div>
       <div className="filter-bar">
-        <select value={roleId} onChange={(e) => setRoleId(Number(e.target.value))}>
+        <select aria-label="권한을 설정할 역할" value={roleId} onChange={(e) => setRoleId(Number(e.target.value))}>
           <option value={0}>역할을 선택하세요</option>
           {roles?.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
         </select>
@@ -379,11 +379,11 @@ function CredentialsTab() {
       </p>
       <p className="hint-text">쿠팡 API를 호출하는 서버 IP를 쿠팡에 별도로 등록해야 합니다.</p>
       <form className="inline-form" onSubmit={handleSave}>
-        <select value={ownerId} onChange={(e) => setOwnerId(Number(e.target.value))}>
+        <select aria-label="인증 정보 대상 플랫폼" value={ownerId} onChange={(e) => setOwnerId(Number(e.target.value))}>
           <option value={0}>플랫폼 선택</option>
           {platforms?.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
         </select>
-        <select
+        <select aria-label="인증 정보 대상 플랫폼"
           value={form.key_name}
           onChange={(e) => setForm({ ...form, key_name: e.target.value })}
           disabled={allKeyNames.length === 0}
@@ -423,7 +423,7 @@ function CredentialsTab() {
       {error && <p className="form-error">{error}</p>}
       {ownerId > 0 && data && (
         <table className="data-table">
-          <thead><tr><th>키 이름</th><th>값(마스킹)</th><th>수정일시</th><th></th></tr></thead>
+          <thead><tr><th>키 이름</th><th>값(마스킹)</th><th>수정일시</th><th><span className="sr-only">작업</span></th></tr></thead>
           <tbody>
             {data.map((c) => (
               <tr key={c.id}>
@@ -465,7 +465,7 @@ function SystemSettingsTab() {
   return (
     <div>
       <form className="inline-form" onSubmit={handleSave}>
-        <select value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })}>
+        <select aria-label="설정 분류" value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })}>
           <option value="BACKUP">{label('settingCategory', 'BACKUP')}</option>
           <option value="REPORT">{label('settingCategory', 'REPORT')}</option>
           <option value="SYSTEM">{label('settingCategory', 'SYSTEM')}</option>

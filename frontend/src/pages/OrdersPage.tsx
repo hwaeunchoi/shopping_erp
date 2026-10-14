@@ -94,7 +94,7 @@ function DetailPanel({ orderId, onClose, onChanged }: { orderId: number; onClose
       <div className="order-tabs">
         {[
           ['info', '주문정보'], ['items', '상품'], ['stock', '재고'], ['po', '발주'], ['ship', '배송'],
-          ['pnl', '정산·손익'], ['cs', `CS${data.cs_history.length ? ' ' + data.cs_history.length : ''}`],
+          ['pnl', '정산·손익'], ['cs', `문의${data.cs_history.length ? ' ' + data.cs_history.length : ''}`],
           ['cust', '고객'], ['memo', `메모 ${data.memos.length}`], ['log', '로그'],
         ].map(([k, label]) => (
           <div key={k} className={`order-tab${tab === k ? ' active' : ''}`} onClick={() => setTab(k)}>{label}</div>
@@ -428,12 +428,12 @@ export function OrdersPage() {
           <span>~</span>
           <input type="date" aria-label="종료일" value={endDate} onChange={(e) => { setPage(1); setEndDate(e.target.value) }} />
           <span className="flabel">쇼핑몰</span>
-          <select value={platformId} onChange={(e) => { setPage(1); setPlatformId(e.target.value) }}>
+          <select aria-label="쇼핑몰 필터" value={platformId} onChange={(e) => { setPage(1); setPlatformId(e.target.value) }}>
             <option value="">전체</option>
             {platforms?.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
           </select>
           <span className="flabel">주문 상태</span>
-          <select value={status} onChange={(e) => { setPage(1); setStatus(e.target.value) }}>
+          <select aria-label="주문 상태 필터" value={status} onChange={(e) => { setPage(1); setStatus(e.target.value) }}>
             {ORDER_STATUS.map((s) => <option key={s || 'all'} value={s}>{s ? label('orderStatus', s) : '전체'}</option>)}
           </select>
           {anyFilterActive && <button type="button" onClick={resetFilters}>필터 초기화</button>}
@@ -442,16 +442,16 @@ export function OrdersPage() {
           <summary>상세 필터{detailFilterCount > 0 ? ` (적용 ${detailFilterCount}개)` : ''}</summary>
           <div className="order-filters">
             <span className="flabel">공급처</span>
-            <select value={supplierId} onChange={(e) => { setPage(1); setSupplierId(e.target.value) }}>
+            <select aria-label="공급처 필터" value={supplierId} onChange={(e) => { setPage(1); setSupplierId(e.target.value) }}>
               <option value="">전체</option>
               {suppliers?.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
             </select>
             <span className="flabel">배송 상태</span>
-            <select value={shippingStatus} onChange={(e) => { setPage(1); setShippingStatus(e.target.value) }}>
+            <select aria-label="배송 상태 필터" value={shippingStatus} onChange={(e) => { setPage(1); setShippingStatus(e.target.value) }}>
               {SHIPPING_STATUS.map(([v, l]) => <option key={v || 'all'} value={v}>{l}</option>)}
             </select>
             <span className="flabel">문의 상태</span>
-            <select value={csStatus} onChange={(e) => { setPage(1); setCsStatus(e.target.value) }}>
+            <select aria-label="문의 상태 필터" value={csStatus} onChange={(e) => { setPage(1); setCsStatus(e.target.value) }}>
               {CS_FILTER.map(([v, l]) => <option key={v || 'all'} value={v}>{l}</option>)}
             </select>
             <span className="flabel">상품 코드(SKU)</span>
@@ -482,7 +482,7 @@ export function OrdersPage() {
             <table className="order-table">
               <thead>
                 <tr className="grp">
-                  <th></th>
+                  <th><span className="sr-only">선택</span></th>
                   <th colSpan={2}>주문정보</th>
                   <th colSpan={2}>고객정보</th>
                   <th colSpan={3}>상품정보</th>
@@ -492,7 +492,7 @@ export function OrdersPage() {
                   <th>기타</th>
                 </tr>
                 <tr className="col">
-                  <th><input type="checkbox" checked={rows.length > 0 && selected.size === rows.length} onChange={toggleAll} /></th>
+                  <th><input type="checkbox" aria-label="현재 목록 전체 선택" checked={rows.length > 0 && selected.size === rows.length} onChange={toggleAll} /></th>
                   <th>주문번호 / 쇼핑몰</th>
                   <th>상태</th>
                   <th>고객명</th>
@@ -512,7 +512,7 @@ export function OrdersPage() {
                   <tr key={r.id} className={`${selected.has(r.id) || openId === r.id ? 'sel' : ''}${r.is_delayed ? ' delayed' : ''}`}
                     onClick={() => setOpenId(r.id)}>
                     <td onClick={(e) => e.stopPropagation()}>
-                      <input type="checkbox" checked={selected.has(r.id)} onChange={() => toggle(r.id)} />
+                      <input type="checkbox" aria-label={`주문 ${r.platform_order_no} 선택`} checked={selected.has(r.id)} onChange={() => toggle(r.id)} />
                     </td>
                     <td className="order-cell-stack">
                       <span className="mono">{r.platform_order_no}</span>

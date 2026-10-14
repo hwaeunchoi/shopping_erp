@@ -8,6 +8,7 @@ import { GlobalSearch } from './GlobalSearch'
 import { Icon } from './Icon'
 import { NotificationBell } from './NotificationBell'
 import { UserMenu } from './UserMenu'
+import { useScrollableRegions } from './useScrollableRegions'
 
 // 왼쪽 사이드바(대분류 > 소분류) + 간결한 상단바.
 // 메뉴 구조는 navigation.ts가 단일 출처이며 권한이 없는 메뉴는 보이지 않는다.
@@ -22,6 +23,8 @@ export function Layout({ children }: { children: ReactNode }) {
   const [toggled, setToggled] = useState<Record<string, boolean>>({})
   const menuButtonRef = useRef<HTMLButtonElement>(null)
   const closeButtonRef = useRef<HTMLButtonElement>(null)
+  const mainRef = useRef<HTMLElement>(null)
+  useScrollableRegions(mainRef, [pathname])
 
   // 화면을 옮기면 서랍을 닫고, 현재 화면의 대분류는 자동으로 펼친다.
   useEffect(() => {
@@ -136,7 +139,7 @@ export function Layout({ children }: { children: ReactNode }) {
             <UserMenu />
           </div>
         </header>
-        <main id="main-content" className="content" tabIndex={-1}>
+        <main ref={mainRef} id="main-content" className="content" tabIndex={-1}>
           {current && (
             <nav className="breadcrumb" aria-label="현재 위치">
               <span>{current.group.label}</span>

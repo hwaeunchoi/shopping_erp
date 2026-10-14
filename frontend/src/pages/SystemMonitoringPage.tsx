@@ -90,18 +90,18 @@ function TaskHistoryTab({ initialTaskType }: { initialTaskType: string }) {
   return (
     <div>
       <div className="filter-bar">
-        <select value={taskType} onChange={(e) => setTaskType(e.target.value)}>
+        <select aria-label="작업 유형 필터" value={taskType} onChange={(e) => setTaskType(e.target.value)}>
           {TASK_TYPE_OPTIONS.map((t) => (
             <option key={t} value={t}>{t ? label('taskType', t) : '유형 전체'}</option>
           ))}
         </select>
-        <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+        <select aria-label="작업 상태 필터" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
           {TASK_STATUS_OPTIONS.map((s) => (
             <option key={s} value={s}>{s ? label('taskStatus', s) : '상태 전체'}</option>
           ))}
         </select>
-        <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
-        <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
+        <input type="date" aria-label="시작일" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
+        <input type="date" aria-label="종료일" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
       </div>
       {isLoading && <p>불러오는 중...</p>}
       {error && <p className="form-error">{error}</p>}

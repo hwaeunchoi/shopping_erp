@@ -205,7 +205,7 @@ export function ProductBulkPage() {
       </div>
 
       <div className="filter-bar">
-        <select value={platformId} onChange={(e) => setPlatformId(e.target.value ? Number(e.target.value) : '')}>
+        <select aria-label="채널 필터" value={platformId} onChange={(e) => setPlatformId(e.target.value ? Number(e.target.value) : '')}>
           <option value="">전체 채널</option>
           {(platforms ?? []).map((p) => (
             <option key={p.id} value={p.id}>
@@ -258,7 +258,7 @@ export function ProductBulkPage() {
               {rows.map((row) => (
                 <tr key={row.id} className={selected.has(row.id) ? 'sel' : ''}>
                   <td>
-                    <input type="checkbox" checked={selected.has(row.id)} onChange={() => toggle(row.id)} />
+                    <input type="checkbox" aria-label={`상품 옵션 ${row.id} 선택`} checked={selected.has(row.id)} onChange={() => toggle(row.id)} />
                   </td>
                   <td>{row.id}</td>
                   <td>{row.platform_code}</td>
@@ -277,7 +277,7 @@ export function ProductBulkPage() {
                   )}
                   {kind === 'SALE_STATUS' && (
                     <td>
-                      <select
+                      <select aria-label="변경할 판매 상태"
                         value={statusById[row.id] ?? 'ON_SALE'}
                         onChange={(e) => setStatusById((prev) => ({ ...prev, [row.id]: e.target.value }))}
                       >
@@ -492,7 +492,7 @@ function ProgressPanel({ initialCommandIds }: { initialCommandIds: number[] }) {
     <div className="table-scroll">
       <h3>대량 작업 진행상태</h3>
       <div className="filter-bar">
-        <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+        <select aria-label="명령 상태 필터" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
           {STATUS_FILTER_OPTIONS.map((s) => (
             <option key={s} value={s}>
               {s === 'ALL' ? '전체' : label('commandStatus', s)}
@@ -525,7 +525,7 @@ function ProgressPanel({ initialCommandIds }: { initialCommandIds: number[] }) {
             <tr key={s.id}>
               <td>
                 {s.status === 'FAILED' ? (
-                  <input type="checkbox" checked={retrySelected.has(s.id)} onChange={() => toggleRetry(s.id)} />
+                  <input type="checkbox" aria-label={`명령 ${s.id} 재시도 선택`} checked={retrySelected.has(s.id)} onChange={() => toggleRetry(s.id)} />
                 ) : s.status === 'UNKNOWN' ? (
                   <span className="hint-text">운영자 확인 필요(상품상세 화면에서 해소)</span>
                 ) : (
