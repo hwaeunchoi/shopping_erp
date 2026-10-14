@@ -1,6 +1,7 @@
 // 디자인 토큰 명암비, 번들(지연 로딩·크기·테스트 코드 제외), 모바일 규칙 검증.
 import assert from 'node:assert/strict'
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
@@ -70,7 +71,7 @@ test('모바일 규칙: 표는 표 안에서만 가로 스크롤하고, 누르�
 })
 
 const distDir = fileURLToPath(new URL('../dist/assets/', import.meta.url))
-const distExists = existsSync(distDir)
+// dist 는 `npm test` 의 pretest 가 매번 지우고 새로 빌드한다. 없으면 건너뛰지 않고 실패한다.
 
 test('route 단위 지연 로딩: 모든 화면이 lazyPage 로 불러와지고 Suspense 한국어 문구가 있다', () => {
   const app = read('../src/App.tsx')
@@ -86,7 +87,8 @@ test('route 단위 지연 로딩: 모든 화면이 lazyPage 로 불러와지고 
   assert.match(layout, /<ErrorBoundary key=\{pathname\}>/, '오류 경계가 화면 단위로 초기화되어야 합니다')
 })
 
-test('빌드 산출물: 초기 JS 가 500kB 미만이고 테스트·모의·접근성 도구가 포함되지 않는다', { skip: !distExists && 'dist 없음(빌드 후 실행)' }, () => {
+test('빌드 산출물: 초기 JS 가 500kB 미만이고 테스트·모의·접근성 도구가 포함되지 않는다', () => {
+  assert.ok(existsSync(distDir), 'production build 후 테스트를 실행해야 합니다(npm test 는 build 를 먼저 실행합니다)')
   const files = readdirSync(distDir).filter((f) => f.endsWith('.js'))
   const entry = files.find((f) => f.startsWith('index-'))
   assert.ok(entry)
@@ -96,5 +98,40 @@ test('빌드 산출물: 초기 JS 가 500kB 미만이고 테스트·모의·접�
   for (const f of files) {
     const text = readFileSync(distDir + f, 'utf8')
     assert.doesNotMatch(text, /__mock|mock-api|axe-core|axe\.run|node:test|OPENAPI/i, `${f} 에 테스트·모의 코드가 있습니다`)
+  }
+})
+
+test('소스 기준: production entry(import graph)에 테스트·모의·시각 검수·접근성 도구 코드가 들어가지 않는다', () => {
+  const srcRoot = fileURLToPath(new URL('../src/', import.meta.url))
+  const seen = new Set<string>()
+  const queue = [srcRoot + 'main.tsx']
+  const resolveTs = (from: string, spec: string): string | null => {
+    const base = join(dirname(from), spec)
+    for (const c of [base, base + '.ts', base + '.tsx', join(base, 'index.ts'), join(base, 'index.tsx')]) {
+      if (existsSync(c) && statSync(c).isFile()) return c
+    }
+    return null
+  }
+  while (queue.length) {
+    const file = queue.pop()!
+    if (seen.has(file)) continue
+    seen.add(file)
+    const text = readFileSync(file, 'utf8')
+    for (const m of text.matchAll(/(?:from|import)\s*\(?\s*['"]([^'"]+)['"]/g)) {
+      const spec = m[1]
+      assert.doesNotMatch(spec, /axe-core|node:|mock|visual|\/tests?\//i, `${file} 가 production 에 넣으면 안 되는 모듈을 import 합니다: ${spec}`)
+      if (spec.startsWith('.')) {
+        const target = resolveTs(file, spec)
+        if (target) {
+          assert.ok(target.replace(/\\/g, '/').startsWith(srcRoot.replace(/\\/g, '/')), `src 밖 모듈을 import 합니다: ${spec}`)
+          queue.push(target)
+        }
+      }
+    }
+  }
+  assert.ok(seen.size > 30, 'import graph 탐색이 너무 작습니다(' + seen.size + ')')
+  // Layout 이 쓰는 컴포넌트·모든 화면이 graph 에 포함되어야 탐색이 유효하다.
+  for (const must of ['App.tsx', 'components/Layout.tsx', 'pages/OrdersPage.tsx', 'labels.ts', 'rowActionMenu.ts']) {
+    assert.ok([...seen].some((f) => f.replace(/\\/g, '/').endsWith('/' + must)), must + ' 가 import graph 에 없습니다')
   }
 })

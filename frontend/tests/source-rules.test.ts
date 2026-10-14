@@ -1,6 +1,6 @@
 // 화면 소스 규칙 검사: 흑백 디자인, 한국어 표시, 접근성, 원문 enum 비노출.
 import assert from 'node:assert/strict'
-import { readdirSync, readFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
@@ -122,12 +122,10 @@ test('서버 오류 문구는 한국어일 때만 그대로 쓰고 아니면 안
 })
 
 test('빌드 산출물(dist)에 비밀값·운영 식별자 형태가 없다', () => {
-  let distFiles: string[] = []
-  try {
-    distFiles = walk(fileURLToPath(new URL('../dist/', import.meta.url)))
-  } catch {
-    return // dist 가 없으면(빌드 전) 건너뛴다. 최종 게이트에서는 빌드 후 실행한다.
-  }
+  const distUrl = new URL('../dist/', import.meta.url)
+  assert.ok(existsSync(fileURLToPath(distUrl)), 'production build 후 테스트를 실행해야 합니다(npm test 는 build 를 먼저 실행합니다)')
+  const distFiles = walk(fileURLToPath(distUrl))
+  assert.ok(distFiles.length > 0, 'dist 가 비어 있습니다')
   for (const f of distFiles.filter((x) => /\.(js|css|html)$/.test(x))) {
     const text = readFileSync(f, 'utf8')
     assert.doesNotMatch(text, /eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\./, 'JWT 형태')
