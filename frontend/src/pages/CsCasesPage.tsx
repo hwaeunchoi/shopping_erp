@@ -422,7 +422,6 @@ export function CsCasesPage() {
           {bulkResults.map((r) => (
             <li key={r.case_id}>
               #{r.case_id}: {label('csBulkOutcome', r.outcome)}
-              
             </li>
           ))}
         </ul>
