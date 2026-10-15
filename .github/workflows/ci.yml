@@ -46,3 +46,55 @@ jobs:
 
       - name: Pytest
         run: pytest -q
+
+  # frontend 품질 게이트. backend job(quality)과 완전히 독립이다: 별도 runner, Docker·PostgreSQL 미사용,
+  # deploy·SSH·이미지 push·migration 단계 없음. 모든 단계는 실패하면 job 이 실패한다(continue-on-error·조건부 skip 금지).
+  #
+  # Node 버전 근거: 저장소의 공식 Node 설정은 frontend/Dockerfile 의 node:20 뿐이다(.nvmrc·engines 없음).
+  # 그런데 `npm test`(node --test 로 TypeScript 테스트 직접 실행)는 Node 22.18+(type stripping 기본 활성)가
+  # 필요하고 Node 20 에서는 ERR_UNKNOWN_FILE_EXTENSION 으로 실패한다(2026-10-15 Node 20.19.5 로 확인).
+  # 그래서 검사는 Node 22 에서, 운영 이미지와 같은 Node 20 에서는 production build 를 한 번 더 확인한다.
+  frontend-quality:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node (tests)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies (lockfile as-is)
+        run: npm ci
+
+      - name: Lockfile unchanged by install
+        run: git diff --exit-code -- package.json package-lock.json
+
+      - name: Lint
+        run: npm run lint
+
+      - name: TypeScript
+        run: npx tsc -b
+
+      # pretest 가 dist 를 지우고 clean production build 를 수행한 뒤 테스트를 실행한다
+      # (bundle 크기·mock/test/axe 미포함·Secret/운영값 미포함 검사 포함).
+      - name: Test (clean production build + bundle checks + unit tests)
+        run: npm test
+
+      - name: Set up Node 20 (production image Node major)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Production build on the production image Node major
+        run: npm run build
