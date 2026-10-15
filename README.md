@@ -654,15 +654,15 @@ docker compose up --build
 
 ### 결정 사항과 이유
 
-- **Python 버전은 3.14를 사용한다.** `pyproject.toml`의
-  `requires-python = ">=3.11"`을 그대로 따르지 않은 이유는, 이 프로젝트가
-  실제로 개발/검증해 온 인터프리터가 3.14이기 때문이다. requirements.txt의
-  SQLAlchemy(2.0.35→2.0.51), pydantic(2.9.2→2.13.4), pandas(2.2.2→2.3.3)
-  버전이 모두 "Python 3.14용 wheel이 없거나 충돌해서" 상향된 값들이라,
-  한 번도 실행해 본 적 없는 3.11에서 CI를 돌리면 로컬에서는 안 나던
-  문제가 나올 위험이 있다. 3.11 지원을 실제로 보장하려면 별도로 매트릭스
-  빌드를 추가해야 하며, 이는 현재 지시 범위를 벗어난다고 판단해 하지
-  않았다.
+- **Python 버전은 운영 이미지와 같은 3.11을 사용한다.** 처음에는 3.14로
+  정했지만 requirements.txt의 `psycopg[binary]==3.2.1`에 Python 3.14용
+  wheel이 없어(3.2.10부터 존재) 의존성 설치 단계에서 매번 실패했고, 그 뒤의
+  Ruff/Black/MyPy/Pytest는 실행되지 못했다. 운영 Dockerfile(`python:3.11-slim`),
+  로컬 검증 환경(3.11), `requires-python = ">=3.11"`이 모두 3.11을 가리키므로
+  CI도 3.11로 맞췄다(깨끗한 Linux 3.11 환경에서 설치부터 Pytest까지 통과를
+  확인). Python 3.14 지원은 선언하지 않았다. 지원하려면 운영 DB 드라이버
+  (psycopg)를 올리고 별도 호환성 job으로 검증해야 하며, 그전에는 필수 gate로
+  두지 않는다.
 - **isort는 CI 단계에 넣지 않았다.** 지시받은 4개 도구(Ruff/Black/MyPy/
   Pytest)에 정확히 맞췄다. 로컬 pre-commit에는 isort가 이미 포함되어
   있어(4순위) 실질적인 커버리지 공백은 크지 않다고 판단했다. isort까지
