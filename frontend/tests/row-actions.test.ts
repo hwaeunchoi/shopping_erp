@@ -53,7 +53,7 @@ test('실제 화면 적용: 표 한 행에 3개 이상 나열된 작업 버튼�
   const pages = ['ProductsPage', 'NotificationsPage', 'ReportsPage', 'ProductDetailPage']
   for (const page of pages) {
     const source = readFileSync(new URL(`../src/pages/${page}.tsx`, import.meta.url), 'utf8').replace(/\r\n/g, '\n')
-    assert.ok(source.includes('RowActionMenu'), `${page} 가 행 작업 메뉴를 쓰지 않습니다`)
+    assert.ok(source.includes('<RowActionMenu'), `${page} 가 행 작업 메뉴(<RowActionMenu>)를 쓰지 않습니다`)
   }
   // 모든 표 셀(td)에 버튼이 3개 이상 있는 곳이 없어야 한다(전수 검사).
   // FulfillmentPage 는 제외한다: 한 셀의 버튼 4개는 출고 항목 상태(READY/PICKING/VERIFYING/PACKED)별로 하나만 조건부 표시되는 단계 전환 버튼이다.
@@ -70,7 +70,7 @@ test('실제 화면 적용: 표 한 행에 3개 이상 나열된 작업 버튼�
 test('더보기 메뉴: 위험 작업은 skipConfirm 이 아닌 한 확인창을 거친다', () => {
   const component = readFileSync(new URL('../src/components/RowActionMenu.tsx', import.meta.url), 'utf8')
   assert.match(component, /action\.danger && !action\.skipConfirm && !window\.confirm/)
-  for (const needle of ['aria-haspopup="menu"', 'aria-expanded', 'role="menu"', 'role="menuitem"', "e.key === 'Escape'", "e.key === 'Tab'", 'aria-disabled', 'row-action-reason']) {
+  for (const needle of ['aria-haspopup="menu"', 'aria-expanded', 'role="menu"', 'role="menuitem"', 'aria-disabled', 'row-action-reason']) {
     assert.ok(component.includes(needle), `RowActionMenu 에 ${needle} 이 없습니다`)
   }
   // skipConfirm 은 자체 확인창이 있는 처리 함수에만 쓴다.
@@ -78,6 +78,18 @@ test('더보기 메뉴: 위험 작업은 skipConfirm 이 아닌 한 확인창을
     const src = readFileSync(new URL(`../src/pages/${file}.tsx`, import.meta.url), 'utf8')
     assert.ok(src.includes(`const ${needle} = async`) && /window\.confirm\(`[^`]*삭제하시겠습니까/.test(src), `${file}.${needle} 에 자체 확인창이 없습니다`)
   }
+})
+
+test('더보기 메뉴: Esc 로 닫고 버튼으로 초점을 돌려준다', () => {
+  const component = readFileSync(new URL('../src/components/RowActionMenu.tsx', import.meta.url), 'utf8')
+  assert.match(component, /e\.key === 'Escape'[\s\S]{0,120}close\(true\)/, 'Esc 가 메뉴를 닫고 초점을 복귀시켜야 합니다')
+})
+
+test('더보기 메뉴: 바깥 클릭과 Tab 으로 닫힌다', () => {
+  const component = readFileSync(new URL('../src/components/RowActionMenu.tsx', import.meta.url), 'utf8')
+  assert.match(component, /document\.addEventListener\('mousedown', onMouseDown\)/, '바깥 클릭 닫기 리스너가 없습니다')
+  assert.match(component, /document\.removeEventListener\('mousedown', onMouseDown\)/, '리스너 정리가 없습니다')
+  assert.match(component, /e\.key === 'Tab'[\s\S]{0,40}setOpen\(false\)/, 'Tab 으로 닫혀야 합니다')
 })
 
 test('보고서 구분 이름은 자유 문자열 계약을 그대로 유지한다(서버 값 변환 없음)', () => {
