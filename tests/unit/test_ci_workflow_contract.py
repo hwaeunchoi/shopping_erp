@@ -1,7 +1,7 @@
 """CI workflow(.github/workflows/ci.yml) 계약 테스트.
 
 backend `quality` job이 한 번도 Ruff/Black/MyPy/Pytest에 도달하지 못한 채 의존성 설치에서
-계속 실패했던 문제(Python 3.14에서 psycopg-binary==3.2.1 wheel 없음)가 되풀이되지 않도록,
+계속 실패했던 문제(clean Python 3.14 환경에서 psycopg-binary==3.2.1 설치 실패가 재현됨)가 되풀이되지 않도록,
 CI가 사용하는 Python 버전과 설치 명령이 저장소의 실제 계약(Dockerfile, requirements.txt,
 pyproject.toml)과 일치하는지, 그리고 실패를 숨기거나 배포하는 단계가 없는지 고정한다.
 """
@@ -115,7 +115,11 @@ def test_backend_quality_steps_are_present_in_order_and_unconditional(workflow: 
     steps = _steps(_jobs(workflow)["quality"])
     runs = [_run_of(s) for s in steps]
     prefixes = ["pip install -r requirements.txt", "ruff check .", "black --check .", "mypy ", "pytest -q"]
-    positions = [next(i for i, r in enumerate(runs) if r.startswith(p)) for p in prefixes]
+    positions: list[int] = []
+    for prefix in prefixes:
+        found = [i for i, r in enumerate(runs) if r.startswith(prefix)]
+        assert len(found) == 1, f"backend job에 '{prefix}' 단계가 정확히 하나여야 합니다(현재 {len(found)}개)"
+        positions.append(found[0])
     assert positions == sorted(positions), "설치 → Ruff → Black → MyPy → Pytest 순서여야 합니다"
     mypy_run = runs[positions[3]]
     for target in (
@@ -178,3 +182,58 @@ def test_frontend_quality_job_is_kept(workflow: dict[Any, Any]) -> None:
         str(s["with"]["node-version"]) for s in _steps(job) if str(s.get("uses", "")).startswith("actions/setup-node")
     ]
     assert versions == ["22.x", "20.x"], "Node 22 테스트와 Node 20 production build를 모두 수행해야 합니다"
+
+
+# --- Python 지원 계약 문구와 직접 의존성 선언 -------------------------------------------------
+
+_BAD_WORDS = ("범위 밖", "미지원", "지원 대상이 아니", "지원하지 않", "not supported", "unsupported")
+
+
+def test_requires_python_has_no_upper_bound() -> None:
+    """requires-python은 하한만 있는 계약이다. 상한이 생기면 문서·CI 설명도 함께 고쳐야 한다."""
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert re.search(
+        r'^requires-python\s*=\s*">=\s*\d+(\.\d+)*"\s*$', pyproject, re.MULTILINE
+    ), "requires-python이 '>=X.Y' 형태가 아닙니다. 상한을 추가했다면 README와 ci.yml의 Python 설명을 갱신하세요."
+
+
+@pytest.mark.parametrize("rel", [".github/workflows/ci.yml", "README.md"])
+def test_docs_do_not_misstate_python_314_support(rel: str) -> None:
+    """3.14가 '범위 밖'이거나 '미지원'이라고 단정하는 문구가 없어야 한다(검증되지 않았을 뿐이다)."""
+    for lineno, line in enumerate((ROOT / rel).read_text(encoding="utf-8").splitlines(), start=1):
+        if "3.14" in line:
+            lowered = line.lower()
+            for word in _BAD_WORDS:
+                assert word not in lowered, f"{rel}:{lineno}: 3.14 지원 여부를 단정하는 문구 '{word}'"
+
+
+def test_workflow_comment_states_python_314_is_unverified() -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert "3.14 호환성은 검증되지 않았다" in text, "ci.yml 주석에 3.14가 검증되지 않았다는 사실을 남겨야 합니다"
+
+
+def test_directly_imported_yaml_is_declared_in_requirements() -> None:
+    """tests가 yaml을 직접 import하면 PyYAML을 transitive(pre-commit) 우연에 맡기지 않고 직접 고정한다."""
+    importers: list[Path] = []
+    for top in (
+        "tests",
+        "api",
+        "core",
+        "services",
+        "repositories",
+        "integrations",
+        "scheduler",
+        "scripts",
+        "models",
+        "config",
+    ):
+        for path in (ROOT / top).rglob("*.py"):
+            if re.search(r"^\s*(import yaml\b|from yaml\b)", path.read_text(encoding="utf-8"), re.MULTILINE):
+                importers.append(path)
+    assert importers, "이 테스트 파일 자신이 yaml을 import하므로 최소 1개는 있어야 합니다"
+    requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+    assert re.search(
+        r"^PyYAML==\d+(\.\d+)+(\s|$)", requirements, re.MULTILINE | re.IGNORECASE
+    ), "yaml을 직접 import하는 파일이 있지만 requirements.txt에 PyYAML==X.Y.Z 고정이 없습니다: " + ", ".join(
+        sorted(p.relative_to(ROOT).as_posix() for p in importers)
+    )

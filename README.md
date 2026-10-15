@@ -654,15 +654,17 @@ docker compose up --build
 
 ### 결정 사항과 이유
 
-- **Python 버전은 운영 이미지와 같은 3.11을 사용한다.** 처음에는 3.14로
-  정했지만 requirements.txt의 `psycopg[binary]==3.2.1`에 Python 3.14용
-  wheel이 없어(3.2.10부터 존재) 의존성 설치 단계에서 매번 실패했고, 그 뒤의
-  Ruff/Black/MyPy/Pytest는 실행되지 못했다. 운영 Dockerfile(`python:3.11-slim`),
-  로컬 검증 환경(3.11), `requires-python = ">=3.11"`이 모두 3.11을 가리키므로
-  CI도 3.11로 맞췄다(깨끗한 Linux 3.11 환경에서 설치부터 Pytest까지 통과를
-  확인). Python 3.14 지원은 선언하지 않았다. 지원하려면 운영 DB 드라이버
-  (psycopg)를 올리고 별도 호환성 job으로 검증해야 하며, 그전에는 필수 gate로
-  두지 않는다.
+- **현재 검증·운영 기준 Python은 3.11이고, CI 필수 gate도 3.11을 쓴다.**
+  운영 Dockerfile(`python:3.11-slim`)과 로컬 검증 환경이 3.11이다.
+  프로젝트 메타데이터 `requires-python = ">=3.11"`은 상한이 없어 3.14도 형식상
+  허용하지만, 현재 고정 dependency 세트는 Python 3.14에서 설치되지 않아
+  (clean 3.14 환경에서 `psycopg-binary==3.2.1` 설치 실패가 재현됨) 3.14 호환성은
+  검증되지 않았다. 처음에는 CI를 3.14로 정했고 "Install dependencies" step이
+  exit code 1로 실패했다(공개 API로 확인한 사실은 실패한 step과 exit code뿐이며
+  상세 로그는 읽지 못했다). 그 뒤의 Ruff/Black/MyPy/Pytest는 실행되지 못했다.
+  CI를 운영 runtime과 같은 3.11로 맞추자 깨끗한 Linux 3.11 환경에서 설치부터
+  Pytest까지 통과했다. Python 3.14 지원은 dependency 갱신과 별도 호환성 검증을
+  거친 뒤에 선언한다.
 - **isort는 CI 단계에 넣지 않았다.** 지시받은 4개 도구(Ruff/Black/MyPy/
   Pytest)에 정확히 맞췄다. 로컬 pre-commit에는 isort가 이미 포함되어
   있어(4순위) 실질적인 커버리지 공백은 크지 않다고 판단했다. isort까지
