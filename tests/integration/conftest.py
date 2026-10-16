@@ -11,7 +11,10 @@ get_db 의존성만 오버라이드하고 나머지는 실제 앱(api.main.app) 
 - 라우터/의존성 로직 자체를 그대로 검증하기 위함이다.
 """
 
+import os
+
 import pytest
+from _runner_image import runner_image_problem
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
@@ -52,6 +55,27 @@ ALL_PERMISSION_CODES = [
     "OPERATIONS_RETRY",
     "OPERATIONS_UNKNOWN_RESOLVE",
 ]
+
+
+@pytest.fixture(autouse=True)
+def _runner_image_prerequisite(request, monkeypatch):
+    """RUNNER_IMAGE를 쓰는 PostgreSQL 통합 테스트는 그 이미지가 있어야 한다 - 없으면 실행 전에 원인을 알려 준다.
+
+    clean 환경에는 이미지가 없고, 없으면 docker run이 Docker Hub pull을 시도해 알아보기 어려운
+    "pull access denied"로 실패한다(skip이 아니라 실패다: 이미지 없이 통과한 것처럼 보이면 안 된다).
+    ERP_TEST_RUNNER_IMAGE를 지정하면 하드코딩된 shopping_erp-api:latest 대신 그 이미지로 테스트한다 -
+    기존 태그를 건드리지 않고 방금 빌드한 이미지로 clean 조건을 검증할 때 쓴다.
+    """
+    image = getattr(request.module, "RUNNER_IMAGE", None)
+    if image is None:
+        return
+    override = os.environ.get("ERP_TEST_RUNNER_IMAGE")
+    if override:
+        monkeypatch.setattr(request.module, "RUNNER_IMAGE", override)
+        image = override
+    problem = runner_image_problem(image)
+    if problem:
+        pytest.fail(problem, pytrace=False)
 
 
 @pytest.fixture()
