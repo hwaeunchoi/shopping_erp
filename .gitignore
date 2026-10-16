@@ -16,6 +16,7 @@ venv/
 logs/*.log*
 backup/*/
 reports/generated/*
+!reports/generated/.gitkeep
 
 # 프론트엔드
 frontend/node_modules/

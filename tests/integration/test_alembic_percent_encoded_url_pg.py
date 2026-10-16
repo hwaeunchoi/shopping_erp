@@ -167,6 +167,8 @@ def _run_runner(runner_image: str, sandbox: dict, action: str, timeout: int = 12
             "0:0",
             "--tmpfs",
             "/app/logs",
+            "--tmpfs",
+            "/app/reports/generated",  # 저장소가 :ro라 init_db.init_directories()가 만드는 이 경로만 임시(tmpfs)로 덮는다. /app 전체는 읽기 전용 그대로다.
             "-v",
             f"{REPO_ROOT.as_posix()}:/app:ro",
             "-w",

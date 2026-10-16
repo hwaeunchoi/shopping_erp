@@ -186,6 +186,8 @@ def _run_runner(
             "0:0",  # /pgbackup 볼륨 초기 소유자가 root라 테스트에서만 root로 실행한다(운영 이미지의 USER appuser는 그대로다).
             "--tmpfs",
             "/app/logs",  # 저장소를 :ro로 마운트하므로 scripts/init_db.py의 setup_logging()이 쓸 곳이 필요하다 - 저장소 파일은 건드리지 않는다.
+            "--tmpfs",
+            "/app/reports/generated",  # 저장소가 :ro라 init_db.init_directories()가 만드는 이 경로만 임시(tmpfs)로 덮는다. /app 전체는 읽기 전용 그대로다.
             "-v",
             f"{REPO_ROOT.as_posix()}:/app:ro",
             "-v",
