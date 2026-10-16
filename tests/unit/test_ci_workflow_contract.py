@@ -160,7 +160,7 @@ def test_no_deploy_ssh_push_or_production_migration(workflow: dict[Any, Any]) ->
         "rsync",
         "docker push",
         "docker login",
-        "docker build",
+        "docker pull",
         "docker compose",
         "alembic upgrade",
         "deploy",
@@ -237,3 +237,40 @@ def test_directly_imported_yaml_is_declared_in_requirements() -> None:
     ), "yaml을 직접 import하는 파일이 있지만 requirements.txt에 PyYAML==X.Y.Z 고정이 없습니다: " + ", ".join(
         sorted(p.relative_to(ROOT).as_posix() for p in importers)
     )
+
+
+# --- 통합 테스트 runner 이미지 ---------------------------------------------------------------
+
+
+def _runner_image_constants() -> dict[str, str]:
+    found: dict[str, str] = {}
+    for path in sorted((ROOT / "tests" / "integration").glob("test_*_pg.py")):
+        m = re.search(r'^RUNNER_IMAGE\s*=\s*"([^"]+)"', path.read_text(encoding="utf-8"), re.MULTILINE)
+        if m:
+            found[path.name] = m.group(1)
+    return found
+
+
+def test_integration_runner_image_is_built_locally_before_pytest(workflow: dict[Any, Any]) -> None:
+    """RUNNER_IMAGE를 가정하는 통합 테스트가 있으면 CI가 Pytest 전에 그 이미지를 직접 빌드해야 한다."""
+    constants = _runner_image_constants()
+    assert constants, "RUNNER_IMAGE를 쓰는 통합 테스트가 없다면 이 테스트와 CI 빌드 단계를 함께 정리하세요"
+    assert set(constants.values()) == {"shopping_erp-api:latest"}, constants
+
+    steps = _steps(_jobs(workflow)["quality"])
+    runs = [_run_of(s) for s in steps]
+    builds = [i for i, r in enumerate(runs) if r.strip().startswith("docker build")]
+    assert len(builds) == 1, "runner 이미지를 빌드하는 단계가 정확히 하나여야 합니다"
+    assert runs[builds[0]].strip() == "docker build -t shopping_erp-api:latest ."
+    pytest_idx = next(i for i, r in enumerate(runs) if r.startswith("pytest "))
+    install_idx = runs.index("pip install -r requirements.txt")
+    assert install_idx < builds[0] < pytest_idx, "이미지 빌드는 의존성 설치 뒤, Pytest 앞이어야 합니다"
+    assert (ROOT / "Dockerfile").is_file()
+
+
+def test_ci_never_pulls_pushes_or_passes_secrets_to_docker(workflow: dict[Any, Any]) -> None:
+    for name, job in _jobs(workflow).items():
+        for step in _steps(job):
+            run = _run_of(step)
+            for bad in ("--push", "--build-arg", "--secret", "docker login", "docker pull", "docker push", "--ssh"):
+                assert bad not in run, f"{name}: docker 단계에 '{bad}' 금지"

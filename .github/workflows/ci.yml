@@ -47,6 +47,13 @@ jobs:
       - name: MyPy (type check)
         run: mypy models config core repositories services api integrations scheduler scripts tests
 
+      # tests/integration/*_pg.py의 "러너" 컨테이너가 쓰는 이미지다. clean runner에는 이 이미지가 없고, 없으면
+      # docker run이 Docker Hub에서 pull을 시도해 실패한다(pull access denied, exit 125). 로컬 개발 PC에는
+      # 예전에 빌드한 이미지가 남아 있어 통과했을 뿐이다. 운영 api 이미지와 같은 Dockerfile·context로 runner
+      # 안에서만 빌드한다(registry login·pull·push 없음, build-arg·secret 없음).
+      - name: Build integration test runner image
+        run: docker build -t shopping_erp-api:latest .
+
       - name: Pytest
         run: pytest -q
 
